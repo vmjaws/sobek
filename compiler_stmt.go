@@ -87,9 +87,12 @@ func (c *compiler) compileLabeledStatement(v *ast.LabelledStatement, needResult 
 	}
 }
 
+
+
 func (c *compiler) updateEnterBlock(enter *enterBlock) {
 	scope := c.scope
 	stashSize, stackSize := 0, 0
+
 	if scope.dynLookup {
 		stashSize = len(scope.bindings)
 		enter.names = scope.makeNamesMap()
@@ -101,6 +104,8 @@ func (c *compiler) updateEnterBlock(enter *enterBlock) {
 				stackSize++
 			}
 		}
+		// ALWAYS populate the names map
+		enter.names = scope.makeNamesMap()
 	}
 	enter.stashSize, enter.stackSize = uint32(stashSize), uint32(stackSize)
 }

@@ -92,6 +92,9 @@ type SourceTextModuleRecord struct {
 	indirectExportEntries []exportEntry
 	starExportEntries     []exportEntry
 
+	// debug controls whether the module should be compiled with debug symbols
+	debug bool
+
 	hostResolveImportedModule HostResolveImportedModuleFunc
 
 	once *sync.Once
@@ -404,7 +407,17 @@ func ParseModule(name, sourceText string, resolveModule HostResolveImportedModul
 	return ModuleFromAST(body, resolveModule)
 }
 
+// ModuleFromAST constructs a module record without debug symbols.
 func ModuleFromAST(body *ast.Program, resolveModule HostResolveImportedModuleFunc) (*SourceTextModuleRecord, error) {
+	return moduleFromAST(body, resolveModule, false)
+}
+
+// ModuleFromASTDebug constructs a module record with debug symbols enabled.
+func ModuleFromASTDebug(body *ast.Program, resolveModule HostResolveImportedModuleFunc) (*SourceTextModuleRecord, error) {
+	return moduleFromAST(body, resolveModule, true)
+}
+
+func moduleFromAST(body *ast.Program, resolveModule HostResolveImportedModuleFunc, debug bool) (*SourceTextModuleRecord, error) {
 	requestedModules := requestedModulesFromAst(body.Body)
 	importEntries, err := importEntriesFromAst(body.ImportEntries)
 	if err != nil {
@@ -459,9 +472,11 @@ func ModuleFromAST(body *ast.Program, resolveModule HostResolveImportedModuleFun
 		localExportEntries:    localExportEntries,
 		indirectExportEntries: indirectExportEntries,
 		starExportEntries:     starExportEntries,
+		debug:                 debug,
 
 		hostResolveImportedModule: resolveModule,
-		once:                      &sync.Once{},
+
+		once: new(sync.Once),
 	}
 
 	names := s.getExportedNamesWithotStars() // we use this as the other one loops but wee need to early errors here
@@ -568,7 +583,7 @@ func (module *SourceTextModuleRecord) handleAsyncGeteExportNames(
 
 func (module *SourceTextModuleRecord) InitializeEnvironment() (err error) {
 	module.once.Do(func() {
-		c := newCompiler()
+		c := newCompiler(module.debug)
 		defer func() {
 			if x := recover(); x != nil {
 				switch x1 := x.(type) {
@@ -691,7 +706,7 @@ func (module *SourceTextModuleRecord) Evaluate(rt *Runtime) *Promise {
 }
 
 func (module *SourceTextModuleRecord) Link() error {
-	c := newCompiler()
+	c := newCompiler(module.debug)
 	c.hostResolveImportedModule = module.hostResolveImportedModule
 	return c.CyclicModuleRecordConcreteLink(module)
 }

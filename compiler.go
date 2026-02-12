@@ -30,8 +30,8 @@ const (
 	maskDeletable = 1 << 29
 	maskStrict    = maskDeletable
 	maskIndirect  = 1 << 28
-
 	maskTyp = maskConst | maskVar | maskDeletable | maskIndirect
+	maskIndex     = 0x0FFFFFFF
 )
 
 type varType byte
@@ -75,6 +75,29 @@ type Program struct {
 	srcMap   []srcMapItem
 
 	scriptOrModule interface{}
+
+	//  only populated when compiling with debug flag
+	debugSymbols *DebugSymbols
+}
+
+type DebugSymbols struct {
+	// Map PC range to available variables
+	// Key: PC, Value: slice of variable info available at that PC
+	scopeMap map[int][]VarLocation
+
+	// Map line number to PCs
+	lineToPCs map[int][]int
+}
+
+type VarLocation struct {
+	Name      string
+	InStash   bool
+	StashIdx  uint32  // if InStash=true, the stash index
+	StackIdx  int     // if InStash=false, the stack index
+	IsParam   bool
+	IsConst   bool
+	StartPC   int     // PC where variable becomes available
+	EndPC     int     // PC where variable goes out of scope
 }
 
 type compiler struct {
@@ -89,8 +112,9 @@ type compiler struct {
 
 	enumGetExpr compiledEnumGetExpr
 
-	evalVM *vm // VM used to evaluate constant expressions
-	ctxVM  *vm // VM in which an eval() code is compiled
+	debug  bool // enable debug mode, effectively disabling a lot of optimizations
+	evalVM *vm  // VM used to evaluate constant expressions
+	ctxVM  *vm  // VM in which an eval() code is compiled
 
 	codeScratchpad []instruction
 
@@ -431,9 +455,10 @@ func (c *compiler) emitLiteralValue(v Value) {
 	c.emit(loadVal{v})
 }
 
-func newCompiler() *compiler {
+func newCompiler(debug bool) *compiler {
 	c := &compiler{
-		p: &Program{},
+		p:     &Program{},
+		debug: debug,
 	}
 
 	c.enumGetExpr.init(c, file.Idx(0))
@@ -633,27 +658,63 @@ func (s *scope) nearestThis() *scope {
 	return nil
 }
 
+
 func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 	argsInStash := false
 	if f := s.nearestFunction(); f != nil {
 		argsInStash = f.argsInStash
 	}
 	stackIdx, stashIdx := 0, 0
-	allInStash := s.isDynamic()
+	allInStash := s.isDynamic() || s.c.debug
+	
+	// CRITICAL FIX: In debug mode, if all variables go in stash, args must too!
+	// This ensures function parameters are accessible when allInStash=true
+	if s.c.debug && allInStash && s.isFunction() && !argsInStash {
+		// Check if this scope has any argument bindings
+		hasArgs := false
+		for _, b := range s.bindings {
+			if b.isArg {
+				hasArgs = true
+				break
+			}
+		}
+		if hasArgs {
+			s.moveArgsToStash()
+			argsInStash = true
+		}
+	}
+	
+	if s.c.debug {
+		fmt.Printf("[COMPILER-DEBUG] finaliseVarAlloc: allInStash=%v (isDynamic=%v, debug=%v), argsInStash=%v\n",
+			allInStash, s.isDynamic(), s.c.debug, argsInStash)
+	}
 	var derivedCtor bool
 	if fs := s.nearestThis(); fs != nil && fs.funcType == funcDerivedCtor {
 		derivedCtor = true
 	}
+
+	// Initialize debug symbols ONCE before processing bindings
+	if s.c.debug && s.c.p.debugSymbols == nil {
+		s.c.p.debugSymbols = &DebugSymbols{
+			scopeMap:  make(map[int][]VarLocation),
+			lineToPCs: make(map[int][]int),
+		}
+	}
+
 	for i, b := range s.bindings {
 		var this bool
 		if b.name == thisBindingName {
 			this = true
 		}
 		if allInStash || b.inStash {
+			// CRITICAL: Mark binding as in stash
+			b.inStash = true
+
+
 			for scope, aps := range b.accessPoints {
 				var level uint32
 				for sc := scope; sc != nil && sc != s; sc = sc.outer {
-					if sc.needStash || sc.isDynamic() {
+					if sc.needStash || sc.isDynamic() || sc.c.debug {
 						level++
 					}
 				}
@@ -745,6 +806,9 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 			}
 			stashIdx++
 		} else {
+			if s.c.debug {
+				fmt.Printf("  -> Binding[%d] %q going to STACK\n", i, b.name)
+			}
 			var idx int
 			if !this {
 				if i < s.numArgs {
@@ -754,10 +818,11 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 					idx = stackIdx + stackOffset
 				}
 			}
+			
 			for scope, aps := range b.accessPoints {
 				var level int
 				for sc := scope; sc != nil && sc != s; sc = sc.outer {
-					if sc.needStash || sc.isDynamic() {
+					if sc.needStash || sc.isDynamic() || sc.c.debug {
 						level++
 					}
 				}
@@ -786,7 +851,7 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 							}
 						}
 					} /*else {
-						no-op
+					    no-op
 					}*/
 				} else if argsInStash {
 					for _, pc := range *aps {
@@ -852,11 +917,322 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 			}
 		}
 	}
+
+	// CRITICAL: Collect debug symbols for ALL bindings AFTER they've been processed
+	if s.c.debug {
+		s.collectAllDebugSymbols(stackOffset, stashIdx, stackIdx)
+	}
+
 	for _, nested := range s.nested {
 		nested.finaliseVarAlloc(stackIdx + stackOffset)
 	}
+
+	if s.c.debug {
+		fmt.Printf("[COMPILER-DEBUG] Scope finalised: %d bindings, stackOffset=%d, stashIdx=%d, stackIdx=%d\n", 
+			len(s.bindings), stackOffset, stashIdx, stackIdx)
+		for i, b := range s.bindings {
+			fmt.Printf("[COMPILER-DEBUG]   Binding[%d]: name=%s, isVar=%v, isArg=%v, isConst=%v, inStash=%v\n",
+				i, b.name, b.isVar, b.isArg, b.isConst, b.inStash)
+		}
+	}
 	return stashIdx, stackIdx
 }
+
+func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx int) {
+	if s.c.p.debugSymbols == nil {
+		return
+	}
+	
+	stashIdx := 0
+	stackIdx := 0
+	
+	for i, b := range s.bindings {
+		// Skip special bindings
+		if b.name == thisBindingName {
+			continue
+		}
+
+		varLoc := VarLocation{
+			Name:    b.name.String(),
+			InStash: b.inStash,
+			IsParam: b.isArg,
+			IsConst: b.isConst,
+		}
+
+		if b.inStash {
+			// Variable is in stash
+			varLoc.StashIdx = uint32(stashIdx)
+			stashIdx++
+		} else {
+			// Variable is on stack
+			if b.isArg {
+				varLoc.StackIdx = -(i + 1)
+			} else {
+				varLoc.StackIdx = stackOffset + stackIdx
+				stackIdx++
+			}
+		}
+
+		// Find PC range where this variable is accessible
+		minPC := len(s.c.p.code)
+		maxPC := 0
+
+		for scope, aps := range b.accessPoints {
+			for _, pc := range *aps {
+				absolutePC := scope.base + pc
+				if absolutePC < minPC {
+					minPC = absolutePC
+				}
+				if absolutePC > maxPC {
+					maxPC = absolutePC
+				}
+			}
+		}
+
+		varLoc.StartPC = minPC
+		varLoc.EndPC = maxPC
+
+		// Add to scope map for all PCs in range
+		for pc := minPC; pc <= maxPC; pc++ {
+			s.c.p.debugSymbols.scopeMap[pc] = append(
+				s.c.p.debugSymbols.scopeMap[pc],
+				varLoc,
+			)
+		}
+		
+		if s.c.debug {
+			fmt.Printf("[COMPILER-DEBUG]   Debug symbol: %s, inStash=%v, stashIdx=%d, stackIdx=%d, PC range=[%d-%d]\n",
+				varLoc.Name, varLoc.InStash, varLoc.StashIdx, varLoc.StackIdx, minPC, maxPC)
+		}
+	}
+}
+
+
+
+//func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
+//	argsInStash := false
+//	if f := s.nearestFunction(); f != nil {
+//		argsInStash = f.argsInStash
+//	}
+//	stackIdx, stashIdx := 0, 0
+//	allInStash := s.isDynamic()
+//	var derivedCtor bool
+//	if fs := s.nearestThis(); fs != nil && fs.funcType == funcDerivedCtor {
+//		derivedCtor = true
+//	}
+//	for i, b := range s.bindings {
+//		var this bool
+//		if b.name == thisBindingName {
+//			this = true
+//		}
+//		if allInStash || b.inStash {
+//			for scope, aps := range b.accessPoints {
+//				var level uint32
+//				for sc := scope; sc != nil && sc != s; sc = sc.outer {
+//					if sc.needStash || sc.isDynamic() {
+//						level++
+//					}
+//				}
+//				if level > 255 {
+//					s.c.throwSyntaxError(0, "Maximum nesting level (256) exceeded")
+//				}
+//				idx := (level << 24) | uint32(stashIdx)
+//				base := scope.base
+//				code := scope.prg.code
+//				if this {
+//					if derivedCtor {
+//						for _, pc := range *aps {
+//							ap := &code[base+pc]
+//							switch (*ap).(type) {
+//							case loadStack:
+//								*ap = loadThisStash(idx)
+//							case initStack:
+//								*ap = initStash(idx)
+//							case initStackP:
+//								*ap = initStashP(idx)
+//							case resolveThisStack:
+//								*ap = resolveThisStash(idx)
+//							case _ret:
+//								*ap = cret(idx)
+//							default:
+//								s.c.assert(false, s.c.p.sourceOffset(pc), "Unsupported instruction for 'this'")
+//							}
+//						}
+//					} else {
+//						for _, pc := range *aps {
+//							ap := &code[base+pc]
+//							switch (*ap).(type) {
+//							case loadStack:
+//								*ap = loadStash(idx)
+//							case initStack:
+//								*ap = initStash(idx)
+//							case initStackP:
+//								*ap = initStashP(idx)
+//							default:
+//								s.c.assert(false, s.c.p.sourceOffset(pc), "Unsupported instruction for 'this'")
+//							}
+//						}
+//					}
+//				} else {
+//					for _, pc := range *aps {
+//						ap := &code[base+pc]
+//						switch i := (*ap).(type) {
+//						case loadStack:
+//							*ap = loadStash(idx)
+//						case initIndirect:
+//							*ap = initIndirect{idx: idx, getter: i.getter}
+//						case export:
+//							*ap = export{
+//								idx:      idx,
+//								callback: i.callback,
+//							}
+//						case exportLex:
+//							*ap = exportLex{
+//								idx:      idx,
+//								callback: i.callback,
+//							}
+//						case storeStack:
+//							*ap = storeStash(idx)
+//						case storeStackP:
+//							*ap = storeStashP(idx)
+//						case loadStackLex:
+//							*ap = loadStashLex(idx)
+//						case storeStackLex:
+//							*ap = storeStashLex(idx)
+//						case storeStackLexP:
+//							*ap = storeStashLexP(idx)
+//						case initStackP:
+//							*ap = initStashP(idx)
+//						case initStack:
+//							*ap = initStash(idx)
+//						case *loadMixed:
+//							i.idx = idx
+//						case *loadMixedLex:
+//							i.idx = idx
+//						case *resolveMixed:
+//							i.idx = idx
+//						case loadIndirect:
+//							// nothing needs to be changed in this case
+//						default:
+//							s.c.assert(false, s.c.p.sourceOffset(pc), "Unsupported instruction for binding: %T", i)
+//						}
+//					}
+//				}
+//			}
+//			stashIdx++
+//		} else {
+//			var idx int
+//			if !this {
+//				if i < s.numArgs {
+//					idx = -(i + 1)
+//				} else {
+//					stackIdx++
+//					idx = stackIdx + stackOffset
+//				}
+//			}
+//			for scope, aps := range b.accessPoints {
+//				var level int
+//				for sc := scope; sc != nil && sc != s; sc = sc.outer {
+//					if sc.needStash || sc.isDynamic() {
+//						level++
+//					}
+//				}
+//				if level > 255 {
+//					s.c.throwSyntaxError(0, "Maximum nesting level (256) exceeded")
+//				}
+//				code := scope.prg.code
+//				base := scope.base
+//				if this {
+//					if derivedCtor {
+//						for _, pc := range *aps {
+//							ap := &code[base+pc]
+//							switch (*ap).(type) {
+//							case loadStack:
+//								*ap = loadThisStack{}
+//							case initStack:
+//								// no-op
+//							case initStackP:
+//								// no-op
+//							case resolveThisStack:
+//								// no-op
+//							case _ret:
+//								// no-op, already in the right place
+//							default:
+//								s.c.assert(false, s.c.p.sourceOffset(pc), "Unsupported instruction for 'this'")
+//							}
+//						}
+//					} /*else {
+//						no-op
+//					}*/
+//				} else if argsInStash {
+//					for _, pc := range *aps {
+//						ap := &code[base+pc]
+//						switch i := (*ap).(type) {
+//						case loadStack:
+//							*ap = loadStack1(idx)
+//						case storeStack:
+//							*ap = storeStack1(idx)
+//						case storeStackP:
+//							*ap = storeStack1P(idx)
+//						case loadStackLex:
+//							*ap = loadStack1Lex(idx)
+//						case storeStackLex:
+//							*ap = storeStack1Lex(idx)
+//						case storeStackLexP:
+//							*ap = storeStack1LexP(idx)
+//						case initStackP:
+//							*ap = initStack1P(idx)
+//						case initStack:
+//							*ap = initStack1(idx)
+//						case *loadMixed:
+//							*ap = &loadMixedStack1{name: i.name, idx: idx, level: uint8(level), callee: i.callee}
+//						case *loadMixedLex:
+//							*ap = &loadMixedStack1Lex{name: i.name, idx: idx, level: uint8(level), callee: i.callee}
+//						case *resolveMixed:
+//							*ap = &resolveMixedStack1{typ: i.typ, name: i.name, idx: idx, level: uint8(level), strict: i.strict}
+//						default:
+//							s.c.assert(false, s.c.p.sourceOffset(pc), "Unsupported instruction for binding: %T", i)
+//						}
+//					}
+//				} else {
+//					for _, pc := range *aps {
+//						ap := &code[base+pc]
+//						switch i := (*ap).(type) {
+//						case loadStack:
+//							*ap = loadStack(idx)
+//						case storeStack:
+//							*ap = storeStack(idx)
+//						case storeStackP:
+//							*ap = storeStackP(idx)
+//						case loadStackLex:
+//							*ap = loadStackLex(idx)
+//						case storeStackLex:
+//							*ap = storeStackLex(idx)
+//						case storeStackLexP:
+//							*ap = storeStackLexP(idx)
+//						case initStack:
+//							*ap = initStack(idx)
+//						case initStackP:
+//							*ap = initStackP(idx)
+//						case *loadMixed:
+//							*ap = &loadMixedStack{name: i.name, idx: idx, level: uint8(level), callee: i.callee}
+//						case *loadMixedLex:
+//							*ap = &loadMixedStackLex{name: i.name, idx: idx, level: uint8(level), callee: i.callee}
+//						case *resolveMixed:
+//							*ap = &resolveMixedStack{typ: i.typ, name: i.name, idx: idx, level: uint8(level), strict: i.strict}
+//						default:
+//							s.c.assert(false, s.c.p.sourceOffset(pc), "Unsupported instruction for binding: %T", i)
+//						}
+//					}
+//				}
+//			}
+//		}
+//	}
+//	for _, nested := range s.nested {
+//		nested.finaliseVarAlloc(stackIdx + stackOffset)
+//	}
+//	return stashIdx, stackIdx
+//}
 
 func (s *scope) moveArgsToStash() {
 	for _, b := range s.bindings {
@@ -897,13 +1273,19 @@ func (s *scope) adjustBase(delta int) {
 	}
 }
 
+
 func (s *scope) makeNamesMap() map[unistring.String]uint32 {
 	l := len(s.bindings)
 	if l == 0 {
 		return nil
 	}
 	names := make(map[unistring.String]uint32, l)
+
 	for i, b := range s.bindings {
+		// Skip 'this' binding in the names map as it's handled specially
+		if b.name == thisBindingName {
+			continue
+		}
 		idx := uint32(i)
 		if b.isConst {
 			idx |= maskConst
@@ -914,13 +1296,23 @@ func (s *scope) makeNamesMap() map[unistring.String]uint32 {
 		if b.isVar {
 			idx |= maskVar
 		}
+		if b.inStash {
+			idx |= maskIndirect
+		}
 		if b.getIndirect != nil {
 			idx |= maskIndirect
 		}
 		names[b.name] = idx
 	}
+
+	if len(names) == 0 {
+		return nil
+	}
 	return names
 }
+
+
+
 
 func (s *scope) isDynamic() bool {
 	return s.dynLookup || s.dynamic
@@ -979,6 +1371,7 @@ func (c *compiler) compileModule(module *SourceTextModuleRecord) {
 		funcType:    funcModule,
 		extensible:  true,
 		adjustStack: true,
+		names:       c.scope.makeNamesMap(),
 	})
 	for _, in := range module.indirectExportEntries {
 		v, ambiguous := module.ResolveExport(in.exportName)

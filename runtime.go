@@ -220,6 +220,9 @@ type StackFrame struct {
 	prg      *Program
 	funcName unistring.String
 	pc       int
+	File     string
+	Line     int
+	Index    int
 }
 
 func (f *StackFrame) SrcName() string {
@@ -1312,18 +1315,41 @@ func New() *Runtime {
 	return r
 }
 
+// AttachDebugger will attach and return a Debugger instance to the runtime.
+// This will also compile all future scripts directly ran through it in a debug mode until it's detached
+// Another way to compile in debug mode is to use CompileASTDebug
+// Only 1 debugger can be attached at a time
+// This method needs to be called before running any script and to call Continue on the debugger before running a script
+// in order to get when it blocks on a debugger statement or breakpoint
+// There can only be 1 debugger attached at a time, attaching more is has undefined behaviour
+func (r *Runtime) AttachDebugger() *Debugger {
+	r.vm.debugMode = true // maybe don't do this?
+	r.vm.debugger = newDebugger(r.vm)
+	return r.vm.debugger
+}
+
+// GetDebugger returns the attached debugger, or nil if no debugger is attached
+func (r *Runtime) GetDebugger() *Debugger {
+	return r.vm.debugger
+}
+
 // Compile creates an internal representation of the JavaScript code that can be later run using the Runtime.RunProgram()
 // method. This representation is not linked to a runtime in any way and can be run in multiple runtimes (possibly
 // at the same time).
 func Compile(name, src string, strict bool) (*Program, error) {
-	return compile(name, src, strict, true, nil)
+	return compile(name, src, strict, true, nil, false)
 }
 
 // CompileAST creates an internal representation of the JavaScript code that can be later run using the Runtime.RunProgram()
 // method. This representation is not linked to a runtime in any way and can be run in multiple runtimes (possibly
 // at the same time).
 func CompileAST(prg *js_ast.Program, strict bool) (*Program, error) {
-	return compileAST(prg, strict, true, nil)
+	return compileAST(prg, strict, true, nil, false)
+}
+
+// CompileASTDebug is like CompileAST but enables debug mode when compiling
+func CompileASTDebug(prg *js_ast.Program, strict bool) (*Program, error) {
+	return compileAST(prg, strict, true, nil, true)
 }
 
 // MustCompile is like Compile but panics if the code cannot be compiled.
@@ -1359,17 +1385,16 @@ func Parse(name, src string, options ...parser.Option) (prg *js_ast.Program, err
 	return
 }
 
-func compile(name, src string, strict, inGlobal bool, evalVm *vm, parserOptions ...parser.Option) (p *Program, err error) {
+func compile(name, src string, strict, inGlobal bool, evalVm *vm, debug bool, parserOptions ...parser.Option) (p *Program, err error) {
 	prg, err := Parse(name, src, parserOptions...)
 	if err != nil {
 		return
 	}
 
-	return compileAST(prg, strict, inGlobal, evalVm)
+	return compileAST(prg, strict, inGlobal, evalVm, debug)
 }
-
-func compileAST(prg *js_ast.Program, strict, inGlobal bool, evalVm *vm) (p *Program, err error) {
-	c := newCompiler()
+func compileAST(prg *js_ast.Program, strict, inGlobal bool, evalVm *vm, debug bool) (p *Program, err error) {
+	c := newCompiler(debug)
 
 	defer func() {
 		if x := recover(); x != nil {
@@ -1385,11 +1410,18 @@ func compileAST(prg *js_ast.Program, strict, inGlobal bool, evalVm *vm) (p *Prog
 
 	c.compile(prg, strict, inGlobal, evalVm)
 	p = c.p
+	if debug && p != nil && p.debugSymbols != nil {
+		symbolCount := 0
+		for _, vars := range p.debugSymbols.scopeMap {
+			symbolCount += len(vars)
+		}
+		fmt.Printf("[COMPILER-DEBUG] generated %d debug symbols across %d PCs for %s\n", symbolCount, len(p.debugSymbols.scopeMap), p.src.Name())
+	}
 	return
 }
 
 func (r *Runtime) compile(name, src string, strict, inGlobal bool, evalVm *vm) (p *Program, err error) {
-	p, err = compile(name, src, strict, inGlobal, evalVm, r.parserOptions...)
+	p, err = compile(name, src, strict, inGlobal, evalVm, r.vm.debugMode, r.parserOptions...)
 	if err != nil {
 		switch x1 := err.(type) {
 		case *CompilerSyntaxError:
