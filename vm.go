@@ -127,6 +127,7 @@ type stashRef struct {
 	n   unistring.String
 	v   *[]Value
 	idx int
+	vm  *vm
 }
 
 func (r *stashRef) get() Value {
@@ -182,9 +183,10 @@ type stashRefLex struct {
 func (r *stashRefLex) get() Value {
 	v := (*r.v)[r.idx]
 	if v == nil {
-		// In debug mode, parameters and some variables may not be initialized yet
-		// Return undefined instead of panicking to allow graceful handling
-		return _undefined
+		if r.vm != nil && r.vm.debugger != nil {
+			return _undefined
+		}
+		panic(errAccessBeforeInit)
 	}
 	return v
 }
@@ -485,11 +487,14 @@ func (s *stash) initByIdx(idx uint32, v Value) {
 	if s.obj != nil {
 		panic("Attempt to init by idx into an object scope")
 	}
-	// Grow the values slice defensively if the compiler emitted a higher index than preallocated.
-	if int(idx) >= len(s.values) {
-		needed := int(idx) + 1
-		extra := make([]Value, needed-len(s.values))
-		s.values = append(s.values, extra...)
+
+	if s.vm != nil && s.vm.debugMode {
+		// Grow the values slice defensively if the compiler emitted a higher index than preallocated.
+		if int(idx) >= len(s.values) {
+			needed := int(idx) + 1
+			extra := make([]Value, needed-len(s.values))
+			s.values = append(s.values, extra...)
+		}
 	}
 	s.values[idx] = v
 }
@@ -516,9 +521,17 @@ func (s *stash) getByName(name unistring.String) (v Value, exists bool) {
 	if idx, exists := s.names[name]; exists {
 		v := s.values[idx&^maskTyp]
 		if v == nil {
-			// In debug mode, return undefined instead of panicking
-			// This handles function parameters and variables that haven't been initialized yet
-			v = _undefined
+			if s.vm != nil && s.vm.debugMode {
+				// In debug mode, return undefined instead of panicking
+				// This handles function parameters and variables that haven't been initialized yet
+				v = _undefined
+			} else {
+				if idx&maskVar == 0 {
+					panic(errAccessBeforeInit)
+				} else {
+					v = _undefined
+				}
+			}
 		} else if idx&maskIndirect != 0 {
 			var f func(*vm) Value
 			_ = s.vm.r.ExportTo(v, &f)
@@ -548,6 +561,7 @@ func (s *stash) getRefByName(name unistring.String, strict bool) ref {
 							n:   name,
 							v:   &s.values,
 							idx: int(idx &^ maskTyp),
+							vm:  s.vm,
 						},
 					}
 				} else {
@@ -557,6 +571,7 @@ func (s *stash) getRefByName(name unistring.String, strict bool) ref {
 								n:   name,
 								v:   &s.values,
 								idx: int(idx &^ maskTyp),
+								vm:  s.vm,
 							},
 						},
 						strictConst: strict || (idx&maskStrict != 0),
@@ -567,6 +582,7 @@ func (s *stash) getRefByName(name unistring.String, strict bool) ref {
 					n:   name,
 					v:   &s.values,
 					idx: int(idx &^ maskTyp),
+					vm:  s.vm,
 				}
 			}
 		}
@@ -697,7 +713,6 @@ func (vm *vm) runWithProfiler() bool {
 	return false
 }
 
-
 func (vm *vm) debug() {
 	if vm.profTracker != nil && !vm.runWithProfiler() {
 		return
@@ -744,71 +759,71 @@ func (vm *vm) debug() {
 					shouldBreak := false
 					breakReason := ""
 
-				if vm.debugger.stepIn {
-					// For step-in: break only if:
-					// 1. We've advanced past the initial PC (ensuring we executed at least one instruction)
-					// 2. We're at a DIFFERENT line (currentLine != prevLine), AND
-					// 3. VM is in a valid state (vm.sb >= 0, not transitioning contexts)
-					// Note: We DON'T check stack depth - we want to step into function calls
-					pcAdvanced := currentPC != prevPC
-					lineChanged := prevLine != currentLine
-					vmInValidState := vm.sb >= 0
-					shouldBreak = pcAdvanced && lineChanged && vmInValidState
-					breakReason = "stepIn"
-					if vm.debugger.enableDebugLogging {
-						fmt.Printf("[VM] stepIn=true, PC=%d (prev=%d), line=%d (prev=%d), depth=%d (prev=%d), pcAdvanced=%v, lineChanged=%v, vmInValidState=%v (sb=%d), shouldBreak=%v\n",
-							currentPC, prevPC, currentLine, prevLine, currentStackDepth, prevStackDepth, pcAdvanced, lineChanged, vmInValidState, vm.sb, shouldBreak)
-					}
-				} else if vm.debugger.next {
-					// For step-over: break only if:
-					// 1. We've advanced past the initial PC (ensuring we executed at least one instruction)
-					// 2. We're at a DIFFERENT line (currentLine != prevLine), AND
-					// 3. We're at the same depth or returned from a call (shallower than where we STARTED), AND
-					// 4. VM is in a valid state (vm.sb >= 0, not transitioning contexts)
-					// CRITICAL: Compare against stepOverTargetDepth (where we STARTED), not prevStackDepth (which changes as we move)
-					pcAdvanced := currentPC != prevPC
-					lineChanged := prevLine != currentLine
-					atValidDepth := currentStackDepth <= vm.debugger.stepOverTargetDepth
-					vmInValidState := vm.sb >= 0
-					shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState
-					breakReason = "next"
-					if vm.debugger.enableDebugLogging {
-						fmt.Printf("[VM] next=true, PC=%d (prev=%d), line=%d (prev=%d), depth=%d (target=%d, prev=%d), pcAdvanced=%v, lineChanged=%v, atValidDepth=%v, vmInValidState=%v (sb=%d), shouldBreak=%v\n",
-							currentPC, prevPC, currentLine, prevLine, currentStackDepth, vm.debugger.stepOverTargetDepth, prevStackDepth, pcAdvanced, lineChanged, atValidDepth, vmInValidState, vm.sb, shouldBreak)
-					}
-				} else {
-					// For regular breakpoint: break if location changed OR if not in continuing mode
-					// When continuing=true, we need to make sure we actually move away from the current location
-					// NOTE: For sameLocation, we check line and filename, NOT PC.
-					// PC can advance multiple times on the same source line (e.g., function calls with multiple instructions)
-					// so checking PC would require multiple Continue clicks for complex lines.
-					sameLocation := prevFilename == currentFilename &&
-						prevLine == currentLine
-
-					// If we're continuing and at the exact same source line, skip this break
-					// This prevents the "requires 2 clicks" issue on complex lines like function calls
-					if vm.debugger.continuing && sameLocation {
-						shouldBreak = false
-						breakReason = "continuing-skip-same-line"
-						// Clear the continuing flag immediately after the first check
-						// This ensures we only skip the breakpoint check once at the initial location
-						vm.debugger.continuing = false
+					if vm.debugger.stepIn {
+						// For step-in: break only if:
+						// 1. We've advanced past the initial PC (ensuring we executed at least one instruction)
+						// 2. We're at a DIFFERENT line (currentLine != prevLine), AND
+						// 3. VM is in a valid state (vm.sb >= 0, not transitioning contexts)
+						// Note: We DON'T check stack depth - we want to step into function calls
+						pcAdvanced := currentPC != prevPC
+						lineChanged := prevLine != currentLine
+						vmInValidState := vm.sb >= 0
+						shouldBreak = pcAdvanced && lineChanged && vmInValidState
+						breakReason = "stepIn"
 						if vm.debugger.enableDebugLogging {
-							fmt.Printf("[VM] Cleared continuing flag after skipping same line (PC %d->%d, line %d)\n",
-								prevPC, currentPC, currentLine)
+							fmt.Printf("[VM] stepIn=true, PC=%d (prev=%d), line=%d (prev=%d), depth=%d (prev=%d), pcAdvanced=%v, lineChanged=%v, vmInValidState=%v (sb=%d), shouldBreak=%v\n",
+								currentPC, prevPC, currentLine, prevLine, currentStackDepth, prevStackDepth, pcAdvanced, lineChanged, vmInValidState, vm.sb, shouldBreak)
+						}
+					} else if vm.debugger.next {
+						// For step-over: break only if:
+						// 1. We've advanced past the initial PC (ensuring we executed at least one instruction)
+						// 2. We're at a DIFFERENT line (currentLine != prevLine), AND
+						// 3. We're at the same depth or returned from a call (shallower than where we STARTED), AND
+						// 4. VM is in a valid state (vm.sb >= 0, not transitioning contexts)
+						// CRITICAL: Compare against stepOverTargetDepth (where we STARTED), not prevStackDepth (which changes as we move)
+						pcAdvanced := currentPC != prevPC
+						lineChanged := prevLine != currentLine
+						atValidDepth := currentStackDepth <= vm.debugger.stepOverTargetDepth
+						vmInValidState := vm.sb >= 0
+						shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState
+						breakReason = "next"
+						if vm.debugger.enableDebugLogging {
+							fmt.Printf("[VM] next=true, PC=%d (prev=%d), line=%d (prev=%d), depth=%d (target=%d, prev=%d), pcAdvanced=%v, lineChanged=%v, atValidDepth=%v, vmInValidState=%v (sb=%d), shouldBreak=%v\n",
+								currentPC, prevPC, currentLine, prevLine, currentStackDepth, vm.debugger.stepOverTargetDepth, prevStackDepth, pcAdvanced, lineChanged, atValidDepth, vmInValidState, vm.sb, shouldBreak)
 						}
 					} else {
-						// Different location or not continuing - break normally
-						locationChanged := prevFilename != currentFilename || prevLine != currentLine
-						shouldBreak = locationChanged
-						breakReason = "breakpoint"
-						// No need to clear continuing here since it was already cleared above
+						// For regular breakpoint: break if location changed OR if not in continuing mode
+						// When continuing=true, we need to make sure we actually move away from the current location
+						// NOTE: For sameLocation, we check line and filename, NOT PC.
+						// PC can advance multiple times on the same source line (e.g., function calls with multiple instructions)
+						// so checking PC would require multiple Continue clicks for complex lines.
+						sameLocation := prevFilename == currentFilename &&
+							prevLine == currentLine
+
+						// If we're continuing and at the exact same source line, skip this break
+						// This prevents the "requires 2 clicks" issue on complex lines like function calls
+						if vm.debugger.continuing && sameLocation {
+							shouldBreak = false
+							breakReason = "continuing-skip-same-line"
+							// Clear the continuing flag immediately after the first check
+							// This ensures we only skip the breakpoint check once at the initial location
+							vm.debugger.continuing = false
+							if vm.debugger.enableDebugLogging {
+								fmt.Printf("[VM] Cleared continuing flag after skipping same line (PC %d->%d, line %d)\n",
+									prevPC, currentPC, currentLine)
+							}
+						} else {
+							// Different location or not continuing - break normally
+							locationChanged := prevFilename != currentFilename || prevLine != currentLine
+							shouldBreak = locationChanged
+							breakReason = "breakpoint"
+							// No need to clear continuing here since it was already cleared above
+						}
+						if vm.debugger.enableDebugLogging {
+							fmt.Printf("[VM] breakpoint check: continuing=%v, sameLocation=%v (file:%v line:%v PC:%d->%d), shouldBreak=%v, reason=%s\n",
+								vm.debugger.continuing, sameLocation, prevFilename == currentFilename, prevLine == currentLine, prevPC, currentPC, shouldBreak, breakReason)
+						}
 					}
-					if vm.debugger.enableDebugLogging {
-						fmt.Printf("[VM] breakpoint check: continuing=%v, sameLocation=%v (file:%v line:%v PC:%d->%d), shouldBreak=%v, reason=%s\n",
-							vm.debugger.continuing, sameLocation, prevFilename == currentFilename, prevLine == currentLine, prevPC, currentPC, shouldBreak, breakReason)
-					}
-				}
 
 					if shouldBreak {
 						if vm.debugger.enableDebugLogging {
@@ -820,7 +835,7 @@ func (vm *vm) debug() {
 						vm.debugger.lastBreakpoint.stackDepth = currentStackDepth
 						vm.debugger.next = false
 						vm.debugger.stepIn = false
-						vm.debugger.continuing = false  // Clear continuing flag when we break
+						vm.debugger.continuing = false // Clear continuing flag when we break
 						vm.debugger.updateCurrentLine()
 						vm.debugger.activate(BreakpointActivation, vm.debugger.Filename(), vm.debugger.currentLine)
 					}
@@ -1471,11 +1486,15 @@ func (e export) exec(vm *vm) {
 		stash = stash.outer
 	}
 	e.callback(vm, func() Value {
-		v := stash.getByIdx(idx)
-		if v == nil {
-			return _undefined
+		if vm != nil && vm.debugMode {
+			v := stash.getByIdx(idx)
+			if v == nil {
+				return _undefined
+			}
+			return v
+		} else {
+			return stash.getByIdx(idx)
 		}
-		return v
 	})
 	vm.pc++
 }
@@ -1494,12 +1513,16 @@ func (e exportLex) exec(vm *vm) {
 		stash = stash.outer
 	}
 	e.callback(vm, func() Value {
-		v := stash.getByIdx(idx)
-		if v == nil {
+		if vm != nil && vm.debugMode {
 			// In debug mode, return undefined instead of panicking for uninitialized parameters
 			return _undefined
+		} else {
+			v := stash.getByIdx(idx)
+			if v == nil {
+				panic(errAccessBeforeInit)
+			}
+			return v
 		}
-		return v
 	})
 	vm.pc++
 }
@@ -2131,7 +2154,6 @@ func (_debugger) exec(vm *vm) {
 		vm.debugger.activate(DebuggerStatementActivation, vm.debugger.Filename(), vm.debugger.Line())
 	}
 }
-
 
 type jump int32
 
@@ -3391,9 +3413,14 @@ func (g loadStashLex) exec(vm *vm) {
 
 	v := stash.getByIdx(idx)
 	if v == nil {
-		// In debug mode, return undefined instead of throwing TDZ error
-		// This handles function parameters and variables not yet initialized
-		v = _undefined
+		if vm != nil && vm.debugMode {
+			// In debug mode, return undefined instead of throwing TDZ error
+			// This handles function parameters and variables not yet initialized
+			v = _undefined
+		} else {
+			vm.throw(errAccessBeforeInit)
+			return
+		}
 	}
 	vm.push(v)
 	vm.pc++
@@ -3465,8 +3492,14 @@ func (g *loadMixedLex) exec(vm *vm) {
 	if stash != nil {
 		v := stash.getByIdx(idx)
 		if v == nil {
-			// In debug mode, push undefined instead of throwing TDZ error
-			v = _undefined
+			if vm != nil && vm.debugMode {
+				// In debug mode, return undefined instead of throwing TDZ error
+				// This handles function parameters and variables not yet initialized
+				v = _undefined
+			} else {
+				vm.throw(errAccessBeforeInit)
+				return
+			}
 		}
 		vm.push(v)
 	}
@@ -3606,13 +3639,14 @@ type resolveMixed struct {
 	strict bool
 }
 
-func newStashRef(typ varType, name unistring.String, v *[]Value, idx int) ref {
+func newStashRef(typ varType, name unistring.String, v *[]Value, idx int, vm *vm) ref {
 	switch typ {
 	case varTypeVar:
 		return &stashRef{
 			n:   name,
 			v:   v,
 			idx: idx,
+			vm:  vm,
 		}
 	case varTypeLet:
 		return &stashRefLex{
@@ -3620,6 +3654,7 @@ func newStashRef(typ varType, name unistring.String, v *[]Value, idx int) ref {
 				n:   name,
 				v:   v,
 				idx: idx,
+				vm:  vm,
 			},
 		}
 	case varTypeConst, varTypeStrictConst:
@@ -3629,6 +3664,7 @@ func newStashRef(typ varType, name unistring.String, v *[]Value, idx int) ref {
 					n:   name,
 					v:   v,
 					idx: idx,
+					vm:  vm,
 				},
 			},
 			strictConst: typ == varTypeStrictConst,
@@ -3651,7 +3687,7 @@ func (r *resolveMixed) exec(vm *vm) {
 	}
 
 	if stash != nil {
-		ref = newStashRef(r.typ, r.name, &stash.values, int(idx))
+		ref = newStashRef(r.typ, r.name, &stash.values, int(idx), vm)
 		goto end
 	}
 
@@ -3694,7 +3730,7 @@ func (r *resolveMixedStack) exec(vm *vm) {
 		idx = vm.sb - r.idx
 	}
 
-	ref = newStashRef(r.typ, r.name, (*[]Value)(&vm.stack), idx)
+	ref = newStashRef(r.typ, r.name, (*[]Value)(&vm.stack), idx, vm)
 
 end:
 	vm.refStack = append(vm.refStack, ref)
@@ -3713,7 +3749,7 @@ func (r *resolveMixedStack1) exec(vm *vm) {
 		stash = stash.outer
 	}
 
-	ref = newStashRef(r.typ, r.name, (*[]Value)(&vm.stack), vm.sb+r.idx)
+	ref = newStashRef(r.typ, r.name, (*[]Value)(&vm.stack), vm.sb+r.idx, vm)
 
 end:
 	vm.refStack = append(vm.refStack, ref)
@@ -4001,19 +4037,30 @@ type enterBlock struct {
 func (e *enterBlock) exec(vm *vm) {
 	// Create stash if we have either stash size or names to track
 	if e.stashSize > 0 || len(e.names) > 0 {
-		vm.newStash()
-		if e.stashSize > 0 {
-			vm.stash.values = make([]Value, e.stashSize)
-		}
-		if len(e.names) > 0 {
-			// Create a copy of the names map
-			vm.stash.names = make(map[unistring.String]uint32, len(e.names))
-			for k, v := range e.names {
-				vm.stash.names[k] = v
+		if vm != nil && vm.debugMode {
+			if e.stashSize > 0 || len(e.names) > 0 {
+				vm.newStash()
+				if e.stashSize > 0 {
+					vm.stash.values = make([]Value, e.stashSize)
+				}
+				if len(e.names) > 0 {
+					// Create a copy of the names map
+					vm.stash.names = make(map[unistring.String]uint32, len(e.names))
+					for k, v := range e.names {
+						vm.stash.names[k] = v
+					}
+				}
+			}
+		} else {
+			if e.stashSize > 0 {
+				vm.newStash()
+				vm.stash.values = make([]Value, e.stashSize)
+				if len(e.names) > 0 {
+					vm.stash.names = e.names
+				}
 			}
 		}
 	}
-
 	ss := int(e.stackSize)
 	vm.stack.expand(vm.sp + ss - 1)
 	vv := vm.stack[vm.sp : vm.sp+ss]
@@ -4034,10 +4081,14 @@ func (e *enterCatchBlock) exec(vm *vm) {
 	vm.newStash()
 	vm.stash.values = make([]Value, e.stashSize)
 	if len(e.names) > 0 {
-		// Create a copy of the names map instead of sharing it
-		vm.stash.names = make(map[unistring.String]uint32, len(e.names))
-		for k, v := range e.names {
-			vm.stash.names[k] = v
+		if vm != nil && vm.debugMode {
+			// Create a copy of the names map instead of sharing it
+			vm.stash.names = make(map[unistring.String]uint32, len(e.names))
+			for k, v := range e.names {
+				vm.stash.names[k] = v
+			}
+		} else {
+			vm.stash.names = e.names
 		}
 	}
 	vm.sp--
@@ -4107,12 +4158,15 @@ func (e *enterFunc) exec(vm *vm) {
 			}
 			stash.names = m
 		} else {
-			// Create a copy of the names map instead of sharing it
-			m := make(map[unistring.String]uint32, len(e.names))
-			for name, idx := range e.names {
-				m[name] = idx
+			if vm != nil && vm.debugMode {
+				// Create a copy of the names map instead of sharing it
+				vm.stash.names = make(map[unistring.String]uint32, len(e.names))
+				for k, v := range e.names {
+					vm.stash.names[k] = v
+				}
+			} else {
+				vm.stash.names = e.names
 			}
-			stash.names = m
 		}
 	}
 	ss := int(e.stackSize)
@@ -4180,12 +4234,16 @@ func (e *enterFunc1) exec(vm *vm) {
 			}
 			stash.names = m
 		} else {
-			// Create a copy of the names map instead of sharing it
-			m := make(map[unistring.String]uint32, len(e.names))
-			for name, idx := range e.names {
-				m[name] = idx
+			if vm != nil && vm.debugMode {
+				// Create a copy of the names map instead of sharing it
+				m := make(map[unistring.String]uint32, len(e.names))
+				for name, idx := range e.names {
+					m[name] = idx
+				}
+				stash.names = m
+			} else {
+				stash.names = e.names
 			}
-			stash.names = m
 		}
 	}
 	offset := vm.args - int(e.argsToCopy)
@@ -4212,14 +4270,12 @@ func (e *enterFunc1) exec(vm *vm) {
 // scope. When used in conjunction with enterFunc1 adjustStack is set to true which
 // causes the arguments to be removed from the stack.
 type enterFuncBody struct {
-	names     map[unistring.String]uint32
+	names map[unistring.String]uint32
 	enterBlock
 	funcType    funcType
 	extensible  bool
 	adjustStack bool
 }
-
-
 
 func (e *enterFuncBody) exec(vm *vm) {
 	if e.stashSize > 0 || e.extensible {
@@ -4236,11 +4292,15 @@ func (e *enterFuncBody) exec(vm *vm) {
 				}
 				stash.names = m
 			} else {
-				m := make(map[unistring.String]uint32, len(e.names))
-				for name, idx := range e.names {
-					m[name] = idx
+				if vm != nil && vm.debugMode {
+					m := make(map[unistring.String]uint32, len(e.names))
+					for name, idx := range e.names {
+						m[name] = idx
+					}
+					stash.names = m
+				} else {
+					stash.names = e.names
 				}
-				stash.names = m
 			}
 		}
 	}

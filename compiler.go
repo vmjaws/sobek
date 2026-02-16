@@ -30,7 +30,7 @@ const (
 	maskDeletable = 1 << 29
 	maskStrict    = maskDeletable
 	maskIndirect  = 1 << 28
-	maskTyp = maskConst | maskVar | maskDeletable | maskIndirect
+	maskTyp       = maskConst | maskVar | maskDeletable | maskIndirect
 	maskIndex     = 0x0FFFFFFF
 )
 
@@ -90,14 +90,14 @@ type DebugSymbols struct {
 }
 
 type VarLocation struct {
-	Name      string
-	InStash   bool
-	StashIdx  uint32  // if InStash=true, the stash index
-	StackIdx  int     // if InStash=false, the stack index
-	IsParam   bool
-	IsConst   bool
-	StartPC   int     // PC where variable becomes available
-	EndPC     int     // PC where variable goes out of scope
+	Name     string
+	InStash  bool
+	StashIdx uint32 // if InStash=true, the stash index
+	StackIdx int    // if InStash=false, the stack index
+	IsParam  bool
+	IsConst  bool
+	StartPC  int // PC where variable becomes available
+	EndPC    int // PC where variable goes out of scope
 }
 
 type compiler struct {
@@ -658,36 +658,38 @@ func (s *scope) nearestThis() *scope {
 	return nil
 }
 
-
 func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 	argsInStash := false
 	if f := s.nearestFunction(); f != nil {
 		argsInStash = f.argsInStash
 	}
 	stackIdx, stashIdx := 0, 0
-	allInStash := s.isDynamic() || s.c.debug
-	
-	// CRITICAL FIX: In debug mode, if all variables go in stash, args must too!
-	// This ensures function parameters are accessible when allInStash=true
-	if s.c.debug && allInStash && s.isFunction() && !argsInStash {
-		// Check if this scope has any argument bindings
-		hasArgs := false
-		for _, b := range s.bindings {
-			if b.isArg {
-				hasArgs = true
-				break
+	allInStash := s.isDynamic()
+
+	if s.c.debug {
+		// CRITICAL FIX: In debug mode, if all variables go in stash, args must too!
+		// This ensures function parameters are accessible when allInStash=true
+		if s.c.debug && allInStash && s.isFunction() && !argsInStash {
+			// Check if this scope has any argument bindings
+			hasArgs := false
+			for _, b := range s.bindings {
+				if b.isArg {
+					hasArgs = true
+					break
+				}
+			}
+			if hasArgs {
+				s.moveArgsToStash()
+				argsInStash = true
 			}
 		}
-		if hasArgs {
-			s.moveArgsToStash()
-			argsInStash = true
+
+		if s.c.debug {
+			fmt.Printf("[COMPILER-DEBUG] finaliseVarAlloc: allInStash=%v (isDynamic=%v, debug=%v), argsInStash=%v\n",
+				allInStash, s.isDynamic(), s.c.debug, argsInStash)
 		}
 	}
-	
-	if s.c.debug {
-		fmt.Printf("[COMPILER-DEBUG] finaliseVarAlloc: allInStash=%v (isDynamic=%v, debug=%v), argsInStash=%v\n",
-			allInStash, s.isDynamic(), s.c.debug, argsInStash)
-	}
+
 	var derivedCtor bool
 	if fs := s.nearestThis(); fs != nil && fs.funcType == funcDerivedCtor {
 		derivedCtor = true
@@ -707,9 +709,11 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 			this = true
 		}
 		if allInStash || b.inStash {
-			// CRITICAL: Mark binding as in stash
-			b.inStash = true
 
+			if s.c.debug {
+				// CRITICAL: Mark binding as in stash
+				b.inStash = true
+			}
 
 			for scope, aps := range b.accessPoints {
 				var level uint32
@@ -818,7 +822,7 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 					idx = stackIdx + stackOffset
 				}
 			}
-			
+
 			for scope, aps := range b.accessPoints {
 				var level int
 				for sc := scope; sc != nil && sc != s; sc = sc.outer {
@@ -928,7 +932,7 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 	}
 
 	if s.c.debug {
-		fmt.Printf("[COMPILER-DEBUG] Scope finalised: %d bindings, stackOffset=%d, stashIdx=%d, stackIdx=%d\n", 
+		fmt.Printf("[COMPILER-DEBUG] Scope finalised: %d bindings, stackOffset=%d, stashIdx=%d, stackIdx=%d\n",
 			len(s.bindings), stackOffset, stashIdx, stackIdx)
 		for i, b := range s.bindings {
 			fmt.Printf("[COMPILER-DEBUG]   Binding[%d]: name=%s, isVar=%v, isArg=%v, isConst=%v, inStash=%v\n",
@@ -942,10 +946,10 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 	if s.c.p.debugSymbols == nil {
 		return
 	}
-	
+
 	stashIdx := 0
 	stackIdx := 0
-	
+
 	for i, b := range s.bindings {
 		// Skip special bindings
 		if b.name == thisBindingName {
@@ -999,15 +1003,13 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 				varLoc,
 			)
 		}
-		
+
 		if s.c.debug {
 			fmt.Printf("[COMPILER-DEBUG]   Debug symbol: %s, inStash=%v, stashIdx=%d, stackIdx=%d, PC range=[%d-%d]\n",
 				varLoc.Name, varLoc.InStash, varLoc.StashIdx, varLoc.StackIdx, minPC, maxPC)
 		}
 	}
 }
-
-
 
 //func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 //	argsInStash := false
@@ -1273,7 +1275,6 @@ func (s *scope) adjustBase(delta int) {
 	}
 }
 
-
 func (s *scope) makeNamesMap() map[unistring.String]uint32 {
 	l := len(s.bindings)
 	if l == 0 {
@@ -1282,9 +1283,11 @@ func (s *scope) makeNamesMap() map[unistring.String]uint32 {
 	names := make(map[unistring.String]uint32, l)
 
 	for i, b := range s.bindings {
-		// Skip 'this' binding in the names map as it's handled specially
-		if b.name == thisBindingName {
-			continue
+		if s.c.debug {
+			// Skip 'this' binding in the names map as it's handled specially
+			if b.name == thisBindingName {
+				continue
+			}
 		}
 		idx := uint32(i)
 		if b.isConst {
@@ -1296,23 +1299,23 @@ func (s *scope) makeNamesMap() map[unistring.String]uint32 {
 		if b.isVar {
 			idx |= maskVar
 		}
-		if b.inStash {
-			idx |= maskIndirect
+		if s.c.debug {
+			if b.inStash {
+				idx |= maskIndirect
+			}
 		}
 		if b.getIndirect != nil {
 			idx |= maskIndirect
 		}
 		names[b.name] = idx
 	}
-
-	if len(names) == 0 {
-		return nil
+	if s.c.debug {
+		if len(names) == 0 {
+			return nil
+		}
 	}
 	return names
 }
-
-
-
 
 func (s *scope) isDynamic() bool {
 	return s.dynLookup || s.dynamic

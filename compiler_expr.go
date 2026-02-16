@@ -7,7 +7,6 @@ import (
 	"github.com/grafana/sobek/file"
 	"github.com/grafana/sobek/token"
 	"github.com/grafana/sobek/unistring"
-
 )
 
 type compiledExpr interface {
@@ -1521,36 +1520,36 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				}
 			}
 		}
+		if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+			// CAPTURE varScope info BEFORE popping
+			varScopeNames := varScope.makeNamesMap()
+			varScopeDynamic := varScope.dynamic
+			varScopeStashSize := 0
+			varScopeStackSize := 0
+			for _, b := range varScope.bindings {
+				if b.inStash {
+					varScopeStashSize++
+				} else {
+					varScopeStackSize++
+				}
+			}
 
-		// CAPTURE varScope info BEFORE popping
-		varScopeNames := varScope.makeNamesMap()
-		varScopeDynamic := varScope.dynamic
-		varScopeStashSize := 0
-		varScopeStackSize := 0
-		for _, b := range varScope.bindings {
-			if b.inStash {
-				varScopeStashSize++
-			} else {
-				varScopeStackSize++
+			e.c.popScope() // Now pop varScope
+
+			// Now create enterFuncBody with captured varScope info
+			if enterFunc2Mark != -1 {
+				ef2 := &enterFuncBody{
+					enterBlock: enterBlock{
+						names:     varScopeNames,
+						stashSize: uint32(varScopeStashSize),
+						stackSize: uint32(varScopeStackSize),
+					},
+					extensible: varScopeDynamic,
+					funcType:   e.typ,
+				}
+				e.c.p.code[enterFunc2Mark] = ef2
 			}
 		}
-
-		e.c.popScope()  // Now pop varScope
-
-		// Now create enterFuncBody with captured varScope info
-		if enterFunc2Mark != -1 {
-			ef2 := &enterFuncBody{
-				enterBlock: enterBlock{
-					names:     varScopeNames,
-					stashSize: uint32(varScopeStashSize),
-					stackSize: uint32(varScopeStackSize),
-				},
-				extensible: varScopeDynamic,
-				funcType:   e.typ,
-			}
-			e.c.p.code[enterFunc2Mark] = ef2
-		}
-
 	} else {
 		// To avoid triggering variable conflict when binding from non-strict direct eval().
 		// Parameters are supposed to be in a parent scope, hence no conflict.
@@ -1702,19 +1701,34 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				extensible:  s.dynamic,
 				funcType:    e.typ,
 			}
-			// Always populate names for debugging, not just for dynamic scopes
-			enter1.names = s.makeNamesMap()
+			if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+				// Always populate names for debugging, not just for dynamic scopes
+				enter1.names = s.makeNamesMap()
+			} else {
+				if s.isDynamic() {
+					enter1.names = s.makeNamesMap()
+				}
+			}
 			enter = &enter1
 			if enterFunc2Mark != -1 {
-				ef2 := &enterFuncBody{
-					enterBlock: enterBlock{
-						names:     varScopeNames2,
-						stashSize: uint32(varScopeStashSize2),
-						stackSize: uint32(varScopeStackSize2),
-					},
-					extensible: varScopeDynamic2,
-					funcType:   e.typ,
+				var ef2 *enterFuncBody
+				if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+					ef2 = &enterFuncBody{
+						enterBlock: enterBlock{
+							names:     varScopeNames2,
+							stashSize: uint32(varScopeStashSize2),
+							stackSize: uint32(varScopeStackSize2),
+						},
+						extensible: varScopeDynamic2,
+						funcType:   e.typ,
+					}
+				} else {
+					ef2 = &enterFuncBody{
+						extensible: e.c.scope.dynamic,
+						funcType:   e.typ,
+					}
 				}
+				e.c.updateEnterBlock(&ef2.enterBlock)
 				e.c.p.code[enterFunc2Mark] = ef2
 			}
 		} else {
@@ -1725,10 +1739,23 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				extensible: s.dynamic,
 				funcType:   e.typ,
 			}
-			// Always populate names for debugging, not just for dynamic scopes
-			enter1.names = s.makeNamesMap()
+			if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+				// Always populate names for debugging, not just for dynamic scopes
+				enter1.names = s.makeNamesMap()
+			} else {
+				if s.isDynamic() {
+					enter1.names = s.makeNamesMap()
+				}
+			}
 			enter = &enter1
 			if enterFunc2Mark != -1 {
+				var extensible bool
+				if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+					extensible = varScopeDynamic2
+				} else {
+					extensible = e.c.scope.dynamic
+				}
+
 				ef2 := &enterFuncBody{
 					enterBlock: enterBlock{
 						names:     varScopeNames2,
@@ -1736,7 +1763,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 						stackSize: uint32(varScopeStackSize2),
 					},
 					adjustStack: true,
-					extensible:  varScopeDynamic2,
+					extensible:  extensible,
 					funcType:    e.typ,
 				}
 				e.c.p.code[enterFunc2Mark] = ef2
@@ -1749,6 +1776,15 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 		enter = &enterFuncStashless{
 			stackSize: uint32(stackSize),
 			args:      uint32(paramsCount),
+		}
+
+		if enterFunc2Mark != -1 {
+			ef2 := &enterFuncBody{
+				extensible: e.c.scope.dynamic,
+				funcType:   e.typ,
+			}
+			e.c.updateEnterBlock(&ef2.enterBlock)
+			e.c.p.code[enterFunc2Mark] = ef2
 		}
 	}
 	code[delta] = enter
@@ -2274,8 +2310,14 @@ func (e *compiledClassLiteral) compileFieldsAndStaticBlocks(elements []clsElemen
 			stashSize: 1,
 			funcType:  funcClsInit,
 		}
-		// Always populate names for debugging, not just for dynamic lookup
-		enter.names = s.makeNamesMap()
+		if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+			// Always populate names for debugging, not just for dynamic lookup
+			enter.names = s.makeNamesMap()
+		} else {
+			if s.dynLookup {
+				enter.names = s.makeNamesMap()
+			}
+		}
 		e.c.p.code[0] = enter
 		s.trimCode(0)
 	} else {

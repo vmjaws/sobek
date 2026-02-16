@@ -1,4 +1,4 @@
-module github.com/grafana/sobek
+module github.com/vmjaws/sobek
 
 go 1.20
 
