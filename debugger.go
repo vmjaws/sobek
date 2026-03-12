@@ -1141,14 +1141,18 @@ func safeCloseActivationCh(ch chan DebuggerActivation) {
 	if ch == nil {
 		return
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			if debugContinue {
-				fmt.Printf("[DEBUGGER-SAFE-CLOSE] Recovered from close of already-closed channel: %v\n", r)
-			}
+	// Use select to check if the channel is already closed before closing.
+	// A closed channel will immediately return on receive; an open one won't.
+	select {
+	case <-ch:
+		// Channel was already closed (or had a buffered value drained — either
+		// way, closing it again would panic). Do nothing.
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-SAFE-CLOSE] Channel already closed, skipping\n")
 		}
-	}()
-	close(ch)
+	default:
+		close(ch)
+	}
 }
 
 func (dbg *Debugger) Continue() DebuggerActivation {
@@ -1551,8 +1555,15 @@ func (dbg *Debugger) GetActivationEpoch() uint64 {
 
 func (dbg *Debugger) Detach() {
 	safeClose := func(ch chan DebuggerActivation) {
-		defer func() { recover() }()
-		close(ch)
+		if ch == nil {
+			return
+		}
+		select {
+		case <-ch:
+			// Already closed
+		default:
+			close(ch)
+		}
 	}
 	dbg.vm.debugger = nil
 	dbg.vm.debugMode = false
