@@ -664,12 +664,12 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 		argsInStash = f.argsInStash
 	}
 	stackIdx, stashIdx := 0, 0
-	allInStash := s.isDynamic()
+	allInStash := s.isDynamic() || s.c.debug
 
 	if s.c.debug {
 		// CRITICAL FIX: In debug mode, if all variables go in stash, args must too!
 		// This ensures function parameters are accessible when allInStash=true
-		if s.c.debug && allInStash && s.isFunction() && !argsInStash {
+		if allInStash && s.isFunction() && !argsInStash {
 			// Check if this scope has any argument bindings
 			hasArgs := false
 			for _, b := range s.bindings {
@@ -684,7 +684,7 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 			}
 		}
 
-		if s.c.debug {
+		if debugCompiler {
 			fmt.Printf("[COMPILER-DEBUG] finaliseVarAlloc: allInStash=%v (isDynamic=%v, debug=%v), argsInStash=%v\n",
 				allInStash, s.isDynamic(), s.c.debug, argsInStash)
 		}
@@ -810,7 +810,7 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 			}
 			stashIdx++
 		} else {
-			if s.c.debug {
+			if debugCompiler {
 				fmt.Printf("  -> Binding[%d] %q going to STACK\n", i, b.name)
 			}
 			var idx int
@@ -931,7 +931,7 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 		nested.finaliseVarAlloc(stackIdx + stackOffset)
 	}
 
-	if s.c.debug {
+	if debugCompiler {
 		fmt.Printf("[COMPILER-DEBUG] Scope finalised: %d bindings, stackOffset=%d, stashIdx=%d, stackIdx=%d\n",
 			len(s.bindings), stackOffset, stashIdx, stackIdx)
 		for i, b := range s.bindings {
@@ -950,63 +950,114 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 	stashIdx := 0
 	stackIdx := 0
 
+	// First, let's see ALL bindings to understand the mismatch
+	if debugCompiler {
+		fmt.Printf("[COMPILER-DEBUG] collectAllDebugSymbols: Processing %d bindings\n", len(s.bindings))
+		for i, b := range s.bindings {
+			fmt.Printf("[COMPILER-DEBUG]   Binding[%d]: name=%s, inStash=%v, isArg=%v\n", i, b.name, b.inStash, b.isArg)
+		}
+	}
+
+	// CRITICAL: Use the SAME logic as the main allocation loop to determine if binding goes in stash
+	allInStash := s.isDynamic() || s.c.debug
+
 	for i, b := range s.bindings {
-		// Skip special bindings
-		if b.name == thisBindingName {
-			continue
-		}
+		// Check if this is the 'this' binding
+		isThisBinding := b.name == thisBindingName
 
-		varLoc := VarLocation{
-			Name:    b.name.String(),
-			InStash: b.inStash,
-			IsParam: b.isArg,
-			IsConst: b.isConst,
-		}
+		// CRITICAL: Use the SAME logic as main loop: allInStash || b.inStash
+		bindingInStash := allInStash || b.inStash
 
-		if b.inStash {
-			// Variable is in stash
-			varLoc.StashIdx = uint32(stashIdx)
-			stashIdx++
-		} else {
-			// Variable is on stack
-			if b.isArg {
-				varLoc.StackIdx = -(i + 1)
+		// Only create and emit debug symbols for user-visible variables (not 'this')
+		if !isThisBinding {
+			varLoc := VarLocation{
+				Name:    b.name.String(),
+				InStash: bindingInStash,
+				IsParam: b.isArg,
+				IsConst: b.isConst,
+			}
+
+			if bindingInStash {
+				// Variable is in stash
+				varLoc.StashIdx = uint32(stashIdx)
 			} else {
-				varLoc.StackIdx = stackOffset + stackIdx
+				// Variable is on stack
+				if b.isArg {
+					varLoc.StackIdx = -(i + 1)
+				} else {
+					varLoc.StackIdx = stackOffset + stackIdx
+				}
+			}
+
+			// Find PC range where this variable is accessible
+			// Start with scope boundaries as the default range
+			scopeStart := s.base
+			scopeEnd := len(s.c.p.code)
+
+			minPC := scopeEnd
+			maxPC := scopeStart
+
+			// Narrow down based on access points if available
+			for scope, aps := range b.accessPoints {
+				for _, pc := range *aps {
+					absolutePC := scope.base + pc
+					if absolutePC < minPC {
+						minPC = absolutePC
+					}
+					if absolutePC > maxPC {
+						maxPC = absolutePC
+					}
+				}
+			}
+
+			// CRITICAL FIX: If access points produce an invalid or narrow range,
+			// extend to cover the entire scope. This ensures variables are visible
+			// throughout the function body in the debugger.
+			if minPC > maxPC || minPC >= scopeEnd {
+				// No valid access points - use full scope range
+				minPC = scopeStart
+				maxPC = scopeEnd - 1
+			} else {
+				// Extend range: parameters and function-scoped variables should be
+				// visible from function start; all variables should be visible to function end
+				if b.isArg || s.funcType != funcNone {
+					// For function parameters and top-level function bindings,
+					// make visible from function start
+					if scopeStart < minPC {
+						minPC = scopeStart
+					}
+				}
+				// Extend to end of scope for all variables
+				if maxPC < scopeEnd-1 {
+					maxPC = scopeEnd - 1
+				}
+			}
+
+			varLoc.StartPC = minPC
+			varLoc.EndPC = maxPC
+
+			// Add to scope map for all PCs in range
+			for pc := minPC; pc <= maxPC; pc++ {
+				s.c.p.debugSymbols.scopeMap[pc] = append(
+					s.c.p.debugSymbols.scopeMap[pc],
+					varLoc,
+				)
+			}
+
+			if debugCompiler {
+				fmt.Printf("[COMPILER-DEBUG]   Debug symbol: %s, inStash=%v, stashIdx=%d, stackIdx=%d, PC range=[%d-%d]\n",
+					varLoc.Name, varLoc.InStash, varLoc.StashIdx, varLoc.StackIdx, minPC, maxPC)
+			}
+		}
+
+		// CRITICAL: Increment counters for ALL bindings (including 'this') using the SAME logic as main loop
+		if bindingInStash {
+			stashIdx++
+		} else if !isThisBinding {
+			// Only increment stackIdx for non-'this' stack bindings
+			if !b.isArg {
 				stackIdx++
 			}
-		}
-
-		// Find PC range where this variable is accessible
-		minPC := len(s.c.p.code)
-		maxPC := 0
-
-		for scope, aps := range b.accessPoints {
-			for _, pc := range *aps {
-				absolutePC := scope.base + pc
-				if absolutePC < minPC {
-					minPC = absolutePC
-				}
-				if absolutePC > maxPC {
-					maxPC = absolutePC
-				}
-			}
-		}
-
-		varLoc.StartPC = minPC
-		varLoc.EndPC = maxPC
-
-		// Add to scope map for all PCs in range
-		for pc := minPC; pc <= maxPC; pc++ {
-			s.c.p.debugSymbols.scopeMap[pc] = append(
-				s.c.p.debugSymbols.scopeMap[pc],
-				varLoc,
-			)
-		}
-
-		if s.c.debug {
-			fmt.Printf("[COMPILER-DEBUG]   Debug symbol: %s, inStash=%v, stashIdx=%d, stackIdx=%d, PC range=[%d-%d]\n",
-				varLoc.Name, varLoc.InStash, varLoc.StashIdx, varLoc.StackIdx, minPC, maxPC)
 		}
 	}
 }
@@ -1298,11 +1349,6 @@ func (s *scope) makeNamesMap() map[unistring.String]uint32 {
 		}
 		if b.isVar {
 			idx |= maskVar
-		}
-		if s.c.debug {
-			if b.inStash {
-				idx |= maskIndirect
-			}
 		}
 		if b.getIndirect != nil {
 			idx |= maskIndirect

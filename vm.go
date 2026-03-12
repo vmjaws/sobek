@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -13,6 +14,9 @@ import (
 
 	"github.com/grafana/sobek/unistring"
 )
+
+// Debug logging control via environment variables (same as debugger.go)
+var vmDebugEnabled = os.Getenv("SOBEK_DEBUG_VM") == "1" || os.Getenv("SOBEK_DEBUG_ALL") == "1"
 
 const (
 	maxInt = 1 << 53
@@ -508,6 +512,14 @@ func (s *stash) initByName(name unistring.String, v Value) {
 }
 
 func (s *stash) getByIdx(idx uint32) Value {
+	if int(idx) >= len(s.values) {
+		// In debug mode, accessing an out-of-bounds index can happen when
+		// code is compiled with different debug symbol info
+		if s.vm != nil && s.vm.debugMode {
+			return _undefined
+		}
+		return nil
+	}
 	return s.values[idx]
 }
 
@@ -637,6 +649,9 @@ func (vm *vm) init() {
 }
 
 func (vm *vm) halted() bool {
+	if vm.prg == nil {
+		return true
+	}
 	pc := vm.pc
 	return pc < 0 || pc >= len(vm.prg.code)
 }
@@ -660,7 +675,7 @@ func (vm *vm) run() {
 			break
 		}
 		pc := vm.pc
-		if pc < 0 || pc >= len(vm.prg.code) {
+		if vm.prg == nil || pc < 0 || pc >= len(vm.prg.code) {
 			break
 		}
 		vm.prg.code[pc].exec(vm)
@@ -693,7 +708,7 @@ func (vm *vm) runWithProfiler() bool {
 			return true
 		}
 		pc := vm.pc
-		if pc < 0 || pc >= len(vm.prg.code) {
+		if vm.prg == nil || pc < 0 || pc >= len(vm.prg.code) {
 			break
 		}
 		vm.prg.code[pc].exec(vm)
@@ -733,13 +748,186 @@ func (vm *vm) debug() {
 		}
 
 		if vm.debugger != nil {
-			// Add nil check for vm.prg before accessing debugger methods
+			// CRITICAL: When suppressDebugger is set, skip ALL debugger processing.
+			// This is used during getter evaluation (resolveIndirectValue/safeCallGetter)
+			// to prevent variable inspection from triggering breakpoints, corrupting
+			// step state, or executing lifecycle functions as side effects.
+			if vm.debugger.suppressDebugger {
+				goto executeInstruction
+			}
+
+			// CHANGED: Allow breakpoints during init phase for user scripts
+			// Only skip breakpoints during init if the current file is NOT a user file
+			// User files are those with breakpoints set on them
+			skipBreakpoints := false
+
+			// CRITICAL: First check if init was already completed for ANY user file
+			// This check happens REGARDLESS of whether initPhase is set
+			// It prevents re-hitting init breakpoints on subsequent VUs (VU 0 for teardown/handleSummary)
+			//
+			// HOWEVER: Do NOT skip breakpoints when:
+			// 1. The debugger is in stepIn mode (explicitly enabled for lifecycle functions)
+			// 2. The initPhase flag is false (we're past init and in a lifecycle function)
+			//
+			// The key insight is that init breakpoints should only be skipped during MODULE-LEVEL
+			// code execution (during VU instantiation). Once we're inside a lifecycle function
+			// (setup/default/teardown), breakpoints should work normally even if they happen
+			// to be on the same line number as something that was executed during init.
 			if vm.prg != nil && vm.prg.src != nil {
-				// Log the state BEFORE checking the condition
-				hasBreakpoint := vm.debugger.breakpoint()
-				if vm.debugger.enableDebugLogging {
-					fmt.Printf("[VM-LOOP] PC=%d, active=%v, hasBreakpoint=%v, next=%v, stepIn=%v, continuing=%v\n",
-						vm.pc, vm.debugger.active, hasBreakpoint, vm.debugger.next, vm.debugger.stepIn, vm.debugger.continuing)
+				currentFilename := vm.debugger.Filename()
+				// Normalize filename - use strings.HasPrefix for reliable prefix checking
+				normalizedFilename := currentFilename
+				if strings.HasPrefix(normalizedFilename, "file://") {
+					normalizedFilename = strings.TrimPrefix(normalizedFilename, "file://")
+				}
+
+				// CRITICAL: Check if ANY file's init was completed
+				// Skip ANY breakpoint that was hit during the original init - this handles both:
+				// 1. VU 0 teardown/handleSummary where initPhase is explicitly not set
+				// 2. Any other VU where module code runs before the target function
+				anyInitCompleted := GetGlobalInitTracker().HasAnyInitCompleted()
+
+				if anyInitCompleted {
+					// CRITICAL FIX: Do NOT skip breakpoints when stepIn is active
+					// stepIn is enabled when entering lifecycle functions (setup/default/teardown)
+					// In this case, we're inside a function, not executing module-level init code
+					// Breakpoints inside functions should work even if the same line number
+					// was hit during init (because it's a DIFFERENT execution context)
+					inStepMode := vm.debugger.stepIn || vm.debugger.next
+
+					// Also check if we're NOT in init phase (initPhase is false after init completes)
+					// If initPhase is false and we're at a lifecycle function entry, don't skip
+					notInInitPhase := !vm.debugger.initPhase
+
+					// Only apply init breakpoint skipping if we're NOT in step mode
+					// AND we're still potentially in module-level code (initPhase is true or we just started)
+					if !inStepMode {
+						currentLine := vm.debugger.Line()
+						// Check if this specific line was hit during init in ANY file
+						// This is important because during module evaluation the current file may be an import
+						// but the breakpoints were recorded for the main script
+						wasHitDuringInit := GetGlobalInitTracker().WasAnyBreakpointHitDuringInit(currentLine)
+						// Also check file-specific
+						wasHitInThisFile := GetGlobalInitTracker().WasBreakpointHitDuringInit(normalizedFilename, currentLine)
+						if wasHitDuringInit || wasHitInThisFile {
+							skipBreakpoints = true
+							// Log when skipping init breakpoints (conditional)
+							if vmDebugEnabled {
+								fmt.Printf("[VM-INIT-CHECK] ✅ Skipping init breakpoint at line %d for '%s' - already hit during init (anyFile=%v, thisFile=%v, notInInit=%v)\n",
+									currentLine, normalizedFilename, wasHitDuringInit, wasHitInThisFile, notInInitPhase)
+							}
+						}
+					}
+				}
+			}
+
+			// Now handle the init phase logic for the FIRST VU
+			if !skipBreakpoints && vm.debugger.initPhase && vm.prg != nil && vm.prg.src != nil {
+				currentFilename := vm.debugger.Filename()
+				normalizedFilename := currentFilename
+				if strings.HasPrefix(normalizedFilename, "file://") {
+					normalizedFilename = strings.TrimPrefix(normalizedFilename, "file://")
+				}
+
+				// Check if this file has breakpoints - if yes, it's a user file and we should process breakpoints
+				globalBPs := GetGlobalBreakpoints().GetAllBreakpoints()
+				_, hasGlobalBP := globalBPs[currentFilename]
+				_, hasNormalizedGlobalBP := globalBPs[normalizedFilename]
+				_, hasLocalBP := vm.debugger.breakpoints[currentFilename]
+				_, hasNormalizedLocalBP := vm.debugger.breakpoints[normalizedFilename]
+
+				// If this is a user file, capture the init filename for later
+				// This ensures MarkInitCompleted works even if SetInitPhase(true) was called
+				// before the program was loaded
+				isUserFile := hasGlobalBP || hasNormalizedGlobalBP || hasLocalBP || hasNormalizedLocalBP
+				if isUserFile && vm.debugger.initFilename == "" {
+					vm.debugger.initFilename = normalizedFilename
+				}
+
+				// Skip breakpoints during init ONLY for non-user files (internal k6 modules)
+				skipBreakpoints = !isUserFile
+			}
+
+			// CRITICAL FIX: Do NOT clear step operations when skipping init breakpoints
+			// The skipBreakpoints flag is used to skip RE-HITTING breakpoints that were hit during init
+			// But if the user explicitly requested step-over or step-in, we should honor that request
+			// Only clear step flags when skipping breakpoints in NON-USER files (internal k6 code)
+			// NOT when skipping init breakpoints in user files
+			//
+			// The old logic was:
+			// if skipBreakpoints && (vm.debugger.next || vm.debugger.stepIn) {
+			//     vm.debugger.next = false
+			//     vm.debugger.stepIn = false
+			//     vm.debugger.steppingFilename = ""
+			// }
+			//
+			// This is WRONG because it clears step flags even when stepping through user code
+			// after an init breakpoint. The step flags should only be cleared when entering
+			// non-user code (which is handled below in the fileChanged check)
+
+			// Add nil check for vm.prg before accessing debugger methods
+			// CRITICAL FIX: We need to process step-over/step-in even when skipBreakpoints is true
+			// The skipBreakpoints flag should only skip BREAKPOINT activation, not stepping
+			if vm.prg != nil && vm.prg.src != nil {
+				// CRITICAL: Inherit global step state if this VM doesn't have local step state
+				// This allows step-over/step-in to work across VM transitions (e.g., init -> setup)
+				// BUT: Skip inheriting step state after init has completed
+				// This prevents VU 0 (setup/teardown) from stepping through its own module init code
+				// The setup/teardown stepping is controlled by EnableStepIn() called in runPart()
+				justInheritedStepState := false
+				if !vm.debugger.next && !vm.debugger.stepIn {
+					// CRITICAL FIX: Once init is complete globally, DON'T inherit global step state
+					// The stepping for setup/teardown/default is controlled by LOCAL EnableStepIn()
+					// This prevents stepping through module initialization code of new VUs
+					anyInitCompleted := GetGlobalInitTracker().HasAnyInitCompleted()
+
+					// Only inherit global step state during the FIRST init phase (when no init has completed yet)
+					// After init completes, stepping should be controlled locally by EnableStepIn()
+					if !anyInitCompleted && GetGlobalCoordinator().HasGlobalStepState() {
+						globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := GetGlobalCoordinator().GetGlobalStepState()
+						if globalNext || globalStepIn {
+							vm.debugger.next = globalNext
+							vm.debugger.stepIn = globalStepIn
+							vm.debugger.steppingFilename = globalSteppingFile
+							vm.debugger.stepOverTargetDepth = vm.debugger.callStackDepth() // Reset to current depth for new VM
+							// For new VM entry, the target depth should be current depth (1) since we're at function entry
+							if globalTargetDepth > 0 && vm.debugger.stepOverTargetDepth == 0 {
+								vm.debugger.stepOverTargetDepth = 1
+							}
+							justInheritedStepState = true
+
+							// CRITICAL FIX: Initialize lastBreakpoint to current position when inheriting step state
+							// This prevents the first instruction from being seen as a "line change" (from line 0 to line 1)
+							// which would cause an immediate spurious break at the module entry point
+							vm.debugger.lastBreakpoint.line = vm.debugger.Line()
+							vm.debugger.lastBreakpoint.pc = vm.pc
+							vm.debugger.lastBreakpoint.filename = vm.debugger.Filename()
+							vm.debugger.lastBreakpoint.stackDepth = vm.debugger.callStackDepth()
+
+							if vm.debugger.enableDebugLogging {
+								fmt.Printf("[VM] Inherited global step state: next=%v, stepIn=%v, file=%s, targetDepth=%d\n",
+									globalNext, globalStepIn, globalSteppingFile, vm.debugger.stepOverTargetDepth)
+							}
+							// When inheriting step state into a new VM, clear the global state
+							// This prevents duplicate breaks across VM transitions
+							GetGlobalCoordinator().ClearGlobalStepState()
+						}
+					}
+
+				}
+
+				// Check breakpoint FIRST before logging
+				// When skipBreakpoints is true, we treat hasBreakpoint as false to skip breakpoint activation
+				// but we STILL process step-over and step-in
+				hasBreakpoint := false
+				if !skipBreakpoints {
+					hasBreakpoint = vm.debugger.breakpoint()
+				}
+
+				// Skip breaking at module entry (line 1) when we just inherited step state
+				// This prevents spurious breaks when transitioning between phases (init -> setup -> default)
+				if justInheritedStepState && vm.debugger.Line() <= 1 && !hasBreakpoint {
+					goto executeInstruction
 				}
 
 				if !vm.debugger.active && (hasBreakpoint || vm.debugger.next || vm.debugger.stepIn) {
@@ -759,38 +947,243 @@ func (vm *vm) debug() {
 					shouldBreak := false
 					breakReason := ""
 
+					// CRITICAL: Check if current file is a "user file" (has breakpoints or is the stepping source)
+					// This prevents stepping through internal k6 code like handleSummary
+					isUserFile := false
+					steppingFilename := vm.debugger.steppingFilename
+
+					// Normalize the current filename for comparison
+					normalizedCurrentFilename := currentFilename
+					if strings.HasPrefix(normalizedCurrentFilename, "file://") {
+						normalizedCurrentFilename = strings.TrimPrefix(normalizedCurrentFilename, "file://")
+					}
+					normalizedSteppingFilename := steppingFilename
+					if strings.HasPrefix(normalizedSteppingFilename, "file://") {
+						normalizedSteppingFilename = strings.TrimPrefix(normalizedSteppingFilename, "file://")
+					}
+
+					// CRITICAL FIX: Skip debugging for internal eval code (like summary wrapper)
+					// The <eval> filename indicates runtime-generated code that shouldn't be debugged
+					if normalizedCurrentFilename == "<eval>" || strings.HasPrefix(normalizedCurrentFilename, "<eval>") {
+						// Clear step flags when entering eval code
+						if vm.debugger.next || vm.debugger.stepIn {
+							vm.debugger.stepIn = false
+							vm.debugger.next = false
+							vm.debugger.steppingFilename = ""
+						}
+						goto executeInstruction
+					}
+
+					// CRITICAL FIX: Detect file change and clear step flags immediately
+					// This happens when stepping in user code and then k6 starts running internal scripts
+					// (like handleSummary). We must stop stepping in those internal scripts.
+					fileChanged := normalizedCurrentFilename != normalizedSteppingFilename && normalizedSteppingFilename != ""
+					if fileChanged && (vm.debugger.next || vm.debugger.stepIn) {
+						// Check if the NEW file has breakpoints - if not, check if it's still a user file
+						globalBPs := GetGlobalBreakpoints().GetAllBreakpoints()
+						_, newFileHasGlobalBP := globalBPs[normalizedCurrentFilename]
+						vm.debugger.breakpointMutex.RLock()
+						_, newFileHasLocalBP := vm.debugger.breakpoints[normalizedCurrentFilename]
+						vm.debugger.breakpointMutex.RUnlock()
+
+						// A file is considered a user file if:
+						// 1. It has breakpoints, OR
+						// 2. It's a local file (starts with /) with a user-code extension (.ts, .js, .mjs)
+						// This allows stepping into imported modules from the same project
+						isUserSourceFile := newFileHasGlobalBP || newFileHasLocalBP
+						if !isUserSourceFile {
+							// Check if it looks like a user source file by extension and path
+							isUserSourceFile = (strings.HasSuffix(normalizedCurrentFilename, ".ts") ||
+								strings.HasSuffix(normalizedCurrentFilename, ".js") ||
+								strings.HasSuffix(normalizedCurrentFilename, ".mjs")) &&
+								strings.HasPrefix(normalizedCurrentFilename, "/") &&
+								!strings.Contains(normalizedCurrentFilename, "node_modules")
+						}
+
+						if !isUserSourceFile {
+							// Entering non-user file:
+							// - For stepIn: clear the flag (we don't want to step through internal code)
+							// - For next (step-over): preserve the flag so stepping continues when we return to user code
+							//   This is the key fix: step-over should step OVER function calls into non-user code
+							vm.debugger.stepIn = false
+							// DON'T clear next here - let step-over continue when we return
+							// vm.debugger.next = false
+							// vm.debugger.steppingFilename = ""
+							// Skip further breakpoint processing for this instruction
+							goto executeInstruction
+						} else if vm.debugger.stepIn {
+							// Entering a user source file during step-in: update the stepping filename
+							// This allows stepping to continue in the new file
+							vm.debugger.steppingFilename = currentFilename
+						}
+					}
+
+					// Check if current file is the stepping file OR has breakpoints OR is a user source file
+					if normalizedCurrentFilename == normalizedSteppingFilename && normalizedSteppingFilename != "" {
+						isUserFile = true
+					} else {
+						// Check if file has breakpoints (global or local)
+						globalBPs := GetGlobalBreakpoints().GetAllBreakpoints()
+						if _, hasGlobalBP := globalBPs[normalizedCurrentFilename]; hasGlobalBP {
+							isUserFile = true
+						}
+						vm.debugger.breakpointMutex.RLock()
+						if _, hasLocalBP := vm.debugger.breakpoints[normalizedCurrentFilename]; hasLocalBP {
+							isUserFile = true
+						}
+						vm.debugger.breakpointMutex.RUnlock()
+						// Also check if it looks like a user source file by extension and path
+						// This allows stepping into imported modules from the same project
+						if !isUserFile {
+							isUserFile = (strings.HasSuffix(normalizedCurrentFilename, ".ts") ||
+								strings.HasSuffix(normalizedCurrentFilename, ".js") ||
+								strings.HasSuffix(normalizedCurrentFilename, ".mjs")) &&
+								strings.HasPrefix(normalizedCurrentFilename, "/") &&
+								!strings.Contains(normalizedCurrentFilename, "node_modules")
+						}
+					}
+
 					if vm.debugger.stepIn {
-						// For step-in: break only if:
-						// 1. We've advanced past the initial PC (ensuring we executed at least one instruction)
-						// 2. We're at a DIFFERENT line (currentLine != prevLine), AND
-						// 3. VM is in a valid state (vm.sb >= 0, not transitioning contexts)
-						// Note: We DON'T check stack depth - we want to step into function calls
-						pcAdvanced := currentPC != prevPC
-						lineChanged := prevLine != currentLine
-						vmInValidState := vm.sb >= 0
-						shouldBreak = pcAdvanced && lineChanged && vmInValidState
-						breakReason = "stepIn"
-						if vm.debugger.enableDebugLogging {
-							fmt.Printf("[VM] stepIn=true, PC=%d (prev=%d), line=%d (prev=%d), depth=%d (prev=%d), pcAdvanced=%v, lineChanged=%v, vmInValidState=%v (sb=%d), shouldBreak=%v\n",
-								currentPC, prevPC, currentLine, prevLine, currentStackDepth, prevStackDepth, pcAdvanced, lineChanged, vmInValidState, vm.sb, shouldBreak)
+					// For step-in: break only if:
+					// 1. We've advanced past the initial PC (ensuring we executed at least one instruction)
+					// 2. We're at a DIFFERENT line (currentLine != prevLine), AND
+					// 3. VM is in a valid state (vm.sb >= 0, not transitioning contexts)
+					//    EXCEPTION: At PC=0 with prevPC=-1 (lifecycle function entry after ResetLastBreakpoint),
+					//    vm.sb is -1 because the scope-setup instruction hasn't executed yet.
+					//    We treat this as valid to avoid skipping the first line of lifecycle functions.
+					// 4. We're in a user file (not internal k6 code)
+					// Note: We DON'T check stack depth - we want to step into function calls
+					pcAdvanced := currentPC != prevPC
+					lineChanged := prevLine != currentLine
+					// LIFECYCLE FIX: At function entry (PC=0, prevPC=-1), vm.sb is -1 because
+					// the scope-setup instruction at PC=0 hasn't executed yet (debug check runs BEFORE
+					// the instruction). Treat this as valid state so the first line of setup(),
+					// default(), teardown(), handleSummary() is not skipped during step-in.
+					isLifecycleFunctionEntry := currentPC == 0 && prevPC == -1
+					vmInValidState := vm.sb >= 0 || isLifecycleFunctionEntry
+
+					// LAST-LINE FIX: Detect when the current instruction is ret/cret.
+					// When stepping and the current instruction is a function return, check
+					// if we're about to leave the function without ever breaking on this line.
+					// This handles the case where the function's last statement and the
+					// implicit return (loadUndef + ret) share the same source line, so
+					// lineChanged is never true for the return bytecodes.
+					//
+					// The fix in compiler_stmt.go (addSrcMap for return keyword) handles
+					// EXPLICIT return statements. This check handles the IMPLICIT return
+					// case where no return statement exists in the source.
+					isRetInstruction := false
+					if !lineChanged && pcAdvanced && vmInValidState && isUserFile && currentPC >= 0 && currentPC < len(vm.prg.code) {
+						switch vm.prg.code[currentPC].(type) {
+						case _ret, cret:
+							isRetInstruction = true
+						}
+					}
+					// For implicit returns: if we're about to execute ret and we've never
+					// broken on this line (prevLine == currentLine because the last statement
+					// and ret share a source line), check if the NEXT instruction after ret
+					// would be at a different depth. This means we're leaving the function.
+					// In this case, we should have already broken on this line (when we first
+					// arrived from a different line). So don't force a double-break.
+					// The source map fix in compiler_stmt.go is the primary fix.
+					_ = isRetInstruction
+
+					shouldBreak = pcAdvanced && lineChanged && vmInValidState && isUserFile
+					breakReason = "stepIn"
+						if isLifecycleFunctionEntry && isUserFile && debugVM {
+							fmt.Printf("[VM-LIFECYCLE-ENTRY] 🎯 Lifecycle function entry detected at line %d (PC=0, prevPC=-1, sb=%d). vmInValidState forced to %v (would be %v without fix). shouldBreak=%v\n",
+								currentLine, vm.sb, vmInValidState, vm.sb >= 0, shouldBreak)
+						}
+						if vm.debugger.enableDebugLogging && isUserFile {
+							fmt.Printf("[VM] stepIn=true, PC=%d (prev=%d), line=%d (prev=%d), depth=%d (prev=%d), pcAdvanced=%v, lineChanged=%v, vmInValidState=%v (sb=%d, lifecycleEntry=%v), isUserFile=%v, shouldBreak=%v\n",
+								currentPC, prevPC, currentLine, prevLine, currentStackDepth, prevStackDepth, pcAdvanced, lineChanged, vmInValidState, vm.sb, isLifecycleFunctionEntry, isUserFile, shouldBreak)
+						}
+						// If we're not in user file during stepIn, clear stepIn flag to stop stepping through internal code
+						// BUT preserve next flag so step-over continues to work when we return to user code
+						// CRITICAL FIX: Don't clear stepIn if this is a lifecycle transition
+						// During lifecycle transitions (setup->teardown->handleSummary), we want to preserve stepIn
+						// until we reach the first line of the user's function
+						if !isUserFile && pcAdvanced && !vm.debugger.lifecycleTransition {
+							vm.debugger.stepIn = false
+							// DON'T clear next here - let step-over continue working after we return from non-user code
+							// vm.debugger.next = false
+							// vm.debugger.steppingFilename = ""
 						}
 					} else if vm.debugger.next {
 						// For step-over: break only if:
 						// 1. We've advanced past the initial PC (ensuring we executed at least one instruction)
-						// 2. We're at a DIFFERENT line (currentLine != prevLine), AND
+						// 2. We're at a DIFFERENT line from where step-over STARTED (not from previous instruction), AND
 						// 3. We're at the same depth or returned from a call (shallower than where we STARTED), AND
 						// 4. VM is in a valid state (vm.sb >= 0, not transitioning contexts)
-						// CRITICAL: Compare against stepOverTargetDepth (where we STARTED), not prevStackDepth (which changes as we move)
+						// 5. We're in a user file (not internal k6 code)
+						// CRITICAL FIX: Compare against stepOverStartLine (where we STARTED the step-over), not prevLine
+						// which can change erratically when entering/exiting native Go functions.
+						// This prevents the "requires 2 clicks" bug on lines like http.get() or sleep()
 						pcAdvanced := currentPC != prevPC
-						lineChanged := prevLine != currentLine
-						atValidDepth := currentStackDepth <= vm.debugger.stepOverTargetDepth
-						vmInValidState := vm.sb >= 0
-						shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState
-						breakReason = "next"
-						if vm.debugger.enableDebugLogging {
-							fmt.Printf("[VM] next=true, PC=%d (prev=%d), line=%d (prev=%d), depth=%d (target=%d, prev=%d), pcAdvanced=%v, lineChanged=%v, atValidDepth=%v, vmInValidState=%v (sb=%d), shouldBreak=%v\n",
-								currentPC, prevPC, currentLine, prevLine, currentStackDepth, vm.debugger.stepOverTargetDepth, prevStackDepth, pcAdvanced, lineChanged, atValidDepth, vmInValidState, vm.sb, shouldBreak)
+						startLine := vm.debugger.stepOverStartLine
+						// Line is considered changed if we're on a different line from where step-over started
+						// We use startLine (captured at step-over start) instead of prevLine because:
+						// - prevLine can become -1 or invalid during native function calls
+						// - When returning from native calls, prevLine != currentLine could be true
+						//   even though we're back on the same source line where step-over started
+						// - Multiple bytecode instructions can exist on the same source line
+						//
+						// CRITICAL: Only use stepOverStartLine when it's VALID (positive).
+						// If it's 0 or negative, it means step-over was just initiated and we haven't captured
+						// the start line yet - in this case, DON'T break (wait for proper setup).
+						lineChanged := false
+						if startLine > 0 {
+							lineChanged = startLine != currentLine
 						}
+						// NOTE: We deliberately do NOT fall back to prevLine comparison anymore.
+						// The stepOverStartLine should ALWAYS be set by Next() before we get here.
+						// If it's <= 0, we skip breaking to avoid spurious stops.
+
+						// Log if we're skipping due to invalid startLine
+						if startLine <= 0 && vm.debugger.enableDebugLogging && isUserFile {
+							fmt.Printf("[VM] next=true, SKIPPING: invalid startLine=%d (waiting for valid state)\n", startLine)
+						}
+
+						atValidDepth := currentStackDepth <= vm.debugger.stepOverTargetDepth
+						// LIFECYCLE FIX: Same as stepIn - at function entry (PC=0, prevPC=-1),
+						// vm.sb is -1 because the scope-setup instruction hasn't executed yet.
+						// Treat this as valid state for lifecycle function entry.
+						isLifecycleFunctionEntry := currentPC == 0 && prevPC == -1
+						vmInValidState := vm.sb >= 0 || isLifecycleFunctionEntry
+						shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState && isUserFile
+						breakReason = "next"
+						if isLifecycleFunctionEntry && isUserFile && debugVM {
+							fmt.Printf("[VM-LIFECYCLE-ENTRY] 🎯 Lifecycle function entry (next) at line %d (PC=0, prevPC=-1, sb=%d). vmInValidState forced to %v. shouldBreak=%v\n",
+								currentLine, vm.sb, vmInValidState, shouldBreak)
+						}
+						if vm.debugger.enableDebugLogging && isUserFile {
+							fmt.Printf("[VM] next=true, PC=%d (prev=%d), line=%d (start=%d, prev=%d), depth=%d (target=%d, prev=%d), pcAdvanced=%v, lineChanged=%v, atValidDepth=%v, vmInValidState=%v (sb=%d, lifecycleEntry=%v), isUserFile=%v, shouldBreak=%v\n",
+								currentPC, prevPC, currentLine, startLine, prevLine, currentStackDepth, vm.debugger.stepOverTargetDepth, prevStackDepth, pcAdvanced, lineChanged, atValidDepth, vmInValidState, vm.sb, isLifecycleFunctionEntry, isUserFile, shouldBreak)
+						}
+						// IMPORTANT: Log when step-over overrides a breakpoint to avoid confusion
+						// The BREAKPOINT-CHECK log may have said "breakpoint detected" but step-over takes precedence
+						if !shouldBreak && hasBreakpoint && debugVM {
+							var skipReason string
+							if !lineChanged {
+								skipReason = fmt.Sprintf("still on start line %d", startLine)
+							} else if !atValidDepth {
+								skipReason = fmt.Sprintf("at deeper depth %d > target %d", currentStackDepth, vm.debugger.stepOverTargetDepth)
+							} else if !pcAdvanced {
+								skipReason = "PC not advanced"
+							} else if !vmInValidState {
+								skipReason = "VM not in valid state"
+							} else if !isUserFile {
+								skipReason = "not in user file"
+							}
+							if debugVM {
+								fmt.Printf("[VM-STEP-OVER] ⚠️ Breakpoint at line %d SKIPPED due to step-over (%s)\n",
+									currentLine, skipReason)
+							}
+						}
+						// NOTE: For step-over, we do NOT clear next flag when in non-user file
+						// This is intentional: step-over should step OVER function calls into non-user code
+						// and continue stepping when we return to user code at the correct depth
+						// The next flag will be cleared when we actually break (in the shouldBreak block below)
 					} else {
 						// For regular breakpoint: break if location changed OR if not in continuing mode
 						// When continuing=true, we need to make sure we actually move away from the current location
@@ -827,33 +1220,132 @@ func (vm *vm) debug() {
 
 					if shouldBreak {
 						if vm.debugger.enableDebugLogging {
-							fmt.Printf("[VM] BREAKING at line %d (PC=%d), reason=%s\n", currentLine, currentPC, breakReason)
+							// Clarify when we stopped due to step command but there's also a breakpoint here
+							if hasBreakpoint && (breakReason == "next" || breakReason == "stepIn") {
+								fmt.Printf("[VM] BREAKING at line %d (PC=%d), reason=%s (NOTE: also has breakpoint, step takes precedence)\n", currentLine, currentPC, breakReason)
+							} else if breakReason == "next" {
+								fmt.Printf("[VM] BREAKING at line %d (PC=%d), reason=%s (step-over from line %d completed)\n",
+									currentLine, currentPC, breakReason, vm.debugger.stepOverStartLine)
+							} else {
+								fmt.Printf("[VM] BREAKING at line %d (PC=%d), reason=%s\n", currentLine, currentPC, breakReason)
+							}
 						}
 						vm.debugger.lastBreakpoint.filename = currentFilename
 						vm.debugger.lastBreakpoint.line = currentLine
 						vm.debugger.lastBreakpoint.pc = currentPC
 						vm.debugger.lastBreakpoint.stackDepth = currentStackDepth
-						vm.debugger.next = false
+
+						// CRITICAL FIX: Capture step flags BEFORE clearing them.
+						// This allows activate() to know whether we broke due to a step command.
+						wasStepIn := vm.debugger.stepIn
+						wasNext := vm.debugger.next
+
+						// Clear step flags BEFORE calling activate().
+						// When we break, the current step operation is COMPLETE.
+						// The user's NEXT command will set these flags again.
 						vm.debugger.stepIn = false
-						vm.debugger.continuing = false // Clear continuing flag when we break
+						vm.debugger.next = false
+
+						vm.debugger.stepOverStartLine = 0 // Clear start line for next step operation
+						vm.debugger.continuing = false    // Clear continuing flag when we break
+						// NOTE: Do NOT clear global step state here! The activate() function reads and
+						// clears it after applying it. Clearing here would race with activate() and
+						// cause the global step state (e.g., set by EnableStepIn() for lifecycle transitions)
+						// to be lost before activate() can read it.
 						vm.debugger.updateCurrentLine()
-						vm.debugger.activate(BreakpointActivation, vm.debugger.Filename(), vm.debugger.currentLine)
+
+						// Use the correct activation reason based on how we stopped
+						var activationReason ActivationReason
+						if breakReason == "stepIn" || breakReason == "next" {
+							activationReason = StepActivation
+						} else {
+							activationReason = BreakpointActivation
+						}
+
+						// DIAGNOSTIC: Log step flags that were active when we decided to break
+						if debugVM {
+							fmt.Printf("[VM-PRE-ACTIVATE] About to call activate(): wasStepIn=%v, wasNext=%v, lifecycleTransition=%v, reason=%s\n",
+								wasStepIn, wasNext, vm.debugger.lifecycleTransition, breakReason)
+						}
+
+						// Pass the captured step flags to activate so it knows the context of the break
+						vm.debugger.activateWithStepState(activationReason, vm.debugger.Filename(), vm.debugger.currentLine, wasStepIn, wasNext)
+
+						// NOTE: activate() handles all flag clearing based on userCommandIssued.
+						// We don't clear flags here anymore to avoid race conditions.
 					}
-				} else {
-					vm.debugger.lastBreakpoint.filename = ""
-					vm.debugger.lastBreakpoint.line = -1
-					vm.debugger.lastBreakpoint.pc = -1
 				}
+				// NOTE: We deliberately DON'T reset lastBreakpoint to -1 when the condition is false.
+				// This is critical for proper "same location" checking - when execution enters code
+				// without breakpoints (like a function call) and then returns to breakpoint-having code,
+				// we need to preserve the last known breakpoint location to detect if we're still on
+				// the same line or have moved to a new location.
 				if vm.debugger != nil {
 					vm.debugger.lastBreakpoint.stackDepth = vm.debugger.callStackDepth()
 				}
 			}
+		}
+	executeInstruction:
+		if vm.prg == nil {
+			break
 		}
 		pc := vm.pc
 		if pc < 0 || pc >= len(vm.prg.code) {
 			break
 		}
 		vm.prg.code[pc].exec(vm)
+	}
+
+	// When a VM finishes executing with a step operation active, we need to decide
+	// whether to propagate the step intent to the next lifecycle phase.
+	//
+	// When the user was stepping through init code and init finishes, we want the
+	// debugger to break at the FIRST LINE of the next lifecycle function (setup/default/teardown),
+	// NOT at line 1 of the module (which would re-step through imports/init code).
+	// We use waitForFunctionEntry to achieve this: the new VM skips module-level code
+	// and only enables stepping when the call depth increases (entering the function body).
+	//
+	// SAFETY: Check vm.debugger != nil first — Detach() could have been called during execution.
+	if vm.debugger != nil && (vm.debugger.next || vm.debugger.stepIn) {
+		// Only handle this at top-level (callStackDepth <= 1 means we're exiting the main function)
+		if vm.debugger.callStackDepth() <= 1 {
+			if debugVM {
+				fmt.Printf("[VM-EXIT] 🔄 Step operation active when VM exited (next=%v, stepIn=%v, depth=%d, lastLine=%d), setting waitForFunctionEntry for next lifecycle phase\n",
+					vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth(), vm.debugger.Line())
+			}
+			// Mark this debugger's VM as exited so Continue() won't send to its dead local channel
+			vm.debugger.vmExited = true
+			// Close vmDoneCh to instantly notify any waiting Continue() that this VM is done
+			if vm.debugger.vmDoneCh != nil {
+				select {
+				case <-vm.debugger.vmDoneCh:
+					// Already closed
+				default:
+					close(vm.debugger.vmDoneCh)
+				}
+			}
+			// Clear the local step flags since this VM is done
+			vm.debugger.next = false
+			vm.debugger.stepIn = false
+			// Clear any stale global step state
+			GetGlobalCoordinator().ClearGlobalStepState()
+			// Set waitForFunctionEntry so the next lifecycle phase (setup/default/teardown)
+			// breaks at its first line, but does NOT re-step through module init code
+			GetGlobalCoordinator().SetWaitForFunctionEntry(true)
+		} else {
+			if debugVM {
+				fmt.Printf("[VM-EXIT] Step operation active but NOT at top-level (next=%v, stepIn=%v, depth=%d) - not propagating\n",
+					vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth())
+			}
+		}
+	} else if vm.debugger != nil && debugVM {
+		// Only log normal VM exits at shallow depths to avoid massive spam
+		// during handleSummary text rendering (hundreds of function calls at depth 5-16)
+		depth := vm.debugger.callStackDepth()
+		if depth <= 2 {
+			fmt.Printf("[VM-EXIT] VM exited normally (no step active, next=%v, stepIn=%v, depth=%d)\n",
+				vm.debugger.next, vm.debugger.stepIn, depth)
+		}
 	}
 
 	if interrupted {
@@ -1513,16 +2005,15 @@ func (e exportLex) exec(vm *vm) {
 		stash = stash.outer
 	}
 	e.callback(vm, func() Value {
-		if vm != nil && vm.debugMode {
-			// In debug mode, return undefined instead of panicking for uninitialized parameters
-			return _undefined
-		} else {
-			v := stash.getByIdx(idx)
-			if v == nil {
-				panic(errAccessBeforeInit)
+		v := stash.getByIdx(idx)
+		if v == nil {
+			if vm != nil && vm.debugMode {
+				// In debug mode, return undefined instead of panicking for uninitialized variables
+				return _undefined
 			}
-			return v
+			panic(errAccessBeforeInit)
 		}
+		return v
 	})
 	vm.pc++
 }
@@ -4019,7 +4510,11 @@ func (numargs call) exec(vm *vm) {
 func (vm *vm) clearStack() {
 	sp := vm.sp
 	if sp > len(vm.stack) {
-		time.Sleep(time.Second)
+		// Clamp sp to prevent out-of-range panic - this indicates a VM bug
+		if debugVM {
+			fmt.Printf("[VM] ⚠️ clearStack: sp=%d > len(stack)=%d, clamping to stack length\n", sp, len(vm.stack))
+		}
+		sp = len(vm.stack)
 	}
 	stackTail := vm.stack[sp:]
 	for i := range stackTail {

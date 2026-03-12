@@ -69,11 +69,24 @@ func (s *SourceTextModuleInstance) ExecuteModule(rt *Runtime, res, rej func(inte
 }
 
 func (s *SourceTextModuleInstance) GetBindingValue(name string) Value {
+	if debugCompiler {
+		fmt.Printf("[DEBUG-SOBEK] GetBindingValue(%s): moduleInstance=%p, exportGetters count=%d\n", name, s, len(s.exportGetters))
+		for k := range s.exportGetters {
+			fmt.Printf("[DEBUG-SOBEK] GetBindingValue(%s): available key: %q\n", name, k)
+		}
+	}
 	getter, ok := s.exportGetters[name]
+	if debugCompiler {
+		fmt.Printf("[DEBUG-SOBEK] GetBindingValue(%s): getter found=%v\n", name, ok)
+	}
 	if !ok { // let's not panic in case somebody asks for a binding that isn't exported
 		return nil
 	}
-	return getter()
+	value := getter()
+	if debugCompiler {
+		fmt.Printf("[DEBUG-SOBEK] GetBindingValue(%s): getter returned value type=%T\n", name, value)
+	}
+	return value
 }
 
 func (s *SourceTextModuleInstance) HasTLA() bool {
@@ -614,7 +627,14 @@ type ResolvedBinding struct {
 // GetModuleInstance returns an instance of an already instanciated module.
 // If the ModuleRecord was not instanciated at this time it will return nil
 func (r *Runtime) GetModuleInstance(m ModuleRecord) ModuleInstance {
-	return r.modules[m]
+	mi := r.modules[m]
+	if debugCompiler {
+		fmt.Printf("[DEBUG-SOBEK] GetModuleInstance: module=%p, found=%v, total modules=%d\n", m, mi != nil, len(r.modules))
+		for k := range r.modules {
+			fmt.Printf("[DEBUG-SOBEK] GetModuleInstance: registered module=%p\n", k)
+		}
+	}
+	return mi
 }
 
 func (module *SourceTextModuleRecord) ResolveExport(exportName string, resolveset ...ResolveSetElement) (*ResolvedBinding, bool) {

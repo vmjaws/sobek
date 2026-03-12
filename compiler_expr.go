@@ -1520,7 +1520,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				}
 			}
 		}
-		if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+		if e.c.debug {
 			// CAPTURE varScope info BEFORE popping
 			varScopeNames := varScope.makeNamesMap()
 			varScopeDynamic := varScope.dynamic
@@ -1701,7 +1701,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				extensible:  s.dynamic,
 				funcType:    e.typ,
 			}
-			if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+			if e.c.debug {
 				// Always populate names for debugging, not just for dynamic scopes
 				enter1.names = s.makeNamesMap()
 			} else {
@@ -1712,7 +1712,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 			enter = &enter1
 			if enterFunc2Mark != -1 {
 				var ef2 *enterFuncBody
-				if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+				if e.c.debug {
 					ef2 = &enterFuncBody{
 						enterBlock: enterBlock{
 							names:     varScopeNames2,
@@ -1739,7 +1739,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				extensible: s.dynamic,
 				funcType:   e.typ,
 			}
-			if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+			if e.c.debug {
 				// Always populate names for debugging, not just for dynamic scopes
 				enter1.names = s.makeNamesMap()
 			} else {
@@ -1750,7 +1750,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 			enter = &enter1
 			if enterFunc2Mark != -1 {
 				var extensible bool
-				if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+				if e.c.debug {
 					extensible = varScopeDynamic2
 				} else {
 					extensible = e.c.scope.dynamic
@@ -2310,7 +2310,7 @@ func (e *compiledClassLiteral) compileFieldsAndStaticBlocks(elements []clsElemen
 			stashSize: 1,
 			funcType:  funcClsInit,
 		}
-		if e.c.ctxVM != nil && e.c.ctxVM.debugMode {
+		if e.c.debug {
 			// Always populate names for debugging, not just for dynamic lookup
 			enter.names = s.makeNamesMap()
 		} else {

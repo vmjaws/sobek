@@ -95,15 +95,19 @@ func (c *compiler) updateEnterBlock(enter *enterBlock) {
 		stashSize = len(scope.bindings)
 		enter.names = scope.makeNamesMap()
 	} else {
+		// CRITICAL: Use the SAME logic as finaliseVarAlloc to determine if binding goes in stash
+		allInStash := scope.isDynamic() || c.debug
+
 		for _, b := range scope.bindings {
-			if b.inStash {
+			// Check using the same logic: allInStash || b.inStash
+			if allInStash || b.inStash {
 				stashSize++
 			} else {
 				stackSize++
 			}
 		}
-		if c.ctxVM != nil && c.ctxVM.debugMode {
-			// ALWAYS populate the names map
+		if c.debug {
+			// ALWAYS populate the names map in debug mode
 			enter.names = scope.makeNamesMap()
 		}
 	}
@@ -739,6 +743,12 @@ func (c *compiler) compileReturnStatement(v *ast.ReturnStatement) {
 	if s := c.scope.nearestFunction(); s != nil && s.funcType == funcClsInit {
 		c.throwSyntaxError(int(v.Return)-1, "Illegal return statement")
 	}
+	// DEBUGGER FIX: Add source map entry for the return keyword BEFORE compiling
+	// the argument. This ensures the return statement has its own source line in
+	// the bytecode, so the debugger can break on the return line when stepping.
+	// Without this, the ret instruction inherits the source position of the last
+	// expression, which may be on the same line as the preceding statement.
+	c.p.addSrcMap(int(v.Return) - 1)
 	if v.Argument != nil {
 		c.emitExpr(c.compileExpression(v.Argument), true)
 	} else {

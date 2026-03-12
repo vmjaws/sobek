@@ -1323,6 +1323,13 @@ func New() *Runtime {
 // in order to get when it blocks on a debugger statement or breakpoint
 // There can only be 1 debugger attached at a time, attaching more is has undefined behaviour
 func (r *Runtime) AttachDebugger() *Debugger {
+	// Return existing debugger if already attached (singleton per runtime).
+	// This prevents creating duplicate debuggers when reusing cached VU 0
+	// across lifecycle phases (setup → teardown → handleSummary).
+	if r.vm.debugger != nil {
+		r.vm.debugMode = true
+		return r.vm.debugger
+	}
 	r.vm.debugMode = true // maybe don't do this?
 	r.vm.debugger = newDebugger(r.vm)
 	return r.vm.debugger
@@ -1331,6 +1338,11 @@ func (r *Runtime) AttachDebugger() *Debugger {
 // GetDebugger returns the attached debugger, or nil if no debugger is attached
 func (r *Runtime) GetDebugger() *Debugger {
 	return r.vm.debugger
+}
+
+// IsDebugMode returns true if the runtime is in debug mode
+func (r *Runtime) IsDebugMode() bool {
+	return r.vm.debugMode
 }
 
 // Compile creates an internal representation of the JavaScript code that can be later run using the Runtime.RunProgram()
@@ -1410,7 +1422,7 @@ func compileAST(prg *js_ast.Program, strict, inGlobal bool, evalVm *vm, debug bo
 
 	c.compile(prg, strict, inGlobal, evalVm)
 	p = c.p
-	if debug && p != nil && p.debugSymbols != nil {
+	if debugCompiler && p != nil && p.debugSymbols != nil {
 		symbolCount := 0
 		for _, vars := range p.debugSymbols.scopeMap {
 			symbolCount += len(vars)
@@ -1447,6 +1459,34 @@ func (r *Runtime) RunScript(name, src string) (Value, error) {
 	p, err := r.compile(name, src, false, true, nil)
 
 	if err != nil {
+		return nil, err
+	}
+
+	return r.RunProgram(p)
+}
+
+// RunStringWithoutDebug executes the given string in the global context without debug mode.
+// This is useful for running internal/system code that should not be affected by debug mode settings.
+func (r *Runtime) RunStringWithoutDebug(str string) (Value, error) {
+	return r.RunScriptWithoutDebug("", str)
+}
+
+// RunScriptWithoutDebug executes the given string in the global context without debug mode.
+// This compiles the code without debug symbols, even if the runtime is in debug mode.
+func (r *Runtime) RunScriptWithoutDebug(name, src string) (Value, error) {
+	// Compile without debug mode (pass false explicitly)
+	p, err := compile(name, src, false, true, nil, false, r.parserOptions...)
+	if err != nil {
+		switch x1 := err.(type) {
+		case *CompilerSyntaxError:
+			err = &Exception{
+				val: r.builtin_new(r.getSyntaxError(), []Value{newStringValue(x1.Error())}),
+			}
+		case *CompilerReferenceError:
+			err = &Exception{
+				val: r.newError(r.getReferenceError(), x1.Message),
+			}
+		}
 		return nil, err
 	}
 

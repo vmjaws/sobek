@@ -4,23 +4,532 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/grafana/sobek/unistring"
 )
+
+// Debug logging flags controlled by environment variables
+// Set these env vars to "1" or "true" to enable verbose logging for specific areas
+var (
+	// SOBEK_DEBUG_ACTIVATE - logs activate() flow, continue signals, lifecycle transitions
+	debugActivate = os.Getenv("SOBEK_DEBUG_ACTIVATE") == "1" || os.Getenv("SOBEK_DEBUG_ACTIVATE") == "true"
+	// SOBEK_DEBUG_GLOBAL_STEP - logs global step state changes across VMs
+	debugGlobalStep = os.Getenv("SOBEK_DEBUG_GLOBAL_STEP") == "1" || os.Getenv("SOBEK_DEBUG_GLOBAL_STEP") == "true"
+	// SOBEK_DEBUG_INIT - logs init phase tracking and breakpoint skipping during init
+	debugInit = os.Getenv("SOBEK_DEBUG_INIT") == "1" || os.Getenv("SOBEK_DEBUG_INIT") == "true"
+	// SOBEK_DEBUG_BREAKPOINT - logs breakpoint checking and hitting
+	debugBreakpoint = os.Getenv("SOBEK_DEBUG_BREAKPOINT") == "1" || os.Getenv("SOBEK_DEBUG_BREAKPOINT") == "true"
+	// SOBEK_DEBUG_BP - alias for SOBEK_DEBUG_BREAKPOINT (for global breakpoint registry)
+	debugBP = os.Getenv("SOBEK_DEBUG_BP") == "1" || os.Getenv("SOBEK_DEBUG_BP") == "true"
+	// SOBEK_DEBUG_CONTINUE - logs Continue() signal flow and channel coordination
+	debugContinue = os.Getenv("SOBEK_DEBUG_CONTINUE") == "1" || os.Getenv("SOBEK_DEBUG_CONTINUE") == "true"
+	// SOBEK_DEBUG_VM - logs VM execution stepping details
+	debugVM = os.Getenv("SOBEK_DEBUG_VM") == "1" || os.Getenv("SOBEK_DEBUG_VM") == "true"
+	// SOBEK_DEBUG_COMPILER - logs compiler debug symbol collection (very verbose)
+	debugCompiler = os.Getenv("SOBEK_DEBUG_COMPILER") == "1" || os.Getenv("SOBEK_DEBUG_COMPILER") == "true"
+	// SOBEK_DEBUG_ALL - enables all debug logging
+	debugAll = os.Getenv("SOBEK_DEBUG_ALL") == "1" || os.Getenv("SOBEK_DEBUG_ALL") == "true"
+)
+
+func init() {
+	if debugAll {
+		debugActivate = true
+		debugGlobalStep = true
+		debugInit = true
+		debugBreakpoint = true
+		debugBP = true
+		debugContinue = true
+		debugVM = true
+		debugCompiler = true
+	}
+}
+
+// GlobalDebugCoordinator manages debug coordination across all VMs/VUs.
+type GlobalDebugCoordinator struct {
+	mu            sync.RWMutex
+	activationCh  chan chan DebuggerActivation
+	activeDbg     *Debugger
+	isInitialized bool
+	hasConnection bool
+
+	globalStepNext        bool
+	globalStepIn          bool
+	globalSteppingFile    string
+	globalStepTargetDepth int
+
+	pendingLifecycleStepIn bool
+	waitForFunctionEntry   bool
+	globalActivationEpoch  uint64
+}
+
+var globalDebugCoordinator = &GlobalDebugCoordinator{
+	activationCh:  make(chan chan DebuggerActivation, 1),
+	isInitialized: false,
+	hasConnection: false,
+}
+
+func InitGlobalCoordinator() {
+	globalDebugCoordinator.mu.Lock()
+	defer globalDebugCoordinator.mu.Unlock()
+
+	// Drain the old channel before replacing it.
+	select {
+	case <-globalDebugCoordinator.activationCh:
+	default:
+	}
+
+	// Full reset — wipe ALL state so a second run starts clean.
+	globalDebugCoordinator.activationCh = make(chan chan DebuggerActivation, 1)
+	globalDebugCoordinator.isInitialized = true
+	globalDebugCoordinator.hasConnection = false
+	globalDebugCoordinator.activeDbg = nil
+	globalDebugCoordinator.globalStepNext = false
+	globalDebugCoordinator.globalStepIn = false
+	globalDebugCoordinator.globalSteppingFile = ""
+	globalDebugCoordinator.globalStepTargetDepth = 0
+	globalDebugCoordinator.pendingLifecycleStepIn = false
+	globalDebugCoordinator.waitForFunctionEntry = false
+	globalDebugCoordinator.globalActivationEpoch = 0
+}
+
+// MaybeInitGlobalCoordinator initializes the coordinator only if it hasn't been
+// initialized yet. This is TOCTOU-safe: the check and init happen under a single
+// Lock, preventing a concurrent Instantiate() from wiping state set by another VU.
+func MaybeInitGlobalCoordinator() {
+	globalDebugCoordinator.mu.Lock()
+	defer globalDebugCoordinator.mu.Unlock()
+	if globalDebugCoordinator.isInitialized {
+		return
+	}
+	globalDebugCoordinator.activationCh = make(chan chan DebuggerActivation, 1)
+	globalDebugCoordinator.isInitialized = true
+	globalDebugCoordinator.hasConnection = false
+	globalDebugCoordinator.activeDbg = nil
+	globalDebugCoordinator.globalStepNext = false
+	globalDebugCoordinator.globalStepIn = false
+	globalDebugCoordinator.globalSteppingFile = ""
+	globalDebugCoordinator.globalStepTargetDepth = 0
+	globalDebugCoordinator.pendingLifecycleStepIn = false
+	globalDebugCoordinator.waitForFunctionEntry = false
+	globalDebugCoordinator.globalActivationEpoch = 0
+}
+
+func GetGlobalCoordinator() *GlobalDebugCoordinator {
+	return globalDebugCoordinator
+}
+
+func (gdc *GlobalDebugCoordinator) SetActiveDebugger(dbg *Debugger) {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	gdc.activeDbg = dbg
+}
+
+func (gdc *GlobalDebugCoordinator) GetActiveDebugger() *Debugger {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	return gdc.activeDbg
+}
+
+func (gdc *GlobalDebugCoordinator) ActivationChannel() chan chan DebuggerActivation {
+	return gdc.activationCh
+}
+
+func (gdc *GlobalDebugCoordinator) NextGlobalEpoch() uint64 {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	gdc.globalActivationEpoch++
+	return gdc.globalActivationEpoch
+}
+
+func (gdc *GlobalDebugCoordinator) GetGlobalEpoch() uint64 {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	return gdc.globalActivationEpoch
+}
+
+func (gdc *GlobalDebugCoordinator) IsInitialized() bool {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	return gdc.isInitialized
+}
+
+func (gdc *GlobalDebugCoordinator) SetGlobalConnection(connected bool) {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	gdc.hasConnection = connected
+	if debugActivate {
+		fmt.Printf("[DEBUGGER] Global connection status set to: %v\n", connected)
+	}
+}
+
+func (gdc *GlobalDebugCoordinator) HasGlobalConnection() bool {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	return gdc.hasConnection
+}
+
+func (gdc *GlobalDebugCoordinator) SetGlobalStepState(next, stepIn bool, filename string, targetDepth int) {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	if debugGlobalStep {
+		fmt.Printf("[GLOBAL-STEP] SetGlobalStepState: next=%v, stepIn=%v, file=%s, targetDepth=%d (was: next=%v, stepIn=%v, file=%s, targetDepth=%d)\n",
+			next, stepIn, filename, targetDepth, gdc.globalStepNext, gdc.globalStepIn, gdc.globalSteppingFile, gdc.globalStepTargetDepth)
+	}
+	gdc.globalStepNext = next
+	gdc.globalStepIn = stepIn
+	gdc.globalSteppingFile = filename
+	gdc.globalStepTargetDepth = targetDepth
+}
+
+func (gdc *GlobalDebugCoordinator) GetGlobalStepState() (next, stepIn bool, filename string, targetDepth int) {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	if debugGlobalStep {
+		fmt.Printf("[GLOBAL-STEP] GetGlobalStepState: next=%v, stepIn=%v, file=%s, targetDepth=%d\n",
+			gdc.globalStepNext, gdc.globalStepIn, gdc.globalSteppingFile, gdc.globalStepTargetDepth)
+	}
+	return gdc.globalStepNext, gdc.globalStepIn, gdc.globalSteppingFile, gdc.globalStepTargetDepth
+}
+
+func (gdc *GlobalDebugCoordinator) ClearGlobalStepState() {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	if debugGlobalStep {
+		fmt.Printf("[GLOBAL-STEP] ClearGlobalStepState: was next=%v, stepIn=%v, file=%s, targetDepth=%d\n",
+			gdc.globalStepNext, gdc.globalStepIn, gdc.globalSteppingFile, gdc.globalStepTargetDepth)
+	}
+	gdc.globalStepNext = false
+	gdc.globalStepIn = false
+	gdc.globalSteppingFile = ""
+	gdc.globalStepTargetDepth = 0
+}
+
+func (gdc *GlobalDebugCoordinator) HasGlobalStepState() bool {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	return gdc.globalStepNext || gdc.globalStepIn
+}
+
+func (gdc *GlobalDebugCoordinator) SetPendingLifecycleStepIn(pending bool) {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	if debugGlobalStep {
+		fmt.Printf("[GLOBAL-STEP] SetPendingLifecycleStepIn: %v (was: %v)\n", pending, gdc.pendingLifecycleStepIn)
+	}
+	gdc.pendingLifecycleStepIn = pending
+}
+
+func (gdc *GlobalDebugCoordinator) HasPendingLifecycleStepIn() bool {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	return gdc.pendingLifecycleStepIn
+}
+
+func (gdc *GlobalDebugCoordinator) ConsumeLifecycleStepIn() bool {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	hadPending := gdc.pendingLifecycleStepIn
+	if hadPending {
+		if debugGlobalStep {
+			fmt.Printf("[GLOBAL-STEP] ConsumeLifecycleStepIn: consumed pending step-in\n")
+		}
+		gdc.pendingLifecycleStepIn = false
+	}
+	return hadPending
+}
+
+func (gdc *GlobalDebugCoordinator) SetWaitForFunctionEntry(wait bool) {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	if debugGlobalStep {
+		fmt.Printf("[GLOBAL-STEP] SetWaitForFunctionEntry: %v (was: %v)\n", wait, gdc.waitForFunctionEntry)
+	}
+	gdc.waitForFunctionEntry = wait
+}
+
+func (gdc *GlobalDebugCoordinator) ConsumeWaitForFunctionEntry() bool {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	had := gdc.waitForFunctionEntry
+	if had {
+		if debugGlobalStep {
+			fmt.Printf("[GLOBAL-STEP] ConsumeWaitForFunctionEntry: consumed (was waiting for function entry)\n")
+		}
+		gdc.waitForFunctionEntry = false
+	}
+	return had
+}
+
+func (gdc *GlobalDebugCoordinator) HasWaitForFunctionEntry() bool {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	return gdc.waitForFunctionEntry
+}
+
+type VMRegistry interface {
+	MultiScopeEval(rt *Runtime, expr string) (Value, error)
+	RegisterVM(phase string, vuID uint64, rt *Runtime)
+	SetSetupData(data Value)
+	RefreshInitStash()
+}
+
+const (
+	PhaseInit = "init"
+	PhaseVU   = "vu"
+)
+
+var (
+	globalVMRegistry   VMRegistry
+	globalVMRegistryMu sync.RWMutex
+)
+
+func SetGlobalRegistry(registry VMRegistry) {
+	globalVMRegistryMu.Lock()
+	defer globalVMRegistryMu.Unlock()
+	globalVMRegistry = registry
+}
+
+func GetGlobalRegistry() VMRegistry {
+	globalVMRegistryMu.RLock()
+	defer globalVMRegistryMu.RUnlock()
+	return globalVMRegistry
+}
+
+// GlobalBreakpointRegistry holds breakpoints shared across all debugger instances.
+type GlobalBreakpointRegistry struct {
+	mu            sync.RWMutex
+	breakpoints   map[string][]int // normalized filename -> sorted line numbers
+	breakpointIDs map[bpKey]int    // PERF: struct key avoids string alloc on lookup
+	nextID        int
+}
+
+// bpKey is used as a map key for breakpointIDs to avoid string concatenation allocations.
+type bpKey struct {
+	filename string
+	line     int
+}
+
+var globalBreakpoints = &GlobalBreakpointRegistry{
+	breakpoints:   make(map[string][]int),
+	breakpointIDs: make(map[bpKey]int),
+	nextID:        0,
+}
+
+// GlobalInitTracker tracks which files have completed their init phase.
+type GlobalInitTracker struct {
+	mu            sync.RWMutex
+	initCompleted map[string]bool
+
+	// PERF: flat set instead of map[string][]int — O(1) lookup vs O(files*lines) scan.
+	// WasAnyBreakpointHitDuringInit is called on every VM instruction; the linear
+	// scan in the original was the dominant cost in the hot path.
+	initBreakpointSet map[int]bool // all init-hit lines across all files — O(1)
+
+	// Per-file set kept for WasBreakpointHitDuringInit (file-specific check).
+	initBreakpointsByFile map[string]map[int]bool
+}
+
+var globalInitTracker = &GlobalInitTracker{
+	initCompleted:         make(map[string]bool),
+	initBreakpointSet:     make(map[int]bool),
+	initBreakpointsByFile: make(map[string]map[int]bool),
+}
+
+func (git *GlobalInitTracker) MarkInitCompleted(filename string) {
+	git.mu.Lock()
+	defer git.mu.Unlock()
+	normalizedFilename := normalizeFilename(filename)
+	git.initCompleted[normalizedFilename] = true
+	if debugInit {
+		fmt.Printf("[INIT-TRACKER] Init completed for: %s\n", normalizedFilename)
+	}
+}
+
+func (git *GlobalInitTracker) IsInitCompleted(filename string) bool {
+	git.mu.RLock()
+	defer git.mu.RUnlock()
+	normalizedFilename := normalizeFilename(filename)
+	return git.initCompleted[normalizedFilename]
+}
+
+func getMapKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func (git *GlobalInitTracker) RecordInitBreakpoint(filename string, line int) {
+	git.mu.Lock()
+	defer git.mu.Unlock()
+	normalizedFilename := normalizeFilename(filename)
+
+	// PERF: O(1) set insert instead of linear duplicate check.
+	git.initBreakpointSet[line] = true
+
+	if git.initBreakpointsByFile[normalizedFilename] == nil {
+		git.initBreakpointsByFile[normalizedFilename] = make(map[int]bool)
+	}
+	git.initBreakpointsByFile[normalizedFilename][line] = true
+
+	if debugInit {
+		fmt.Printf("[INIT-TRACKER] Recorded init breakpoint: file='%s', line=%d\n", normalizedFilename, line)
+	}
+}
+
+// WasBreakpointHitDuringInit checks if a specific file+line was hit during init.
+func (git *GlobalInitTracker) WasBreakpointHitDuringInit(filename string, line int) bool {
+	git.mu.RLock()
+	defer git.mu.RUnlock()
+	normalizedFilename := normalizeFilename(filename)
+	fileSet := git.initBreakpointsByFile[normalizedFilename]
+	if fileSet == nil {
+		return false
+	}
+	return fileSet[line]
+}
+
+// WasAnyBreakpointHitDuringInit checks if this line was hit during init in ANY file.
+// PERF: O(1) map lookup — was O(files * lines) linear scan under RLock.
+func (git *GlobalInitTracker) WasAnyBreakpointHitDuringInit(line int) bool {
+	git.mu.RLock()
+	found := git.initBreakpointSet[line]
+	git.mu.RUnlock()
+	return found
+}
+
+func (git *GlobalInitTracker) HasAnyInitCompleted() bool {
+	git.mu.RLock()
+	defer git.mu.RUnlock()
+	return len(git.initCompleted) > 0
+}
+
+func (git *GlobalInitTracker) Reset() {
+	git.mu.Lock()
+	defer git.mu.Unlock()
+	git.initCompleted = make(map[string]bool)
+	git.initBreakpointSet = make(map[int]bool)
+	git.initBreakpointsByFile = make(map[string]map[int]bool)
+}
+
+func GetGlobalInitTracker() *GlobalInitTracker {
+	return globalInitTracker
+}
+
+// SetBreakpoint adds a breakpoint. Filenames are normalized at write time so
+// HasBreakpoint never needs to allocate or normalize at read time.
+func (gbr *GlobalBreakpointRegistry) SetBreakpoint(filename string, line int) (id int, err error) {
+	// PERF: normalize once here so all lookups use the canonical form.
+	filename = normalizeFilename(filename)
+
+	gbr.mu.Lock()
+	defer gbr.mu.Unlock()
+
+	idx := sort.SearchInts(gbr.breakpoints[filename], line)
+	if idx < len(gbr.breakpoints[filename]) && gbr.breakpoints[filename][idx] == line {
+		return 0, errors.New("breakpoint exists")
+	}
+
+	gbr.breakpoints[filename] = append(gbr.breakpoints[filename], line)
+	if len(gbr.breakpoints[filename]) > 1 {
+		sort.Ints(gbr.breakpoints[filename])
+	}
+
+	id = gbr.nextID
+	gbr.nextID++
+	gbr.breakpointIDs[bpKey{filename, line}] = id
+
+	if debugBP {
+		fmt.Printf("[GLOBAL-BP] ✅ Breakpoint added: id=%d, filename='%s', line=%d, total=%d\n",
+			id, filename, line, len(gbr.breakpoints[filename]))
+	}
+
+	return id, nil
+}
+
+func (gbr *GlobalBreakpointRegistry) ClearBreakpoint(filename string, line int) error {
+	filename = normalizeFilename(filename)
+
+	gbr.mu.Lock()
+	defer gbr.mu.Unlock()
+
+	if len(gbr.breakpoints[filename]) == 0 {
+		return errors.New("no breakpoints")
+	}
+
+	idx := sort.SearchInts(gbr.breakpoints[filename], line)
+	if idx < len(gbr.breakpoints[filename]) && gbr.breakpoints[filename][idx] == line {
+		gbr.breakpoints[filename] = append(gbr.breakpoints[filename][:idx], gbr.breakpoints[filename][idx+1:]...)
+		if len(gbr.breakpoints[filename]) == 0 {
+			delete(gbr.breakpoints, filename)
+		}
+		delete(gbr.breakpointIDs, bpKey{filename, line})
+		if debugBP {
+			fmt.Printf("[GLOBAL-BP] Breakpoint cleared: filename='%s', line=%d\n", filename, line)
+		}
+		return nil
+	}
+
+	return errors.New("breakpoint doesn't exist")
+}
+
+// HasBreakpoint checks for a breakpoint. Caller must pass a normalized filename.
+// PERF: no string allocation, no normalization, just a lock + binary search.
+// No defer — manual unlock is measurably faster in tight hot paths.
+func (gbr *GlobalBreakpointRegistry) HasBreakpoint(normalizedFilename string, line int) bool {
+	gbr.mu.RLock()
+	lines := gbr.breakpoints[normalizedFilename]
+	idx := sort.SearchInts(lines, line)
+	found := idx < len(lines) && lines[idx] == line
+	gbr.mu.RUnlock()
+	return found
+}
+
+func (gbr *GlobalBreakpointRegistry) GetBreakpointID(filename string, line int) int {
+	filename = normalizeFilename(filename)
+	gbr.mu.RLock()
+	id := gbr.breakpointIDs[bpKey{filename, line}]
+	gbr.mu.RUnlock()
+	return id
+}
+
+func (gbr *GlobalBreakpointRegistry) GetAllBreakpoints() map[string][]int {
+	gbr.mu.RLock()
+	defer gbr.mu.RUnlock()
+
+	result := make(map[string][]int)
+	for k, v := range gbr.breakpoints {
+		result[k] = append([]int(nil), v...)
+	}
+	return result
+}
+
+func (gbr *GlobalBreakpointRegistry) Count() int {
+	gbr.mu.RLock()
+	defer gbr.mu.RUnlock()
+	return len(gbr.breakpoints)
+}
+
+func GetGlobalBreakpoints() *GlobalBreakpointRegistry {
+	return globalBreakpoints
+}
 
 type Debugger struct {
 	vm *vm
 
 	currentLine     int
 	lastLine        int
-	breakpoints     map[string][]int
+	lastDebugLine   int
+	breakpoints     map[string][]int // normalized filename -> sorted lines
 	breakpointMutex sync.RWMutex
-	breakpointIDs   map[string]int
+	breakpointIDs   map[bpKey]int // PERF: struct key, no string alloc on lookup
 	breakPointCount int
 	activationCh    chan chan DebuggerActivation
 	currentCh       chan DebuggerActivation
@@ -31,66 +540,134 @@ type Debugger struct {
 		pc         int
 		stackDepth int
 	}
-	next              bool
-	stepIn            bool
-	continuing        bool
-	stepOverTargetDepth int  // Depth where step-over operation started
-	enableDebugLogging bool
-	configuredCh      chan struct{}
-	waitingForConfig  bool
-	evalMutex         sync.Mutex
+	next                bool
+	stepIn              bool
+	continuing          bool
+	stepOverTargetDepth int
+	stepOverStartLine   int
+	steppingFilename    string
+	enableDebugLogging  bool
+	skipPhaseEntryBreak bool
+	lifecycleTransition bool
+	userCommandIssued   bool
+	configuredCh        chan struct{}
+	waitingForConfig    bool
+	evalMutex           sync.Mutex
+	hasConnection       bool
 
-	// Performance caches
-	varDeclLines      map[string]int
-	sourceVarCache    map[int]*sourceVarInfo // Cache keyed by line number
-	globalVarCache    map[string]bool
-	sourceCacheValid  bool
+	initPhase    bool
+	initFilename string
 
-	// Variable value cache - stores captured return values
-	varValueCache     map[string]Value // Cache keyed by "filename:line:varName"
-	varValueCacheLine int              // Current line where cache is valid
+	// --- PERF: hot-path caches ---
 
-	// Function call tracking
-	functionCallStack    []FunctionCall
-	pendingReturnValues map[int]Value // keyed by stack depth
-	returnValueCache    map[string]Value // keyed by "funcName:line"
+	// cachedPrg is the last vm.prg pointer we computed filename/normFilename for.
+	// When vm.prg == cachedPrg we skip all string work in breakpoint().
+	cachedPrg      *Program
+	cachedFilename string // raw src.Name()
+	cachedNormFile string // normalizeFilename(cachedFilename), slice of cachedFilename or equal
 
-	// Scope tracking
-	currentScopeDepth   int
-	scopeVariables     map[int]map[string]Value // depth -> variables
-	
-	// Cross-VM variable access
-	initRuntime       *Runtime  // Reference to init VM for global variable access
-	setupData         Value     // Setup function return value
+	// PERF: Line() cache — avoids expensive src.Position(sourceOffset(pc)) on every instruction.
+	// Invalidated when prg changes (in refreshFilenameCache) or when cachedPC != vm.pc.
+	cachedPC   int
+	cachedLine int
+
+	// initComplete is a local monotonic copy of globalInitTracker.HasAnyInitCompleted().
+	// It is only ever flipped from false→true, never backwards, so once true we stop
+	// asking the global tracker entirely (eliminating an RLock per instruction).
+	initComplete bool
+
+	// hasLocalBPs / hasGlobalBPs are set/cleared by SetBreakpoint/ClearBreakpoint.
+	// When both are false, breakpoint() returns immediately with no lock acquisitions.
+	hasLocalBPs  bool
+	hasGlobalBPs bool
+
+	// pausedVarSnapshot is built lazily on the first eval call per pause and reused
+	// for all subsequent evals during the same pause (e.g. multiple variable hovers).
+	// Cleared by Continue()/Next()/StepIn() before resuming.
+	pausedVarSnapshot     map[string]Value
+	pausedVarSnapshotLine int
+
+	// ---
+
+	varDeclLines     map[string]int
+	sourceVarCache   map[sourceVarCacheKey]*sourceVarInfo // PERF: composite key fixes correctness + re-enables cache
+	globalVarCache   map[string]bool
+	sourceCacheValid bool
+
+	varValueCache     map[string]Value
+	varValueCacheLine int
+
+	functionCallStack   []FunctionCall
+	pendingReturnValues map[int]Value
+	returnValueCache    map[string]Value
+
+	currentScopeDepth int
+	scopeVariables    map[int]map[string]Value
+
+	initRuntime *Runtime
+	setupData   Value
+
+	cachedGlobalNames map[string]bool
+	globalsCaptured   bool
+
+	vmExited bool
+	vmDoneCh chan struct{}
+
+	pendingCh chan DebuggerActivation
+
+	suppressDebugger bool
 }
 
-
+// sourceVarCacheKey includes currentLine so variables declared after the current
+// position are correctly excluded. Previously the cache was keyed only by
+// functionStartLine which caused stale entries to miss newly-declared vars.
+type sourceVarCacheKey struct {
+	functionStartLine int
+	currentLine       int
+}
 
 type sourceVarInfo struct {
-	params     map[string]int  // paramName -> negative index
-	locals     map[string]int  // varName -> positive index
-	declLines  map[string]int  // varName -> declaration line
-	numParams  int
+	params    map[string]int
+	locals    map[string]int
+	declLines map[string]int
+	numParams int
 }
 
 func newDebugger(vm *vm) *Debugger {
+	inheritConnection := false
+	globalInitialized := globalDebugCoordinator.IsInitialized()
+	if globalInitialized {
+		inheritConnection = globalDebugCoordinator.HasGlobalConnection()
+	}
+
 	dbg := &Debugger{
 		vm:                 vm,
-		activationCh:       make(chan chan DebuggerActivation),
+		activationCh:       make(chan chan DebuggerActivation, 1),
 		active:             false,
 		breakpoints:        make(map[string][]int),
-		breakpointIDs:      make(map[string]int),
+		breakpointIDs:      make(map[bpKey]int),
 		lastLine:           0,
+		lastDebugLine:      -1,
 		configuredCh:       make(chan struct{}),
 		waitingForConfig:   true,
 		varDeclLines:       make(map[string]int),
-		sourceVarCache:     make(map[int]*sourceVarInfo),
+		sourceVarCache:     make(map[sourceVarCacheKey]*sourceVarInfo),
 		globalVarCache:     make(map[string]bool),
 		sourceCacheValid:   false,
 		continuing:         false,
-		enableDebugLogging: true, // ENABLED by default to help diagnose stack issues
+		enableDebugLogging: debugAll || os.Getenv("SOBEK_DEBUG_LOGGING") == "1",
 		varValueCache:      make(map[string]Value),
 		varValueCacheLine:  -1,
+		hasConnection:      inheritConnection,
+		vmDoneCh:           make(chan struct{}),
+	}
+	if debugActivate {
+		if inheritConnection {
+			fmt.Printf("[DEBUGGER] New debugger inherited global connection status: %v\n", inheritConnection)
+		} else {
+			fmt.Printf("[DEBUGGER] New debugger NOT inheriting connection (globalInitialized=%v, inheritConnection=%v)\n",
+				globalInitialized, inheritConnection)
+		}
 	}
 	return dbg
 }
@@ -101,6 +678,7 @@ const (
 	ProgramStartActivation      ActivationReason = "start"
 	DebuggerStatementActivation ActivationReason = "debugger"
 	BreakpointActivation        ActivationReason = "breakpoint"
+	StepActivation              ActivationReason = "step"
 )
 
 type DebuggerActivation struct {
@@ -108,8 +686,8 @@ type DebuggerActivation struct {
 	Filename string
 	Line     int
 	ID       int
+	Epoch    uint64
 }
-
 
 var globalBuiltinKeys = map[string]bool{
 	"Object": true, "Function": true, "Array": true, "String": true, "globalThis": true,
@@ -126,54 +704,698 @@ var globalBuiltinKeys = map[string]bool{
 	"WeakSet": true, "WeakMap": true, "Map": true, "Set": true, "Promise": true,
 }
 
-// isIdentifierLike reports whether the name can be used as a JavaScript identifier.
+var globalUnsafeKeys = map[string]bool{
+	"module":  true,
+	"exports": true,
+	"require": true,
+}
+
+var lifecycleFunctionKeys = map[string]bool{
+	"setup":         true,
+	"teardown":      true,
+	"handleSummary": true,
+	"default":       true,
+}
+
+func safeGetGlobalProperty(obj *Object, key unistring.String) (v Value) {
+	defer func() {
+		if r := recover(); r != nil {
+			v = nil
+		}
+	}()
+	return obj.self.getStr(key, nil)
+}
+
+func safeStringKeys(obj *Object) (names []string) {
+	defer func() {
+		if r := recover(); r != nil {
+			names = nil
+		}
+	}()
+	vals := obj.self.stringKeys(true, nil)
+	names = make([]string, 0, len(vals))
+	for _, v := range vals {
+		if s, ok := v.(String); ok {
+			names = append(names, s.String())
+		}
+	}
+	return
+}
+
 func isIdentifierLike(name string) bool {
-    if name == "" {
-        return false
-    }
-    for i, r := range name {
-        if i == 0 {
-            if r != '$' && r != '_' && !unicode.IsLetter(r) {
-                return false
-            }
-            continue
-        }
-        if r != '$' && r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
-            return false
-        }
-    }
-    return true
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if i == 0 {
+			if r != '$' && r != '_' && !unicode.IsLetter(r) {
+				return false
+			}
+			continue
+		}
+		if r != '$' && r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeFilename strips the file:// prefix. It returns a slice of the input
+// string when possible (zero allocation) — only allocates when TrimPrefix would.
+func normalizeFilename(filename string) string {
+	const prefix = "file://"
+	if strings.HasPrefix(filename, prefix) {
+		return filename[len(prefix):] // slice, no allocation
+	}
+	return filename
+}
+
+// refreshFilenameCache updates the per-debugger filename caches when vm.prg changes.
+// Called at the top of breakpoint() and Filename(). Cheap when prg hasn't changed.
+func (dbg *Debugger) refreshFilenameCache() {
+	if dbg.vm.prg == dbg.cachedPrg {
+		return
+	}
+	dbg.cachedPrg = dbg.vm.prg
+	dbg.cachedPC = -1 // invalidate Line() cache
+	dbg.cachedLine = 0
+	if dbg.vm.prg == nil || dbg.vm.prg.src == nil {
+		dbg.cachedFilename = ""
+		dbg.cachedNormFile = ""
+		return
+	}
+	dbg.cachedFilename = dbg.vm.prg.src.Name()
+	dbg.cachedNormFile = normalizeFilename(dbg.cachedFilename)
 }
 
 func (dbg *Debugger) activate(reason ActivationReason, filename string, line int) {
+	dbg.activateWithStepState(reason, filename, line, dbg.stepIn, dbg.next)
+}
+
+func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename string, line int, wasStepIn bool, wasNext bool) {
+	// PERF: only call time.Now() when debug logging is enabled.
+	var activateStart time.Time
+	if debugActivate {
+		activateStart = time.Now()
+	}
+
+	savedStepIn := wasStepIn
+	savedNext := wasNext
+	savedLifecycleTransition := dbg.lifecycleTransition
+
+	if debugActivate {
+		fmt.Printf("[DEBUGGER-ACTIVATE-ENTRY] At %s:%d - savedStepIn=%v, savedNext=%v, savedLifecycleTransition=%v, reason=%v\n",
+			filename, line, savedStepIn, savedNext, savedLifecycleTransition, reason)
+	}
+
+	if globalDebugCoordinator.IsInitialized() {
+		globalDebugCoordinator.SetActiveDebugger(dbg)
+	}
+
 	dbg.active = true
-	ch := <-dbg.activationCh
+
+	savedCallDepth := dbg.callStackDepth()
+
+	epoch := globalDebugCoordinator.NextGlobalEpoch()
+
+	var ch chan DebuggerActivation
+
+	if debugActivate {
+		fmt.Printf("[DEBUGGER-ACTIVATE] Waiting for Continue() at %s:%d (hasConnection=%v, lifecycleTransition=%v)\n",
+			filename, line, dbg.HasConnection(), savedLifecycleTransition)
+	}
+
+	if savedLifecycleTransition {
+		if debugActivate {
+			fmt.Printf("[DEBUGGER-ACTIVATE] Lifecycle transition: waiting on both channels (preferring global coordinator)\n")
+		}
+	lifecycleWaitLoop:
+		for {
+			select {
+			case ch = <-globalDebugCoordinator.ActivationChannel():
+				if debugActivate {
+					fmt.Printf("[DEBUGGER-ACTIVATE] Received from global coordinator (lifecycle transition)\n")
+				}
+				// PERF: read global step state once, reuse below.
+				globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := globalDebugCoordinator.GetGlobalStepState()
+				userIssuedCommand := globalNext || globalStepIn
+
+				if userIssuedCommand {
+					globalDebugCoordinator.ConsumeLifecycleStepIn()
+					localDepth := savedCallDepth
+					if debugActivate {
+						fmt.Printf("[DEBUGGER-ACTIVATE] Lifecycle transition: user issued command, applying global step state: next=%v, stepIn=%v, file=%s, globalDepth=%d, localDepth=%d, line=%d\n",
+							globalNext, globalStepIn, globalSteppingFile, globalTargetDepth, localDepth, line)
+					}
+					dbg.next = globalNext
+					dbg.stepIn = globalStepIn
+					dbg.steppingFilename = globalSteppingFile
+					dbg.stepOverTargetDepth = localDepth
+					dbg.stepOverStartLine = line
+					dbg.userCommandIssued = true
+					globalDebugCoordinator.ClearGlobalStepState()
+				} else if globalDebugCoordinator.ConsumeLifecycleStepIn() {
+					if debugActivate {
+						fmt.Printf("[DEBUGGER-ACTIVATE] Lifecycle transition: using pendingLifecycleStepIn (no user command yet)\n")
+					}
+					dbg.stepIn = true
+					dbg.next = false
+					dbg.steppingFilename = filename
+					dbg.stepOverTargetDepth = savedCallDepth
+					globalDebugCoordinator.ClearGlobalStepState()
+				}
+				break lifecycleWaitLoop
+			case ch = <-dbg.activationCh:
+				if debugActivate {
+					fmt.Printf("[DEBUGGER-ACTIVATE] Received from local channel (lifecycle transition - avoided global coordinator race)\n")
+				}
+				globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := globalDebugCoordinator.GetGlobalStepState()
+				userIssuedCommand := globalNext || globalStepIn
+
+				if userIssuedCommand {
+					globalDebugCoordinator.ConsumeLifecycleStepIn()
+					localDepth := savedCallDepth
+					if debugActivate {
+						fmt.Printf("[DEBUGGER-ACTIVATE] Lifecycle transition (local): user issued command, applying global step state: next=%v, stepIn=%v, file=%s, globalDepth=%d, localDepth=%d, line=%d\n",
+							globalNext, globalStepIn, globalSteppingFile, globalTargetDepth, localDepth, line)
+					}
+					dbg.next = globalNext
+					dbg.stepIn = globalStepIn
+					dbg.steppingFilename = globalSteppingFile
+					dbg.stepOverTargetDepth = localDepth
+					dbg.stepOverStartLine = line
+					dbg.userCommandIssued = true
+					globalDebugCoordinator.ClearGlobalStepState()
+				} else if globalDebugCoordinator.ConsumeLifecycleStepIn() {
+					if debugActivate {
+						fmt.Printf("[DEBUGGER-ACTIVATE] Lifecycle transition (local): using pendingLifecycleStepIn (no user command yet)\n")
+					}
+					dbg.stepIn = true
+					dbg.next = false
+					dbg.steppingFilename = filename
+					dbg.stepOverTargetDepth = savedCallDepth
+					globalDebugCoordinator.ClearGlobalStepState()
+				}
+				break lifecycleWaitLoop
+			case <-time.After(5 * time.Second):
+				if debugActivate {
+					fmt.Printf("[DEBUGGER-ACTIVATE] ⚠️ Lifecycle transition: timeout waiting for Continue() (5s). Still waiting...\n")
+				}
+				if globalDebugCoordinator.HasPendingLifecycleStepIn() {
+					if debugActivate {
+						fmt.Printf("[DEBUGGER-ACTIVATE] Lifecycle transition: has pending step-in, continuing to wait...\n")
+					}
+				} else {
+					if debugActivate {
+						fmt.Printf("[DEBUGGER-ACTIVATE] Lifecycle transition: no pending step-in, still waiting for user...\n")
+					}
+				}
+			}
+		}
+	} else {
+		if debugActivate {
+			fmt.Printf("[DEBUGGER-ACTIVATE] Non-lifecycle: waiting on both channels\n")
+		}
+		select {
+		case ch = <-dbg.activationCh:
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] Received from local channel (non-lifecycle)\n")
+			}
+			if !savedStepIn {
+				globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := globalDebugCoordinator.GetGlobalStepState()
+				if globalNext || globalStepIn {
+					if debugActivate {
+						fmt.Printf("[DEBUGGER-ACTIVATE] Non-lifecycle local channel: applying global step state: next=%v, stepIn=%v, file=%s, targetDepth=%d\n",
+							globalNext, globalStepIn, globalSteppingFile, globalTargetDepth)
+					}
+					dbg.next = globalNext
+					dbg.stepIn = globalStepIn
+					dbg.steppingFilename = globalSteppingFile
+					localDepth := savedCallDepth
+					if debugActivate {
+						fmt.Printf("[DEBUGGER-ACTIVATE] ✅ Using LOCAL call depth=%d (global was=%d, line=%d)\n",
+							localDepth, globalTargetDepth, line)
+					}
+					dbg.stepOverTargetDepth = localDepth
+					dbg.stepOverStartLine = line
+					dbg.userCommandIssued = true
+					globalDebugCoordinator.ClearGlobalStepState()
+				}
+			} else if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] Skipping global step state check (lifecycle stepIn entry, stale state from previous phase)\n")
+			}
+		case ch = <-globalDebugCoordinator.ActivationChannel():
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] Received from global coordinator (non-lifecycle)\n")
+			}
+			if !savedStepIn {
+				globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := globalDebugCoordinator.GetGlobalStepState()
+				if globalNext || globalStepIn {
+					dbg.next = globalNext
+					dbg.stepIn = globalStepIn
+					dbg.steppingFilename = globalSteppingFile
+					localDepth := savedCallDepth
+					if debugActivate {
+						fmt.Printf("[DEBUGGER-ACTIVATE] ✅ Using LOCAL call depth=%d (global was=%d, line=%d)\n",
+							localDepth, globalTargetDepth, line)
+					}
+					dbg.stepOverTargetDepth = localDepth
+					dbg.stepOverStartLine = line
+					dbg.userCommandIssued = true
+					if debugActivate {
+						fmt.Printf("[DEBUGGER-ACTIVATE] Non-lifecycle global: applied global step state: next=%v, stepIn=%v, file=%s, targetDepth=%d (localDepth=%d)\n",
+							globalNext, globalStepIn, globalSteppingFile, globalTargetDepth, localDepth)
+					}
+					globalDebugCoordinator.ClearGlobalStepState()
+				}
+			} else if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] Skipping global step state check (lifecycle stepIn entry, stale state from previous phase)\n")
+			}
+		}
+	}
 
 	id := 0
-	if reason != DebuggerStatementActivation {
-		dbg.breakpointMutex.RLock()
-		id = dbg.breakpointIDs[filename+":"+strconv.Itoa(line)]
-		dbg.breakpointMutex.RUnlock()
+	if debugActivate {
+		channelWait := time.Since(activateStart)
+		fmt.Printf("[DEBUGGER-ACTIVATE] Channel handshake completed in %dms at %s:%d\n",
+			channelWait.Milliseconds(), filename, line)
 	}
+	if reason != DebuggerStatementActivation {
+		id = globalBreakpoints.GetBreakpointID(filename, line)
+		if id == 0 {
+			dbg.breakpointMutex.RLock()
+			id = dbg.breakpointIDs[bpKey{filename, line}]
+			dbg.breakpointMutex.RUnlock()
+		}
+	}
+
+	dbg.pendingCh = ch
 
 	ch <- DebuggerActivation{
 		Reason:   reason,
 		Filename: filename,
 		Line:     line,
 		ID:       id,
+		Epoch:    epoch,
 	}
 	<-ch
+
+	dbg.pendingCh = nil
+
+	// PERF: read global step state once after Continue signal, reuse for all checks below.
+	globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := globalDebugCoordinator.GetGlobalStepState()
+	userCommand := false
+
+	if savedStepIn && !dbg.userCommandIssued {
+		if globalNext || globalStepIn {
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] Post-Continue: IGNORING stale global state (lifecycle stepIn entry): next=%v, stepIn=%v, file=%s, depth=%d\n",
+					globalNext, globalStepIn, globalSteppingFile, globalTargetDepth)
+			}
+			globalDebugCoordinator.ClearGlobalStepState()
+		}
+	} else {
+		userCommand = globalNext || globalStepIn
+		if userCommand {
+			dbg.next = globalNext
+			dbg.stepIn = globalStepIn
+			if globalSteppingFile != "" {
+				dbg.steppingFilename = globalSteppingFile
+			}
+			localDepth := savedCallDepth
+			dbg.stepOverTargetDepth = localDepth
+			dbg.stepOverStartLine = line
+			globalDebugCoordinator.ClearGlobalStepState()
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] Applied user command from global state: next=%v, stepIn=%v, file=%s, globalDepth=%d, localDepth=%d, startLine=%d\n",
+					globalNext, globalStepIn, globalSteppingFile, globalTargetDepth, localDepth, line)
+			}
+		}
+	}
+
+	if dbg.userCommandIssued {
+		userCommand = true
+	}
+	dbg.userCommandIssued = false
+
+	if debugActivate {
+		fmt.Printf("[DEBUGGER-ACTIVATE-POST] After Continue signal: stepIn=%v (saved=%v), next=%v (saved=%v), userCommandIssued=%v, lifecycleTransition=%v\n",
+			dbg.stepIn, savedStepIn, dbg.next, savedNext, userCommand, savedLifecycleTransition)
+	}
+
+	if savedLifecycleTransition {
+		dbg.lifecycleTransition = false
+		dbg.lastBreakpoint.line = line
+		dbg.lastBreakpoint.filename = filename
+		dbg.lastBreakpoint.pc = dbg.vm.pc
+		dbg.lastBreakpoint.stackDepth = savedCallDepth
+		dbg.stepOverTargetDepth = savedCallDepth
+
+		if userCommand {
+			dbg.steppingFilename = filename
+			if dbg.next {
+				dbg.stepOverStartLine = line
+			}
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] Lifecycle transition complete, honoring user's command: stepIn=%v, next=%v, steppingFilename=%s\n",
+					dbg.stepIn, dbg.next, filename)
+			}
+		} else {
+			dbg.stepIn = false
+			dbg.next = false
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] Lifecycle transition complete, no user command, cleared step flags\n")
+			}
+		}
+	} else if userCommand {
+		if debugActivate {
+			fmt.Printf("[DEBUGGER-ACTIVATE] Normal breakpoint, user issued command: stepIn=%v, next=%v\n",
+				dbg.stepIn, dbg.next)
+		}
+		dbg.lastBreakpoint.line = line
+		dbg.lastBreakpoint.filename = filename
+		dbg.lastBreakpoint.pc = dbg.vm.pc
+		dbg.lastBreakpoint.stackDepth = savedCallDepth
+		if dbg.next {
+			dbg.stepOverStartLine = line
+			dbg.stepOverTargetDepth = savedCallDepth
+			if dbg.steppingFilename == "" {
+				dbg.steppingFilename = filename
+			}
+		}
+		if dbg.stepIn {
+			if dbg.steppingFilename == "" {
+				dbg.steppingFilename = filename
+			}
+		}
+	} else {
+		dbg.stepIn = savedStepIn
+		dbg.next = savedNext
+		if dbg.next {
+			dbg.stepOverStartLine = line
+			dbg.stepOverTargetDepth = savedCallDepth
+			dbg.steppingFilename = filename
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] Restored next=true, set stepOverStartLine=%d, targetDepth=%d\n", line, dbg.stepOverTargetDepth)
+			}
+		}
+		if debugActivate {
+			fmt.Printf("[DEBUGGER-ACTIVATE] Normal breakpoint, no user command detected, restored saved: stepIn=%v, next=%v, stepOverStartLine=%d\n",
+				savedStepIn, savedNext, dbg.stepOverStartLine)
+		}
+	}
+
+	// PERF: invalidate the per-pause variable snapshot now that we're resuming.
+	dbg.pausedVarSnapshot = nil
+
 	dbg.active = false
+
+	if debugActivate {
+		totalActivate := time.Since(activateStart)
+		fmt.Printf("[DEBUGGER-ACTIVATE] Total activate() time: %dms at %s:%d\n",
+			totalActivate.Milliseconds(), filename, line)
+	}
+}
+
+type trackedChan struct {
+	ch        chan DebuggerActivation
+	closeOnce sync.Once
+}
+
+func newTrackedChan() *trackedChan {
+	return &trackedChan{
+		ch: make(chan DebuggerActivation),
+	}
+}
+
+func (tc *trackedChan) Close() {
+	if tc == nil {
+		return
+	}
+	tc.closeOnce.Do(func() {
+		close(tc.ch)
+	})
+}
+
+func safeCloseActivationCh(ch chan DebuggerActivation) {
+	if ch == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-SAFE-CLOSE] Recovered from close of already-closed channel: %v\n", r)
+			}
+		}
+	}()
+	close(ch)
 }
 
 func (dbg *Debugger) Continue() DebuggerActivation {
+	var continueStart time.Time
+	if debugContinue {
+		continueStart = time.Now()
+	}
+
+	if dbg.pendingCh != nil {
+		if dbg.pendingCh != dbg.currentCh {
+			safeCloseActivationCh(dbg.pendingCh)
+		}
+		dbg.pendingCh = nil
+	}
 	if dbg.currentCh != nil {
-		close(dbg.currentCh)
+		safeCloseActivationCh(dbg.currentCh)
+		dbg.currentCh = nil
 	}
 	dbg.currentCh = make(chan DebuggerActivation)
-	dbg.activationCh <- dbg.currentCh
-	activation := <-dbg.currentCh
-	return activation
+
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-CONTINUE] Attempting to send continue signal (stepIn=%v, next=%v, lifecycleTransition=%v)\n",
+			dbg.stepIn, dbg.next, dbg.lifecycleTransition)
+	}
+
+	// PERF: read global step state once at Continue() entry rather than re-reading
+	// on every loop iteration. Re-read only after a timeout/transition.
+	globalNext, globalStepIn, _, _ := globalDebugCoordinator.GetGlobalStepState()
+	hasGlobalStepState := globalNext || globalStepIn
+
+	localDead := dbg.vmExited
+	if !localDead {
+		select {
+		case <-dbg.vmDoneCh:
+			localDead = true
+		default:
+		}
+	}
+	if !localDead {
+		activeDbg := globalDebugCoordinator.GetActiveDebugger()
+		if activeDbg != nil {
+			if activeDbg.vmExited {
+				localDead = true
+			} else if activeDbg != dbg {
+				localDead = true
+			}
+		}
+	}
+
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-CONTINUE] Waiting for next activation: hasGlobalStepState=%v (globalNext=%v, globalStepIn=%v), localDead=%v\n",
+			hasGlobalStepState, globalNext, globalStepIn, localDead)
+	}
+
+	// PERF: allocate timers once and Reset() on retry rather than creating a new
+	// timer (and goroutine) on every loop iteration via time.After().
+	retryTimer := time.NewTimer(200 * time.Millisecond)
+	outerTimer := time.NewTimer(2 * time.Second)
+	defer retryTimer.Stop()
+	defer outerTimer.Stop()
+
+	// stopTimer drains and resets a timer safely.
+	stopTimer := func(t *time.Timer) {
+		if !t.Stop() {
+			select {
+			case <-t.C:
+			default:
+			}
+		}
+	}
+
+	waitForActivation := func(source string, skipVMDone bool) (DebuggerActivation, bool) {
+		var waitStart time.Time
+		if debugContinue {
+			waitStart = time.Now()
+		}
+
+		stopTimer(retryTimer)
+		retryTimer.Reset(200 * time.Millisecond)
+
+		if skipVMDone {
+			select {
+			case activation := <-dbg.currentCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Received activation from %s: %s:%d (wait=%dms, total=%dms)\n",
+						source, activation.Filename, activation.Line,
+						time.Since(waitStart).Milliseconds(), time.Since(continueStart).Milliseconds())
+				}
+				return activation, true
+			case <-retryTimer.C:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Retry timeout waiting for activation from %s (200ms, total=%dms)\n",
+						source, time.Since(continueStart).Milliseconds())
+				}
+				return DebuggerActivation{}, false
+			}
+		}
+		select {
+		case activation := <-dbg.currentCh:
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] Received activation from %s: %s:%d (wait=%dms, total=%dms)\n",
+					source, activation.Filename, activation.Line,
+					time.Since(waitStart).Milliseconds(), time.Since(continueStart).Milliseconds())
+			}
+			return activation, true
+		case <-dbg.vmDoneCh:
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] VM exited (vmDoneCh closed) while waiting on %s (%dms, total=%dms) - switching to global\n",
+					source, time.Since(waitStart).Milliseconds(), time.Since(continueStart).Milliseconds())
+			}
+			select {
+			case <-dbg.activationCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Drained stale currentCh from local activation channel\n")
+				}
+			default:
+			}
+			return DebuggerActivation{}, false
+		case <-retryTimer.C:
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] Retry timeout waiting for activation from %s (200ms, total=%dms)\n",
+					source, time.Since(continueStart).Milliseconds())
+			}
+			select {
+			case <-dbg.activationCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Drained stale currentCh from local activation channel\n")
+				}
+			default:
+			}
+			return DebuggerActivation{}, false
+		}
+	}
+
+	localTimedOut := localDead
+	for {
+		if localTimedOut {
+			select {
+			case <-globalDebugCoordinator.ActivationChannel():
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Drained stale entry from global coordinator channel\n")
+				}
+			default:
+			}
+			globalDebugCoordinator.ActivationChannel() <- dbg.currentCh
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] Sent to global coordinator (local VM exited), waiting for activation\n")
+			}
+			if activation, ok := waitForActivation("global", true); ok {
+				return activation
+			}
+			dbg.currentCh = make(chan DebuggerActivation)
+		} else if hasGlobalStepState {
+			stopTimer(outerTimer)
+			outerTimer.Reset(2 * time.Second)
+			select {
+			case globalDebugCoordinator.ActivationChannel() <- dbg.currentCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Sent to global coordinator (preferred due to global step state), waiting for activation\n")
+				}
+				if activation, ok := waitForActivation("global", false); ok {
+					return activation
+				}
+				localTimedOut = true
+				dbg.currentCh = make(chan DebuggerActivation)
+				// re-read global state only after a transition
+				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				hasGlobalStepState = globalNext || globalStepIn
+			case dbg.activationCh <- dbg.currentCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Sent to local channel (fallback), waiting for activation\n")
+				}
+				if activation, ok := waitForActivation("local", false); ok {
+					return activation
+				}
+				localTimedOut = true
+				dbg.currentCh = make(chan DebuggerActivation)
+				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				hasGlobalStepState = globalNext || globalStepIn
+			case <-dbg.vmDoneCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] VM exited (vmDoneCh) while waiting for receiver, switching to global-only\n")
+				}
+				localTimedOut = true
+				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				hasGlobalStepState = globalNext || globalStepIn
+			case <-outerTimer.C:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] ⚠️ Timeout waiting for receiver (hasGlobalStepState=%v), retrying...\n", hasGlobalStepState)
+				}
+				select {
+				case <-dbg.vmDoneCh:
+					localTimedOut = true
+				default:
+				}
+				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				hasGlobalStepState = globalNext || globalStepIn
+			}
+		} else {
+			stopTimer(outerTimer)
+			outerTimer.Reset(2 * time.Second)
+			select {
+			case dbg.activationCh <- dbg.currentCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Sent to local channel, waiting for activation\n")
+				}
+				if activation, ok := waitForActivation("local", false); ok {
+					return activation
+				}
+				localTimedOut = true
+				dbg.currentCh = make(chan DebuggerActivation)
+				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				hasGlobalStepState = globalNext || globalStepIn
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Local VM exited, switching to global-only mode (hasGlobalStepState=%v)\n", hasGlobalStepState)
+				}
+			case globalDebugCoordinator.ActivationChannel() <- dbg.currentCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Sent to global coordinator, waiting for activation\n")
+				}
+				if activation, ok := waitForActivation("global", false); ok {
+					return activation
+				}
+				dbg.currentCh = make(chan DebuggerActivation)
+				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				hasGlobalStepState = globalNext || globalStepIn
+			case <-dbg.vmDoneCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] VM exited (vmDoneCh) while waiting for receiver, switching to global-only\n")
+				}
+				localTimedOut = true
+				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				hasGlobalStepState = globalNext || globalStepIn
+			case <-outerTimer.C:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] ⚠️ Timeout waiting for receiver (hasGlobalStepState=%v), checking global state...\n", hasGlobalStepState)
+				}
+				select {
+				case <-dbg.vmDoneCh:
+					localTimedOut = true
+				default:
+				}
+				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				hasGlobalStepState = globalNext || globalStepIn
+			}
+		}
+	}
 }
 
 func (dbg *Debugger) SetConfigured() {
@@ -183,12 +1405,98 @@ func (dbg *Debugger) SetConfigured() {
 	}
 }
 
+func (dbg *Debugger) SetHasConnection(connected bool) {
+	dbg.hasConnection = connected
+	if globalDebugCoordinator.IsInitialized() {
+		globalDebugCoordinator.SetGlobalConnection(connected)
+	}
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] Connection status set to: %v\n", connected)
+	}
+}
+
+func (dbg *Debugger) HasConnection() bool {
+	if dbg.hasConnection {
+		return true
+	}
+	if globalDebugCoordinator.IsInitialized() {
+		return globalDebugCoordinator.HasGlobalConnection()
+	}
+	return false
+}
+
 func (dbg *Debugger) EnableDebugLogging() {
 	dbg.enableDebugLogging = true
 }
 
 func (dbg *Debugger) DisableDebugLogging() {
 	dbg.enableDebugLogging = false
+}
+
+// SetHasGlobalBPs allows external code to flag that the global breakpoint registry
+// has breakpoints, so breakpoint() will check globalBreakpoints without needing
+// to copy every breakpoint into the local debugger.
+func (dbg *Debugger) SetHasGlobalBPs(v bool) {
+	dbg.hasGlobalBPs = v
+}
+
+func (dbg *Debugger) SetInitPhase(inInit bool) {
+	wasInInit := dbg.initPhase
+	dbg.initPhase = inInit
+
+	if debugInit {
+		fmt.Printf("[DEBUGGER] Init phase set to: %v\n", inInit)
+	}
+
+	if inInit && !wasInInit && dbg.initFilename == "" {
+		if dbg.vm != nil && dbg.vm.prg != nil && dbg.vm.prg.src != nil {
+			filename := dbg.Filename()
+			if filename != "" {
+				dbg.initFilename = normalizeFilename(filename)
+				if debugInit {
+					fmt.Printf("[DEBUGGER] Captured init filename from VM: %s\n", dbg.initFilename)
+				}
+			}
+		}
+	}
+
+	if wasInInit && !inInit {
+		filename := dbg.initFilename
+		if filename == "" && dbg.vm != nil && dbg.vm.prg != nil && dbg.vm.prg.src != nil {
+			filename = normalizeFilename(dbg.Filename())
+			if debugInit {
+				fmt.Printf("[DEBUGGER] Captured init filename at completion: %s\n", filename)
+			}
+		}
+		if filename != "" {
+			if !globalInitTracker.IsInitCompleted(filename) {
+				globalInitTracker.MarkInitCompleted(filename)
+				if debugInit {
+					fmt.Printf("[DEBUGGER] Marked init complete for: %s\n", filename)
+				}
+			} else {
+				if debugInit {
+					fmt.Printf("[DEBUGGER] Init already completed for: %s (skipping mark)\n", filename)
+				}
+			}
+		} else {
+			if debugInit {
+				fmt.Printf("[DEBUGGER] WARNING: Could not mark init complete - no filename available (initFilename=%q)\n", dbg.initFilename)
+			}
+		}
+		dbg.initFilename = ""
+	}
+}
+
+func (dbg *Debugger) SetInitFilename(filename string) {
+	dbg.initFilename = filename
+	if debugInit {
+		fmt.Printf("[DEBUGGER] Init filename explicitly set to: %s\n", filename)
+	}
+}
+
+func (dbg *Debugger) IsInitPhase() bool {
+	return dbg.initPhase
 }
 
 func (dbg *Debugger) logDebug(format string, args ...interface{}) {
@@ -207,82 +1515,444 @@ func (dbg *Debugger) PC() int {
 	return dbg.vm.pc
 }
 
+func (dbg *Debugger) GetRuntime() *Runtime {
+	if dbg.vm == nil {
+		return nil
+	}
+	return dbg.vm.r
+}
+
+func (dbg *Debugger) IsActive() bool {
+	return dbg.active
+}
+
+func (dbg *Debugger) ActivationCh() chan chan DebuggerActivation {
+	return dbg.activationCh
+}
+
+func (dbg *Debugger) GetCurrentBreakpointInfo() (string, int, int, bool) {
+	if !dbg.active || dbg.vm == nil || dbg.vm.prg == nil || dbg.vm.prg.src == nil {
+		return "", 0, 0, false
+	}
+	filename := dbg.Filename()
+	line := dbg.Line()
+	id := globalBreakpoints.GetBreakpointID(filename, line)
+	if id == 0 {
+		dbg.breakpointMutex.RLock()
+		id = dbg.breakpointIDs[bpKey{filename, line}]
+		dbg.breakpointMutex.RUnlock()
+	}
+	return filename, line, id, true
+}
+
+func (dbg *Debugger) GetActivationEpoch() uint64 {
+	return globalDebugCoordinator.GetGlobalEpoch()
+}
+
 func (dbg *Debugger) Detach() {
+	safeClose := func(ch chan DebuggerActivation) {
+		defer func() { recover() }()
+		close(ch)
+	}
 	dbg.vm.debugger = nil
 	dbg.vm.debugMode = false
 	dbg.vm = nil
 	dbg.active = false
+	if dbg.pendingCh != nil {
+		if dbg.pendingCh != dbg.currentCh {
+			safeClose(dbg.pendingCh)
+		}
+		dbg.pendingCh = nil
+	}
 	if dbg.currentCh != nil {
-		close(dbg.currentCh)
+		safeClose(dbg.currentCh)
 		dbg.currentCh = nil
 	}
 }
 
 func (dbg *Debugger) SetBreakpoint(filename string, line int) (id int, err error) {
-	idx := sort.SearchInts(dbg.breakpoints[filename], line)
-	if idx < len(dbg.breakpoints[filename]) && dbg.breakpoints[filename][idx] == line {
-		err = errors.New("breakpoint exists")
-	} else {
-		dbg.breakpoints[filename] = append(dbg.breakpoints[filename], line)
-		if len(dbg.breakpoints[filename]) > 1 {
-			sort.Ints(dbg.breakpoints[filename])
+	if debugBP {
+		fmt.Printf("[DEBUGGER-SET-BP] Setting breakpoint: filename='%s', line=%d, debugger=%p, vm=%p\n", filename, line, dbg, dbg.vm)
+	}
+
+	// Normalize at write time so all read paths use the canonical form.
+	normalizedFilename := normalizeFilename(filename)
+
+	id, globalErr := globalBreakpoints.SetBreakpoint(normalizedFilename, line)
+	if globalErr != nil && globalErr.Error() == "breakpoint exists" {
+		id = globalBreakpoints.GetBreakpointID(normalizedFilename, line)
+	}
+
+	dbg.breakpointMutex.Lock()
+	idx := sort.SearchInts(dbg.breakpoints[normalizedFilename], line)
+	if idx >= len(dbg.breakpoints[normalizedFilename]) || dbg.breakpoints[normalizedFilename][idx] != line {
+		dbg.breakpoints[normalizedFilename] = append(dbg.breakpoints[normalizedFilename], line)
+		if len(dbg.breakpoints[normalizedFilename]) > 1 {
+			sort.Ints(dbg.breakpoints[normalizedFilename])
 		}
-		dbg.breakpointMutex.Lock()
-		id = dbg.breakPointCount
-		dbg.breakPointCount++
-		dbg.breakpointIDs[filename+":"+strconv.Itoa(line)] = id
-		dbg.breakpointMutex.Unlock()
+		if id == 0 {
+			id = dbg.breakPointCount
+			dbg.breakPointCount++
+		}
+		dbg.breakpointIDs[bpKey{normalizedFilename, line}] = id
+	}
+	dbg.hasLocalBPs = len(dbg.breakpoints) > 0
+	dbg.breakpointMutex.Unlock()
+
+	// Keep hasGlobalBPs in sync.
+	dbg.hasGlobalBPs = globalBreakpoints.Count() > 0
+
+	if debugBP {
+		fmt.Printf("[DEBUGGER-SET-BP] ✅ Breakpoint added: id=%d, local=%d, globalCount=%d\n",
+			id, len(dbg.breakpoints[normalizedFilename]), globalBreakpoints.Count())
 	}
 	return
 }
 
 func (dbg *Debugger) ClearBreakpoint(filename string, line int) (err error) {
-	if len(dbg.breakpoints[filename]) == 0 {
+	normalizedFilename := normalizeFilename(filename)
+
+	_ = globalBreakpoints.ClearBreakpoint(normalizedFilename, line)
+
+	dbg.breakpointMutex.Lock()
+	defer dbg.breakpointMutex.Unlock()
+
+	if len(dbg.breakpoints[normalizedFilename]) == 0 {
 		return errors.New("no breakpoints")
 	}
 
-	idx := sort.SearchInts(dbg.breakpoints[filename], line)
-	if idx < len(dbg.breakpoints[filename]) && dbg.breakpoints[filename][idx] == line {
-		dbg.breakpoints[filename] = append(dbg.breakpoints[filename][:idx], dbg.breakpoints[filename][idx+1:]...)
-		if len(dbg.breakpoints[filename]) == 0 {
-			delete(dbg.breakpoints, filename)
+	idx := sort.SearchInts(dbg.breakpoints[normalizedFilename], line)
+	if idx < len(dbg.breakpoints[normalizedFilename]) && dbg.breakpoints[normalizedFilename][idx] == line {
+		dbg.breakpoints[normalizedFilename] = append(dbg.breakpoints[normalizedFilename][:idx], dbg.breakpoints[normalizedFilename][idx+1:]...)
+		if len(dbg.breakpoints[normalizedFilename]) == 0 {
+			delete(dbg.breakpoints, normalizedFilename)
 		}
+		delete(dbg.breakpointIDs, bpKey{normalizedFilename, line})
 	} else {
 		err = errors.New("breakpoint doesn't exist")
 	}
+
+	dbg.hasLocalBPs = len(dbg.breakpoints) > 0
+	dbg.hasGlobalBPs = globalBreakpoints.Count() > 0
 	return
 }
 
 func (dbg *Debugger) Breakpoints() (map[string][]int, error) {
-	if len(dbg.breakpoints) == 0 {
+	globalBPs := globalBreakpoints.GetAllBreakpoints()
+
+	result := make(map[string][]int)
+	for k, v := range globalBPs {
+		result[k] = append([]int(nil), v...)
+	}
+	dbg.breakpointMutex.RLock()
+	for k, v := range dbg.breakpoints {
+		if existing, ok := result[k]; ok {
+			for _, line := range v {
+				found := false
+				for _, existingLine := range existing {
+					if existingLine == line {
+						found = true
+						break
+					}
+				}
+				if !found {
+					result[k] = append(result[k], line)
+				}
+			}
+			sort.Ints(result[k])
+		} else {
+			result[k] = append([]int(nil), v...)
+		}
+	}
+	dbg.breakpointMutex.RUnlock()
+
+	if len(result) == 0 {
 		return nil, errors.New("no breakpoints")
 	}
-	return dbg.breakpoints, nil
+	return result, nil
 }
 
 func (dbg *Debugger) Next() error {
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-NEXT] Called: was stepIn=%v, next=%v, lifecycleTransition=%v\n",
+			dbg.stepIn, dbg.next, dbg.lifecycleTransition)
+	}
 	dbg.next = true
+	dbg.stepIn = false
 	dbg.continuing = false
-	dbg.stepOverTargetDepth = dbg.callStackDepth()  // Capture the depth where we START step-over
-	dbg.lastBreakpoint.pc = dbg.vm.pc
-	dbg.lastBreakpoint.line = dbg.Line()
-	dbg.lastBreakpoint.stackDepth = dbg.callStackDepth()
+	dbg.lifecycleTransition = false
+	dbg.userCommandIssued = true
 
-	if dbg.currentCh != nil {
-		close(dbg.currentCh)
-		dbg.currentCh = nil
+	// Invalidate per-pause snapshot — we're resuming.
+	dbg.pausedVarSnapshot = nil
+
+	activeDbg := globalDebugCoordinator.GetActiveDebugger()
+	var steppingFilename string
+	var targetDepth int
+	var startLine int
+	var gotValidState bool
+
+	if activeDbg != nil && activeDbg.vm != nil && activeDbg.vm.prg != nil {
+		steppingFilename = activeDbg.Filename()
+		targetDepth = activeDbg.lastBreakpoint.stackDepth
+		startLine = activeDbg.Line()
+		gotValidState = startLine >= 0 && steppingFilename != ""
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-NEXT] Using active debugger state: file=%s, depth=%d, line=%d, valid=%v\n",
+				steppingFilename, targetDepth, startLine, gotValidState)
+		}
+	}
+
+	if !gotValidState && dbg.vm != nil && dbg.vm.prg != nil {
+		steppingFilename = dbg.Filename()
+		targetDepth = dbg.lastBreakpoint.stackDepth
+		startLine = dbg.Line()
+		gotValidState = startLine >= 0 && steppingFilename != ""
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-NEXT] Fallback to local debugger state: file=%s, depth=%d, line=%d, valid=%v\n",
+				steppingFilename, targetDepth, startLine, gotValidState)
+		}
+	}
+
+	if !gotValidState {
+		steppingFilename = dbg.lastBreakpoint.filename
+		targetDepth = dbg.lastBreakpoint.stackDepth
+		startLine = dbg.lastBreakpoint.line
+		gotValidState = startLine >= 0 && steppingFilename != ""
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-NEXT] Fallback to lastBreakpoint: file=%s, depth=%d, line=%d, valid=%v\n",
+				steppingFilename, targetDepth, startLine, gotValidState)
+		}
+	}
+
+	if gotValidState {
+		dbg.stepOverTargetDepth = targetDepth
+		dbg.stepOverStartLine = startLine
+		dbg.steppingFilename = steppingFilename
+	} else {
+		dbg.stepOverTargetDepth = dbg.lastBreakpoint.stackDepth
+		dbg.stepOverStartLine = 0
+		dbg.steppingFilename = ""
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-NEXT] ⚠️ No valid state, using safe defaults: targetDepth=%d, startLine=0\n",
+				dbg.stepOverTargetDepth)
+		}
+	}
+
+	if gotValidState {
+		dbg.lastBreakpoint.pc = dbg.vm.pc
+		dbg.lastBreakpoint.line = startLine
+		dbg.lastBreakpoint.filename = steppingFilename
+		dbg.lastBreakpoint.stackDepth = targetDepth
+	}
+
+	globalDebugCoordinator.SetGlobalStepState(true, false, steppingFilename, targetDepth)
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-NEXT] After SetGlobalStepState: next=%v, stepIn=%v, steppingFilename=%s, targetDepth=%d\n",
+			dbg.next, dbg.stepIn, steppingFilename, targetDepth)
+	}
+
+	if dbg.pendingCh != nil {
+		if dbg.pendingCh == dbg.currentCh {
+			safeCloseActivationCh(dbg.pendingCh)
+			dbg.pendingCh = nil
+			dbg.currentCh = nil
+		} else {
+			safeCloseActivationCh(dbg.pendingCh)
+			dbg.pendingCh = nil
+		}
 	}
 	return nil
 }
 
 func (dbg *Debugger) ClearStepFlags() {
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-CLEAR] ClearStepFlags called: was stepIn=%v, next=%v, continuing=%v\n",
+			dbg.stepIn, dbg.next, dbg.continuing)
+	}
 	dbg.lastBreakpoint.pc = dbg.vm.pc
 	dbg.lastBreakpoint.line = dbg.Line()
 	dbg.lastBreakpoint.filename = dbg.Filename()
-	dbg.lastBreakpoint.stackDepth = dbg.callStackDepth()
 	dbg.next = false
 	dbg.stepIn = false
+	dbg.stepOverStartLine = 0
 	dbg.continuing = true
+	dbg.userCommandIssued = true
+	// Invalidate per-pause snapshot — we're resuming.
+	dbg.pausedVarSnapshot = nil
+	globalDebugCoordinator.ClearGlobalStepState()
+}
+
+// ResetForPhaseTransition clears stale step/pause state from a cached Debugger
+// when reusing it for a new lifecycle phase (setup → default → teardown →
+// handleSummary) within the SAME k6 run.  Unlike ResetForNewRun it preserves
+// init-tracking state (initComplete, initFilename, initPhase) so that
+// init-breakpoint deduplication keeps working, and it preserves breakpoints,
+// connection status, and channels.
+func (dbg *Debugger) ResetForPhaseTransition() {
+	if debugActivate {
+		fmt.Printf("[DEBUGGER] ResetForPhaseTransition: clearing stale step state (stepIn=%v, next=%v, continuing=%v, lifecycleTransition=%v, userCommandIssued=%v)\n",
+			dbg.stepIn, dbg.next, dbg.continuing, dbg.lifecycleTransition, dbg.userCommandIssued)
+	}
+
+	// Step / pause state — must be zeroed so the new phase starts clean
+	dbg.next = false
+	dbg.stepIn = false
+	dbg.continuing = false
+	dbg.lifecycleTransition = false
+	dbg.userCommandIssued = false
+	dbg.skipPhaseEntryBreak = false
+	dbg.stepOverTargetDepth = 0
+	dbg.stepOverStartLine = 0
+	dbg.steppingFilename = ""
+
+	// Position tracking — reset so the first line of the new function is seen as "new"
+	// pc must be -1 (not 0) so that pcAdvanced is true at PC=0 (first instruction)
+	dbg.lastBreakpoint.filename = ""
+	dbg.lastBreakpoint.line = 0
+	dbg.lastBreakpoint.pc = -1
+	dbg.lastBreakpoint.stackDepth = 0
+	dbg.lastDebugLine = -1
+	dbg.lastLine = 0
+	dbg.currentLine = 0
+
+	// Variable / scope caches — stale from previous phase
+	// PERF: set to nil instead of make() — nil map reads return zero value safely in Go.
+	// Write paths lazy-init them when needed, avoiding 5 map allocations per phase transition.
+	dbg.pausedVarSnapshot = nil
+	dbg.pausedVarSnapshotLine = 0
+	dbg.sourceVarCache = nil
+	dbg.globalVarCache = nil
+	dbg.sourceCacheValid = false
+	dbg.varDeclLines = nil
+	dbg.varValueCache = nil
+	dbg.varValueCacheLine = -1
+	dbg.cachedGlobalNames = nil
+	dbg.globalsCaptured = false
+
+	// Call stack / return value caches
+	dbg.functionCallStack = nil
+	dbg.pendingReturnValues = nil
+	dbg.returnValueCache = nil
+	dbg.currentScopeDepth = 0
+	dbg.scopeVariables = nil
+
+	// Filename / line cache (will be rebuilt on first breakpoint() call)
+	dbg.cachedPrg = nil
+	dbg.cachedFilename = ""
+	dbg.cachedNormFile = ""
+	dbg.cachedPC = -1
+	dbg.cachedLine = 0
+
+	// VM exit state — reset for the new phase
+	dbg.vmExited = false
+	dbg.vmDoneCh = make(chan struct{})
+
+	// Drain stale entries from the activation channel
+	select {
+	case <-dbg.activationCh:
+	default:
+	}
+	dbg.pendingCh = nil
+	dbg.currentCh = nil
+
+	// NOTE: we intentionally do NOT touch:
+	//   - initPhase / initFilename / initComplete  (init dedup must survive)
+	//   - breakpoints / breakpointIDs / hasLocalBPs / hasGlobalBPs
+	//   - hasConnection
+	//   - initRuntime / setupData (may still be needed)
+}
+
+// ResetForNewRun clears all per-run step/phase state from a cached Debugger so it
+// can be reused cleanly for a new k6 run without carrying over stale flags.
+// It preserves the VM pointer, breakpoints, connection status, and channels.
+func (dbg *Debugger) ResetForNewRun() {
+	// Step / pause state
+	dbg.next = false
+	dbg.stepIn = false
+	dbg.continuing = false
+	dbg.lifecycleTransition = false
+	dbg.userCommandIssued = false
+	dbg.skipPhaseEntryBreak = false
+	dbg.stepOverTargetDepth = 0
+	dbg.stepOverStartLine = 0
+	dbg.steppingFilename = ""
+
+	// Breakpoint position cache
+	dbg.lastBreakpoint.filename = ""
+	dbg.lastBreakpoint.line = 0
+	dbg.lastBreakpoint.pc = 0
+	dbg.lastBreakpoint.stackDepth = 0
+	dbg.lastDebugLine = -1
+	dbg.lastLine = 0
+	dbg.currentLine = 0
+
+	// Init phase flags
+	dbg.initPhase = false
+	dbg.initFilename = ""
+	dbg.initComplete = false
+
+	// Variable / scope caches
+	// PERF: set to nil instead of make() — nil map reads return zero value safely in Go.
+	// Write paths lazy-init them when needed, avoiding allocations on reset.
+	dbg.pausedVarSnapshot = nil
+	dbg.pausedVarSnapshotLine = 0
+	dbg.sourceVarCache = nil
+	dbg.globalVarCache = nil
+	dbg.sourceCacheValid = false
+	dbg.varDeclLines = nil
+	dbg.varValueCache = nil
+	dbg.varValueCacheLine = -1
+	dbg.cachedGlobalNames = nil
+	dbg.globalsCaptured = false
+
+	// Call stack / return value caches
+	dbg.functionCallStack = nil
+	dbg.pendingReturnValues = nil
+	dbg.returnValueCache = nil
+	dbg.currentScopeDepth = 0
+	dbg.scopeVariables = nil
+
+	// Filename / line cache (will be rebuilt on first breakpoint() call)
+	dbg.cachedPrg = nil
+	dbg.cachedFilename = ""
+	dbg.cachedNormFile = ""
+	dbg.cachedPC = -1
+	dbg.cachedLine = 0
+
+	// VM exit state — new run means a new VM lifecycle
+	dbg.vmExited = false
+	// Don't replace vmDoneCh if it's already fresh; replace it so old
+	// goroutines waiting on it don't accidentally unblock.
+	dbg.vmDoneCh = make(chan struct{})
+
+	// Runtime / setup data from previous run
+	dbg.initRuntime = nil
+	dbg.setupData = nil
+
+	// Drain stale entries from the activation channel
+	select {
+	case <-dbg.activationCh:
+	default:
+	}
+	// pendingCh / currentCh — clear without closing (they may already be closed)
+	dbg.pendingCh = nil
+	dbg.currentCh = nil
+}
+
+func (dbg *Debugger) ClearLocalStepState() {
+	if debugActivate {
+		fmt.Printf("[DEBUGGER-CLEAR] ClearLocalStepState called: was stepIn=%v, next=%v, stepOverStartLine=%d, stepOverTargetDepth=%d\n",
+			dbg.stepIn, dbg.next, dbg.stepOverStartLine, dbg.stepOverTargetDepth)
+	}
+	dbg.next = false
+	dbg.stepIn = false
+	dbg.stepOverStartLine = 0
+	dbg.stepOverTargetDepth = 0
+	dbg.steppingFilename = ""
+	dbg.lifecycleTransition = false
+	dbg.pausedVarSnapshot = nil
+	globalDebugCoordinator.ClearGlobalStepState()
 }
 
 func (dbg *Debugger) Exec(expr string) (Value, error) {
@@ -313,15 +1983,108 @@ func stringToLines(s string) (lines []string, err error) {
 	return
 }
 
+// breakpoint is called by the VM on every instruction in debug mode.
+// PERF critical path — minimize allocations and lock acquisitions.
 func (dbg *Debugger) breakpoint() bool {
-	if dbg.vm.prg == nil {
+	if dbg.vm.prg == nil || (!dbg.hasLocalBPs && !dbg.hasGlobalBPs) {
 		return false
 	}
-	filename := dbg.Filename()
+
+	// PERF: skip all debugger work during getter evaluation (resolveIndirectValue/safeCallGetter).
+	// Without this, variable inspection can trigger breakpoints and corrupt step state.
+	if dbg.suppressDebugger {
+		return false
+	}
+
+	// PERF: update cached filename only when prg changes (typically never mid-execution).
+	dbg.refreshFilenameCache()
+	normalizedFilename := dbg.cachedNormFile
 	line := dbg.Line()
 
-	idx := sort.SearchInts(dbg.breakpoints[filename], line)
-	return idx < len(dbg.breakpoints[filename]) && dbg.breakpoints[filename][idx] == line
+	// Capture init filename lazily (same as before, but uses cached normalized form).
+	if dbg.initPhase && dbg.initFilename == "" && normalizedFilename != "" {
+		dbg.initFilename = normalizedFilename
+		if debugInit {
+			fmt.Printf("[BREAKPOINT-CHECK] Captured init filename during breakpoint check: %s\n", normalizedFilename)
+		}
+	}
+
+	// PERF: initComplete is a local monotonic copy — once true we never ask the
+	// global tracker again (eliminating 1-3 RLocks per instruction).
+	if !dbg.initComplete {
+		dbg.initComplete = globalInitTracker.HasAnyInitCompleted()
+	}
+	if dbg.initComplete {
+		// PERF: single RLock for both init-hit checks instead of two separate lock acquisitions.
+		globalInitTracker.mu.RLock()
+		hitGlobal := globalInitTracker.initBreakpointSet[line]
+		var hitFile bool
+		if !hitGlobal {
+			if fs := globalInitTracker.initBreakpointsByFile[normalizedFilename]; fs != nil {
+				hitFile = fs[line]
+			}
+		}
+		globalInitTracker.mu.RUnlock()
+		if hitGlobal || hitFile {
+			if debugInit {
+				fmt.Printf("[BREAKPOINT-CHECK] Skipping init breakpoint at line %d in '%s' - already hit during init\n", line, normalizedFilename)
+			}
+			return false
+		}
+	}
+
+	isNewLine := dbg.lastDebugLine != line
+	if isNewLine {
+		dbg.lastDebugLine = line
+	}
+
+	// PERF: check local breakpoints first (no lock needed for empty map fast path,
+	// but we still hold RLock for the actual lookup).
+	found := false
+	if dbg.hasLocalBPs {
+		dbg.breakpointMutex.RLock()
+		lines := dbg.breakpoints[normalizedFilename]
+		idx := sort.SearchInts(lines, line)
+		found = idx < len(lines) && lines[idx] == line
+		dbg.breakpointMutex.RUnlock()
+	}
+
+	// PERF: check global registry only if not found locally.
+	// HasBreakpoint now takes an already-normalized filename — no alloc inside.
+	if !found && dbg.hasGlobalBPs {
+		found = globalBreakpoints.HasBreakpoint(normalizedFilename, line)
+	}
+
+	if found && dbg.initPhase {
+		globalInitTracker.RecordInitBreakpoint(normalizedFilename, line)
+	}
+
+	if found && dbg.enableDebugLogging && isNewLine {
+		willStop := true
+		skipReason := ""
+		if dbg.next {
+			startLine := dbg.stepOverStartLine
+			// PERF: inline callStackDepth — avoid function call overhead in hot path
+			currentDepth := len(dbg.vm.callStack)
+			targetDepth := dbg.stepOverTargetDepth
+			if startLine == line {
+				willStop = false
+				skipReason = fmt.Sprintf("step-over still on start line %d", startLine)
+			} else if currentDepth > targetDepth {
+				willStop = false
+				skipReason = fmt.Sprintf("step-over at deeper depth %d > target %d", currentDepth, targetDepth)
+			}
+		} else if dbg.stepIn {
+			skipReason = "step-in active (will break at new line)"
+		}
+		if willStop {
+			fmt.Printf("[BREAKPOINT-CHECK] ✅✅ BREAKPOINT HIT at line %d in '%s' - will activate debugger\n", line, dbg.cachedFilename)
+		} else {
+			fmt.Printf("[BREAKPOINT-CHECK] ⚠️ BREAKPOINT at line %d in '%s' - WILL BE SKIPPED (%s)\n", line, dbg.cachedFilename, skipReason)
+		}
+	}
+
+	return found
 }
 
 func (dbg *Debugger) getLastLine() int {
@@ -329,6 +2092,22 @@ func (dbg *Debugger) getLastLine() int {
 		return dbg.lastLine
 	}
 	return dbg.Line()
+}
+
+func (dbg *Debugger) getSourceLine(lineNum int) string {
+	if dbg.vm.prg == nil || dbg.vm.prg.src == nil {
+		return ""
+	}
+	source := dbg.vm.prg.src.Source()
+	lines := strings.Split(source, "\n")
+	if lineNum < 1 || lineNum > len(lines) {
+		return ""
+	}
+	line := strings.TrimSpace(lines[lineNum-1])
+	if len(line) > 60 {
+		line = line[:60] + "..."
+	}
+	return line
 }
 
 func (dbg *Debugger) updateLastLine(lineNumber int) {
@@ -345,14 +2124,19 @@ func (dbg *Debugger) Line() int {
 	if dbg.vm.prg == nil || dbg.vm.prg.src == nil {
 		return -1
 	}
-	return dbg.vm.prg.src.Position(dbg.vm.prg.sourceOffset(dbg.vm.pc)).Line
+	// PERF: cache line number per-PC — src.Position(sourceOffset(pc)) is expensive
+	// and Line() is called multiple times per instruction in the hot path.
+	if dbg.vm.pc == dbg.cachedPC && dbg.cachedLine != 0 {
+		return dbg.cachedLine
+	}
+	dbg.cachedPC = dbg.vm.pc
+	dbg.cachedLine = dbg.vm.prg.src.Position(dbg.vm.prg.sourceOffset(dbg.vm.pc)).Line
+	return dbg.cachedLine
 }
 
 func (dbg *Debugger) Filename() string {
-	if dbg.vm.prg == nil || dbg.vm.prg.src == nil {
-		return ""
-	}
-	return dbg.vm.prg.src.Name()
+	dbg.refreshFilenameCache()
+	return dbg.cachedFilename
 }
 
 func (dbg *Debugger) updateCurrentLine() {
@@ -383,17 +2167,145 @@ func (dbg *Debugger) safeToRun() bool {
 }
 
 func (dbg *Debugger) StepIn() error {
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-STEPIN] Called: was stepIn=%v, next=%v, lifecycleTransition=%v\n",
+			dbg.stepIn, dbg.next, dbg.lifecycleTransition)
+	}
 	dbg.stepIn = true
+	dbg.next = false
 	dbg.continuing = false
-	dbg.lastBreakpoint.pc = dbg.vm.pc
-	dbg.lastBreakpoint.line = dbg.Line()
-	dbg.lastBreakpoint.stackDepth = dbg.callStackDepth()
+	dbg.lifecycleTransition = false
+	dbg.userCommandIssued = true
 
-	if dbg.currentCh != nil {
-		close(dbg.currentCh)
-		dbg.currentCh = nil
+	// Invalidate per-pause snapshot — we're resuming.
+	dbg.pausedVarSnapshot = nil
+
+	activeDbg := globalDebugCoordinator.GetActiveDebugger()
+	var steppingFilename string
+	var callDepth int
+	var gotValidState bool
+
+	if activeDbg != nil && activeDbg.vm != nil && activeDbg.vm.prg != nil {
+		steppingFilename = activeDbg.Filename()
+		callDepth = activeDbg.lastBreakpoint.stackDepth
+		startLine := activeDbg.Line()
+		gotValidState = startLine >= 0 && steppingFilename != ""
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-STEPIN] Using active debugger state: file=%s, depth=%d, line=%d, valid=%v\n",
+				steppingFilename, callDepth, startLine, gotValidState)
+		}
+	}
+
+	if !gotValidState && dbg.vm != nil && dbg.vm.prg != nil {
+		steppingFilename = dbg.Filename()
+		callDepth = dbg.lastBreakpoint.stackDepth
+		startLine := dbg.Line()
+		gotValidState = startLine >= 0 && steppingFilename != ""
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-STEPIN] Fallback to local debugger state: file=%s, depth=%d, line=%d, valid=%v\n",
+				steppingFilename, callDepth, startLine, gotValidState)
+		}
+	}
+
+	if !gotValidState {
+		steppingFilename = dbg.lastBreakpoint.filename
+		callDepth = dbg.lastBreakpoint.stackDepth
+		gotValidState = dbg.lastBreakpoint.line >= 0 && steppingFilename != ""
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-STEPIN] Fallback to lastBreakpoint: file=%s, depth=%d, line=%d, valid=%v\n",
+				steppingFilename, callDepth, dbg.lastBreakpoint.line, gotValidState)
+		}
+	}
+
+	if gotValidState {
+		dbg.lastBreakpoint.pc = dbg.vm.pc
+		dbg.lastBreakpoint.line = dbg.Line()
+		dbg.lastBreakpoint.filename = steppingFilename
+		dbg.lastBreakpoint.stackDepth = callDepth
+	}
+
+	if gotValidState {
+		dbg.steppingFilename = steppingFilename
+	} else {
+		dbg.steppingFilename = ""
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-STEPIN] ⚠️ No valid state, using empty steppingFilename\n")
+		}
+	}
+
+	globalDebugCoordinator.SetGlobalStepState(false, true, steppingFilename, callDepth)
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-STEPIN] After SetGlobalStepState: stepIn=%v, next=%v, steppingFilename=%s, callDepth=%d\n",
+			dbg.stepIn, dbg.next, steppingFilename, callDepth)
+	}
+
+	if dbg.pendingCh != nil {
+		if dbg.pendingCh == dbg.currentCh {
+			safeCloseActivationCh(dbg.pendingCh)
+			dbg.pendingCh = nil
+			dbg.currentCh = nil
+		} else {
+			safeCloseActivationCh(dbg.pendingCh)
+			dbg.pendingCh = nil
+		}
 	}
 	return nil
+}
+
+func (dbg *Debugger) EnableStepIn() {
+	if debugActivate {
+		fmt.Printf("[DEBUGGER] EnableStepIn: BEFORE - stepIn=%v, next=%v, lifecycleTransition=%v\n",
+			dbg.stepIn, dbg.next, dbg.lifecycleTransition)
+	}
+	dbg.stepIn = true
+	dbg.continuing = false
+	dbg.next = false
+	dbg.lifecycleTransition = true
+
+	globalDebugCoordinator.SetPendingLifecycleStepIn(true)
+	globalDebugCoordinator.SetGlobalStepState(false, true, dbg.Filename(), 0)
+
+	if debugActivate {
+		fmt.Printf("[DEBUGGER] EnableStepIn: AFTER - stepIn=%v, next=%v, lifecycleTransition=%v (step-in mode enabled for next execution)\n",
+			dbg.stepIn, dbg.next, dbg.lifecycleTransition)
+	}
+}
+
+func (dbg *Debugger) SetStepIn(v bool) {
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] SetStepIn: %v (was: %v)\n", v, dbg.stepIn)
+	}
+	dbg.stepIn = v
+}
+
+func (dbg *Debugger) SetNext(v bool) {
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] SetNext: %v (was: %v)\n", v, dbg.next)
+	}
+	dbg.next = v
+}
+
+func (dbg *Debugger) SetContinuing(v bool) {
+	dbg.continuing = v
+}
+
+func (dbg *Debugger) ResetLastBreakpoint() {
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] ResetLastBreakpoint: clearing (was: file=%s, line=%d, pc=%d)\n",
+			dbg.lastBreakpoint.filename, dbg.lastBreakpoint.line, dbg.lastBreakpoint.pc)
+	}
+	dbg.lastBreakpoint.line = 0
+	dbg.lastBreakpoint.pc = -1
+	dbg.lastBreakpoint.filename = ""
+	dbg.lastBreakpoint.stackDepth = 0
+}
+
+func (dbg *Debugger) ResetVMExited() {
+	if debugActivate {
+		fmt.Printf("[DEBUGGER] ResetVMExited: was=%v, setting to false\n", dbg.vmExited)
+	}
+	dbg.vmExited = false
+	dbg.vmDoneCh = make(chan struct{})
 }
 
 func (dbg *Debugger) List() ([]string, error) {
@@ -403,15 +2315,15 @@ func (dbg *Debugger) List() ([]string, error) {
 	return stringToLines(dbg.vm.prg.src.Source())
 }
 
-// OPTIMIZED: Cache source parsing results
+// getSourceVarInfo parses the source to find params and locals visible at the current line.
+// PERF: cache is now keyed by (functionStartLine, currentLine) so it correctly
+// invalidates when the current line changes, and correctly reuses within the same pause.
 func (dbg *Debugger) getSourceVarInfo(functionStartLine int) *sourceVarInfo {
-	// CRITICAL FIX: Disable cache because it incorrectly caches variables visible at one line
-	// and reuses that cache at later lines, missing newly declared variables
-	// The cache is keyed only by functionStartLine, but should include currentLine too
-	// For now, we disable caching to ensure correctness
-	// if info, exists := dbg.sourceVarCache[functionStartLine]; exists && dbg.sourceCacheValid {
-	// 	return info
-	// }
+	currentLine := dbg.Line()
+	key := sourceVarCacheKey{functionStartLine, currentLine}
+	if info, exists := dbg.sourceVarCache[key]; exists {
+		return info
+	}
 
 	if dbg.vm.prg == nil || dbg.vm.prg.src == nil {
 		return nil
@@ -425,13 +2337,11 @@ func (dbg *Debugger) getSourceVarInfo(functionStartLine int) *sourceVarInfo {
 
 	source := dbg.vm.prg.src.Source()
 	lines := strings.Split(source, "\n")
-	currentLine := dbg.Line()
 
 	if currentLine < 0 || currentLine > len(lines) {
 		return info
 	}
 
-	// Find function start
 	functionStart := -1
 	var functionLine string
 	braceDepth := 0
@@ -461,10 +2371,13 @@ func (dbg *Debugger) getSourceVarInfo(functionStartLine int) *sourceVarInfo {
 
 foundFunction:
 	if functionStart < 0 {
+		if dbg.sourceVarCache == nil {
+			dbg.sourceVarCache = make(map[sourceVarCacheKey]*sourceVarInfo)
+		}
+		dbg.sourceVarCache[key] = info
 		return info
 	}
 
-	// Extract parameters
 	if openParen := strings.Index(functionLine, "("); openParen >= 0 {
 		if closeParen := strings.Index(functionLine[openParen:], ")"); closeParen >= 0 {
 			paramsStr := functionLine[openParen+1 : openParen+closeParen]
@@ -488,9 +2401,6 @@ foundFunction:
 		}
 	}
 
-	// Scan for local variables
-	// CRITICAL FIX: Scan UP TO AND INCLUDING the current line to detect variables declared on the current line
-	// Convert currentLine from 1-based to 0-based for array indexing
 	endLine := currentLine - 1
 	if endLine >= len(lines) {
 		endLine = len(lines) - 1
@@ -502,20 +2412,14 @@ foundFunction:
 	for i := functionStart; i <= endLine; i++ {
 		line := lines[i]
 		trimmed := strings.TrimSpace(line)
-
 		braceDepth += strings.Count(line, "{") - strings.Count(line, "}")
 
 		if braceDepth == 1 {
 			for _, keyword := range []string{"let ", "const ", "var "} {
-				// Look for the keyword at the START of the trimmed line
 				if !strings.HasPrefix(trimmed, keyword) {
 					continue
 				}
-
-				rest := trimmed[len(keyword):]
-				rest = strings.TrimSpace(rest)
-
-				// Extract just the variable name (stop at =, ;, ,, :, or whitespace)
+				rest := strings.TrimSpace(trimmed[len(keyword):])
 				varName := ""
 				for _, ch := range rest {
 					if ch == ' ' || ch == '=' || ch == ';' || ch == ',' || ch == ':' || ch == '\t' {
@@ -524,27 +2428,25 @@ foundFunction:
 					varName += string(ch)
 				}
 				varName = strings.TrimSpace(varName)
-
-				// Only process if it's a valid identifier and doesn't already exist
 				if varName != "" && isSimpleIdentifier(varName) {
 					if _, exists := info.locals[varName]; !exists {
 						info.locals[varName] = localVarCount
 						localVarCount++
 						info.declLines[varName] = i + 1
-
 						if dbg.enableDebugLogging {
 							fmt.Printf("[PARSER] Found variable '%s' at line %d (index %d)\n", varName, i+1, localVarCount-1)
 						}
 					}
-					// Only process the first keyword match per line
 					break
 				}
 			}
 		}
 	}
 
-	dbg.sourceVarCache[functionStart] = info
-	dbg.sourceCacheValid = true
+	if dbg.sourceVarCache == nil {
+		dbg.sourceVarCache = make(map[sourceVarCacheKey]*sourceVarInfo)
+	}
+	dbg.sourceVarCache[key] = info
 	return info
 }
 
@@ -552,18 +2454,30 @@ func isSimpleIdentifier(s string) bool {
 	if len(s) == 0 {
 		return false
 	}
-
 	first := rune(s[0])
 	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_' || first == '$') {
 		return false
 	}
-
 	for _, ch := range s[1:] {
 		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$') {
 			return false
 		}
 	}
+	return true
+}
 
+func isDotPropertyChain(s string) bool {
+	if len(s) == 0 || !strings.Contains(s, ".") {
+		return false
+	}
+	for _, ch := range s {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$' || ch == '.') {
+			return false
+		}
+	}
+	if s[0] == '.' || s[len(s)-1] == '.' || strings.Contains(s, "..") {
+		return false
+	}
 	return true
 }
 
@@ -581,19 +2495,126 @@ func (dbg *Debugger) Evaluate(expr string) (Value, error) {
 		}
 	}
 
+	if isDotPropertyChain(expr) {
+		parts := strings.Split(expr, ".")
+		rootVal, err := dbg.getValue(parts[0])
+		if err == nil && rootVal != nil {
+			if _, isUnresolved := rootVal.(valueUnresolved); !isUnresolved {
+				var result Value
+				var evalErr error
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							evalErr = fmt.Errorf("property access panicked: %v", r)
+						}
+					}()
+					val := rootVal
+					for _, prop := range parts[1:] {
+						obj, ok := val.(*Object)
+						if !ok {
+							val = nil
+							return
+						}
+						propVal := obj.Get(prop)
+						if propVal == nil || propVal == _undefined {
+							val = _undefined
+							return
+						}
+						val = propVal
+					}
+					result = val
+				}()
+				if evalErr == nil && result != nil {
+					return result, nil
+				}
+				if evalErr != nil {
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] Evaluate('%s'): dot-chain root '%s' found but property access failed: %v\n", expr, parts[0], evalErr)
+					}
+					return nil, evalErr
+				}
+				return nil, fmt.Errorf("cannot access property '%s' on non-object value", expr)
+			}
+		}
+	}
+
 	return dbg.evaluateComplexExpression(expr)
+}
+
+// buildPausedVarSnapshot collects all accessible variables once per pause and caches them.
+// Subsequent evals during the same pause reuse the snapshot without re-walking the stash.
+func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
+	currentLine := dbg.Line()
+	if dbg.pausedVarSnapshot != nil && dbg.pausedVarSnapshotLine == currentLine {
+		return dbg.pausedVarSnapshot
+	}
+
+	snap := make(map[string]Value, 64)
+
+	// Walk stash chain.
+	stashLevel := 0
+	for s := dbg.vm.stash; s != nil; s = s.outer {
+		if s.names != nil {
+			for name, idx := range s.names {
+				nameStr := name.String()
+				if snap[nameStr] != nil || globalBuiltinKeys[nameStr] {
+					continue
+				}
+				actualIdx := idx & uint32(maskIndex)
+				isIndirect := (idx & maskIndirect) != 0
+				if int(actualIdx) < len(s.values) {
+					val := s.values[actualIdx]
+					if val != nil && !isNullValue(val) {
+						if isIndirect && !lifecycleFunctionKeys[nameStr] {
+							val = dbg.resolveIndirectValue(val)
+						}
+						if isSimpleIdentifier(nameStr) {
+							snap[nameStr] = val
+						}
+					}
+				}
+			}
+		}
+		if s.obj != nil {
+			for _, keyStr := range safeStringKeys(s.obj) {
+				if snap[keyStr] != nil || !isSimpleIdentifier(keyStr) || globalBuiltinKeys[keyStr] || globalUnsafeKeys[keyStr] {
+					continue
+				}
+				if v := safeGetGlobalProperty(s.obj, unistring.String(keyStr)); v != nil && !isNullValue(v) {
+					snap[keyStr] = v
+				}
+			}
+		}
+		stashLevel++
+	}
+
+	// Global object.
+	if dbg.vm.r != nil {
+		if globalObj := dbg.vm.r.globalObject; globalObj != nil {
+			for _, keyStr := range safeStringKeys(globalObj) {
+				if snap[keyStr] != nil || !isSimpleIdentifier(keyStr) || globalBuiltinKeys[keyStr] || globalUnsafeKeys[keyStr] {
+					continue
+				}
+				if v := safeGetGlobalProperty(globalObj, unistring.String(keyStr)); v != nil && !isNullValue(v) {
+					snap[keyStr] = v
+				}
+			}
+		}
+	}
+
+	dbg.pausedVarSnapshot = snap
+	dbg.pausedVarSnapshotLine = currentLine
+	return snap
 }
 
 func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 	dbg.evalMutex.Lock()
 	defer dbg.evalMutex.Unlock()
 
-	// Try using the global registry for multi-scope eval first with panic recovery
 	registry := GetGlobalRegistry()
 	if registry != nil {
 		var result Value
 		var err error
-		
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -603,120 +2624,39 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 					}
 				}
 			}()
-			
 			result, err = registry.MultiScopeEval(dbg.vm.r, expr)
 		}()
-		
 		if err == nil && result != nil {
 			return result, nil
 		}
-		
-		// If registry eval fails, fall back to single-VM eval
 		if dbg.enableDebugLogging {
 			fmt.Printf("[DEBUGGER] Registry eval failed: %v, falling back to single-VM eval\n", err)
 		}
 	}
 
-	// FALLBACK: Single-VM eval
 	if dbg.vm.sb < 0 || dbg.vm.stash == nil {
 		return nil, fmt.Errorf("cannot evaluate: invalid execution state")
 	}
 
-	// STRATEGY: Collect ALL accessible variables from stash + stack
-	varNames := make([]string, 0, 64)
-	varValues := make([]Value, 0, 64)
-	seen := make(map[string]bool)
+	// PERF: use per-pause snapshot so we walk the stash chain only once per pause,
+	// regardless of how many variables the user hovers over.
+	varSnapshot := dbg.buildPausedVarSnapshot()
 
-	// 1. Walk stash chain for variables in scope
-	stashLevel := 0
-	for s := dbg.vm.stash; s != nil; s = s.outer {
-		if s.names != nil {
-			for name, idx := range s.names {
-				nameStr := name.String()
-				if seen[nameStr] || globalBuiltinKeys[nameStr] {
-					continue
-				}
-
-				actualIdx := idx & uint32(maskIndex)
-				isIndirect := (idx & maskIndirect) != 0
-
-				var val Value
-				var found bool
-
-				if isIndirect {
-					// Indirect: stored in THIS stash's values
-					nonIndirectCount := 0
-					for _, otherIdx := range s.names {
-						otherActualIdx := otherIdx & uint32(maskIndex)
-						otherIsIndirect := (otherIdx & maskIndirect) != 0
-						if !otherIsIndirect && otherActualIdx < actualIdx {
-							nonIndirectCount++
-						}
-					}
-					adjustedIdx := int(actualIdx) - nonIndirectCount
-					if adjustedIdx >= 0 && adjustedIdx < len(s.values) {
-						val = s.values[adjustedIdx]
-						found = (val != nil && !isNullValue(val))
-					}
-				} else {
-					// Non-indirect: look in parent stash
-					for parent := s.outer; parent != nil; parent = parent.outer {
-						if parent.names != nil {
-							if parentIdx, exists := parent.names[name]; exists {
-								parentActualIdx := parentIdx & 0x00FFFFFF
-								if int(parentActualIdx) < len(parent.values) {
-									val = parent.values[parentActualIdx]
-									found = (val != nil && !isNullValue(val))
-									break
-								}
-							}
-						}
-						if !found && parent.obj != nil {
-							if v := parent.obj.self.getStr(name, nil); v != nil {
-								val = v
-								found = true
-								break
-							}
-						}
-					}
-				}
-
-				if found && isSimpleIdentifier(nameStr) {
-					seen[nameStr] = true
-					varNames = append(varNames, nameStr)
-					varValues = append(varValues, val)
-				}
-			}
-		}
-
-		// Check object properties
-		if s.obj != nil {
-			iter := s.obj.self.iterateStringKeys()
-			for {
-				item, next := iter()
-				if next == nil {
-					break
-				}
-				iter = next
-
-				keyStr := item.name.String()
-				if !seen[keyStr] && isSimpleIdentifier(keyStr) && !globalBuiltinKeys[keyStr] {
-					seen[keyStr] = true
-					if item.value != nil && !isNullValue(item.value) {
-						varNames = append(varNames, keyStr)
-						varValues = append(varValues, item.value)
-					}
-				}
-			}
-		}
-		stashLevel++
+	varNames := make([]string, 0, len(varSnapshot))
+	varValues := make([]Value, 0, len(varSnapshot))
+	for name, val := range varSnapshot {
+		varNames = append(varNames, name)
+		varValues = append(varValues, val)
 	}
 
-	// 2. Add stack-based local variables using debug symbols (more accurate than source parsing)
+	// Also add stack-based locals from debug symbols (not in stash snapshot).
 	currentPC := dbg.vm.pc
 	currentLine := dbg.Line()
-	
-	// First try to use debug symbols if available
+	seen := make(map[string]bool, len(varSnapshot))
+	for _, n := range varNames {
+		seen[n] = true
+	}
+
 	if dbg.vm.prg != nil && dbg.vm.prg.debugSymbols != nil {
 		if varLocs, exists := dbg.vm.prg.debugSymbols.scopeMap[currentPC]; exists {
 			if dbg.enableDebugLogging {
@@ -726,111 +2666,17 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 				if seen[varLoc.Name] {
 					continue
 				}
-				
-				var val Value
-				var found bool
-				
-				if varLoc.InStash {
-					// Variable is in stash - find it in stash chain
-					if dbg.vm.stash != nil {
-						stashIdx := int(varLoc.StashIdx)
-						stashLevel := 0
-						for s := dbg.vm.stash; s != nil && stashLevel <= 2; s = s.outer {
-							if s.values != nil {
-								if dbg.enableDebugLogging && stashLevel == 0 {
-									fmt.Printf("[DEBUGGER] Checking stash level %d for '%s' (stashIdx=%d, stashValuesLen=%d)\n",
-										stashLevel, varLoc.Name, stashIdx, len(s.values))
-								}
-								if stashIdx < len(s.values) {
-									val = s.values[stashIdx]
-									if val != nil && !isNullValue(val) {
-										found = true
-										if dbg.enableDebugLogging {
-											fmt.Printf("[DEBUGGER] Found stash variable '%s' at stash level %d, idx %d\n", 
-												varLoc.Name, stashLevel, stashIdx)
-										}
-										break
-									} else {
-										if dbg.enableDebugLogging && stashLevel == 0 {
-											fmt.Printf("[DEBUGGER] Stash variable '%s' at idx %d is nil/invalid (val=%v)\n",
-												varLoc.Name, stashIdx, val)
-										}
-									}
-								} else {
-									if dbg.enableDebugLogging && stashLevel == 0 {
-										fmt.Printf("[DEBUGGER] Stash idx %d out of range for '%s' (len=%d)\n",
-											stashIdx, varLoc.Name, len(s.values))
-									}
-								}
-							}
-							stashLevel++
-						}
-					} else {
-						if dbg.enableDebugLogging {
-							fmt.Printf("[DEBUGGER] No stash available for variable '%s'\n", varLoc.Name)
-						}
-					}
-				} else {
-					// Variable is on stack
-					// StackIdx from debug symbols is relative to stackOffset which accounts for args
-					// If it's negative, it's an argument, otherwise it's a local
-					var stackPos int
-					if varLoc.IsParam {
-						// Argument: StackIdx is negative, use sb + 1 + (-StackIdx - 1) = sb - StackIdx
-						stackPos = dbg.vm.sb - int(varLoc.StackIdx)
-					} else {
-						// Local variable: StackIdx is already relative to stackOffset
-						// Need to check if args are in stash or on stack
-						// If args are in stash, locals start at sb+1, otherwise at sb+args+1
-						// For now, try both possibilities
-						stackPos = dbg.vm.sb + int(varLoc.StackIdx)
-						// Also try with args offset if the first doesn't work
-						if stackPos < dbg.vm.sb || stackPos >= dbg.vm.sp {
-							// Try with args offset
-							if dbg.vm.args > 0 {
-								stackPos = dbg.vm.sb + dbg.vm.args + int(varLoc.StackIdx)
-							}
-						}
-					}
-					
-					if stackPos >= dbg.vm.sb && stackPos < dbg.vm.sp && stackPos >= 0 && stackPos < len(dbg.vm.stack) {
-						val = dbg.vm.stack[stackPos]
-						if val != nil && !isNullValue(val) && !isFunctionValue(val) {
-							found = true
-							if dbg.enableDebugLogging {
-								fmt.Printf("[DEBUGGER] Found stack variable '%s' at stack pos %d (sb=%d, sp=%d, stackIdx=%d, isParam=%v)\n", 
-									varLoc.Name, stackPos, dbg.vm.sb, dbg.vm.sp, varLoc.StackIdx, varLoc.IsParam)
-							}
-						} else {
-							if dbg.enableDebugLogging {
-								fmt.Printf("[DEBUGGER] Stack variable '%s' at pos %d is nil/invalid (val=%v)\n",
-									varLoc.Name, stackPos, val)
-							}
-						}
-					} else {
-						if dbg.enableDebugLogging {
-							fmt.Printf("[DEBUGGER] Stack variable '%s' out of range: stackPos=%d, sb=%d, sp=%d, stackLen=%d, stackIdx=%d\n",
-								varLoc.Name, stackPos, dbg.vm.sb, dbg.vm.sp, len(dbg.vm.stack), varLoc.StackIdx)
-						}
-					}
-				}
-				
-				if found {
+				val, err := dbg.getValueFromLocation(varLoc)
+				if err == nil && val != nil && !isNullValue(val) {
 					seen[varLoc.Name] = true
 					varNames = append(varNames, varLoc.Name)
 					varValues = append(varValues, val)
 				}
 			}
-		} else {
-			if dbg.enableDebugLogging {
-				fmt.Printf("[DEBUGGER] No debug symbols found at PC=%d, falling back to source parsing\n", currentPC)
-			}
 		}
 	}
-	
-	// Fallback to source parsing if debug symbols don't have the variable
+
 	if varInfo := dbg.getSourceVarInfo(currentLine); varInfo != nil {
-		// Add parameters from stack
 		for paramName, paramIdx := range varInfo.params {
 			if seen[paramName] {
 				continue
@@ -843,28 +2689,17 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 					seen[paramName] = true
 					varNames = append(varNames, paramName)
 					varValues = append(varValues, val)
-					if dbg.enableDebugLogging {
-						fmt.Printf("[DEBUGGER] Found parameter '%s' via source parsing at stack pos %d\n", paramName, stackPos)
-					}
 				}
 			}
 		}
-
-		// Add local variables from stack
 		for localName, localIdx := range varInfo.locals {
 			if seen[localName] {
 				continue
 			}
-
-			// Check if this variable has been declared yet
 			declLine := varInfo.declLines[localName]
 			if declLine > currentLine {
-				if dbg.enableDebugLogging {
-					fmt.Printf("[DEBUGGER] Skipping '%s': declared at line %d, current line %d\n", localName, declLine, currentLine)
-				}
-				continue // Not yet declared
+				continue
 			}
-
 			stackPos := dbg.vm.sb + 2 + localIdx
 			if stackPos >= dbg.vm.sb && stackPos < dbg.vm.sp && stackPos < len(dbg.vm.stack) {
 				val := dbg.vm.stack[stackPos]
@@ -872,20 +2707,6 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 					seen[localName] = true
 					varNames = append(varNames, localName)
 					varValues = append(varValues, val)
-					if dbg.enableDebugLogging {
-						fmt.Printf("[DEBUGGER] Found local '%s' via source parsing at stack pos %d (localIdx=%d)\n", 
-							localName, stackPos, localIdx)
-					}
-				} else {
-					if dbg.enableDebugLogging {
-						fmt.Printf("[DEBUGGER] Local '%s' at stack pos %d is nil or invalid (val=%v)\n", 
-							localName, stackPos, val)
-					}
-				}
-			} else {
-				if dbg.enableDebugLogging {
-					fmt.Printf("[DEBUGGER] Local '%s' stack pos %d out of range (sb=%d, sp=%d, len=%d)\n",
-						localName, stackPos, dbg.vm.sb, dbg.vm.sp, len(dbg.vm.stack))
 				}
 			}
 		}
@@ -895,28 +2716,18 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		fmt.Printf("[DEBUGGER] Evaluating '%s' with %d variables available\n", expr, len(varNames))
 	}
 
-	// 3. Inject all variables into global scope for evaluation
 	globalObj := dbg.vm.r.globalObject
 	savedVars := make(map[string]Value)
-
 	for i, name := range varNames {
 		nameUni := unistring.String(name)
-		if existingVal := globalObj.self.getStr(nameUni, nil); existingVal != nil {
+		if existingVal := safeGetGlobalProperty(globalObj, nameUni); existingVal != nil {
 			savedVars[name] = existingVal
 		}
 		globalObj.self.setOwnStr(nameUni, varValues[i], false)
 	}
 
-	// 4. Compile and evaluate expression with FRESH context (not evalVm)
-	// CRITICAL: Pass nil as evalVm because:
-	// - evalVm makes the compiler try to resolve variables from the STASH CHAIN at compile time
-	// - But in debug mode, stash state is complex and may not be stable
-	// - Instead, we've already injected all variables into the GLOBAL OBJECT
-	// - So the compiler should resolve variables from global scope, not stash
-	// IMPORTANT: Use dbg.vm.debugMode to ensure debug symbols are generated for eval
 	prog, compileErr := compile("<eval>", expr, false, true, nil, dbg.vm.debugMode, dbg.vm.r.parserOptions...)
 	if compileErr != nil {
-		// Restore global scope before returning error
 		for _, name := range varNames {
 			nameUni := unistring.String(name)
 			if savedVal, hadValue := savedVars[name]; hadValue {
@@ -928,20 +2739,15 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		return nil, fmt.Errorf("compilation error: %w", compileErr)
 	}
 
-	// Run the compiled program using the Runtime's RunProgram method
-	// This ensures proper context handling and exception management
 	var result Value
 	var evalErr error
-
 	result, evalErr = dbg.vm.r.RunProgram(prog)
 	if evalErr != nil {
-		// Check if it's an exception and unwrap it
 		if exc, ok := evalErr.(*Exception); ok {
 			evalErr = exc
 		}
 	}
 
-	// 5. Restore global scope
 	for _, name := range varNames {
 		nameUni := unistring.String(name)
 		if savedVal, hadValue := savedVars[name]; hadValue {
@@ -951,11 +2757,9 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		}
 	}
 
-
 	if evalErr != nil {
 		return nil, fmt.Errorf("evaluation error: %w", evalErr)
 	}
-
 	return result, nil
 }
 
@@ -963,18 +2767,14 @@ func (dbg *Debugger) captureReturnValue(varName string, value Value) {
 	if dbg.enableDebugLogging {
 		fmt.Printf("[DEBUGGER] Capturing return value for '%s': %v (type: %T)\n", varName, value, value)
 	}
-
 	currentLine := dbg.Line()
 	filename := dbg.Filename()
-
-	// Create cache key
 	cacheKey := fmt.Sprintf("%s:%d:__return_%s", filename, currentLine, varName)
-
-	// Store in cache
+	if dbg.varValueCache == nil {
+		dbg.varValueCache = make(map[string]Value)
+	}
 	dbg.varValueCache[cacheKey] = value
 	dbg.varValueCacheLine = currentLine
-
-	// Also cache under the variable name if we can find its declaration
 	if varInfo := dbg.getSourceVarInfo(currentLine); varInfo != nil {
 		if _, isLocal := varInfo.locals[varName]; isLocal {
 			declLine := varInfo.declLines[varName]
@@ -982,6 +2782,183 @@ func (dbg *Debugger) captureReturnValue(varName string, value Value) {
 			dbg.varValueCache[localCacheKey] = value
 		}
 	}
+}
+
+func (dbg *Debugger) debugVarLocations() []VarLocation {
+	if dbg.vm.prg == nil {
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] debugVarLocations: prg is nil\n")
+		}
+		return nil
+	}
+	if dbg.vm.prg.debugSymbols == nil {
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] debugVarLocations: debugSymbols is nil for program %s (funcName=%s)\n",
+				dbg.vm.prg.src.Name(), dbg.vm.prg.funcName)
+		}
+		return nil
+	}
+	if varLocs, exists := dbg.vm.prg.debugSymbols.scopeMap[dbg.vm.pc]; exists {
+		return varLocs
+	}
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] debugVarLocations: no symbols at PC %d for program %s (funcName=%s), scopeMap has %d entries\n",
+			dbg.vm.pc, dbg.vm.prg.src.Name(), dbg.vm.prg.funcName, len(dbg.vm.prg.debugSymbols.scopeMap))
+	}
+	return nil
+}
+
+// withSuppressedDebugger saves/restores all VM and debugger state around fn().
+// Used by resolveIndirectValue and safeCallGetter to prevent getter evaluation
+// from corrupting step state when the user expands variables in the IDE.
+// PERF: single implementation — eliminates the ~60-line duplication between
+// resolveIndirectValue and safeCallGetter, and ensures both stay in sync when
+// new fields are added to Debugger.
+func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
+	if dbg.vm == nil {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			if dbg.enableDebugLogging {
+				fmt.Printf("[DEBUGGER] withSuppressedDebugger: panicked: %v\n", r)
+			}
+			result = nil
+		}
+	}()
+
+	savedPC := dbg.vm.pc
+	savedSB := dbg.vm.sb
+	savedSP := dbg.vm.sp
+	savedArgs := dbg.vm.args
+	savedPrg := dbg.vm.prg
+	savedStash := dbg.vm.stash
+	savedResult := dbg.vm.result
+	savedCallStackLen := len(dbg.vm.callStack)
+	savedStackLen := len(dbg.vm.stack)
+
+	savedNext := dbg.next
+	savedStepIn := dbg.stepIn
+	savedContinuing := dbg.continuing
+	savedStepOverTargetDepth := dbg.stepOverTargetDepth
+	savedStepOverStartLine := dbg.stepOverStartLine
+	savedSteppingFilename := dbg.steppingFilename
+	savedActive := dbg.active
+	savedLastBreakpoint := dbg.lastBreakpoint
+	savedUserCommandIssued := dbg.userCommandIssued
+	savedLifecycleTransition := dbg.lifecycleTransition
+
+	dbg.suppressDebugger = true
+
+	defer func() {
+		dbg.suppressDebugger = false
+
+		dbg.vm.pc = savedPC
+		dbg.vm.sb = savedSB
+		dbg.vm.sp = savedSP
+		dbg.vm.args = savedArgs
+		dbg.vm.prg = savedPrg
+		dbg.vm.stash = savedStash
+		dbg.vm.result = savedResult
+		if len(dbg.vm.callStack) > savedCallStackLen {
+			dbg.vm.callStack = dbg.vm.callStack[:savedCallStackLen]
+		}
+		if len(dbg.vm.stack) > savedStackLen {
+			dbg.vm.stack = dbg.vm.stack[:savedStackLen]
+		} else if len(dbg.vm.stack) < savedStackLen {
+			for len(dbg.vm.stack) < savedStackLen {
+				dbg.vm.stack = append(dbg.vm.stack, nil)
+			}
+		}
+
+		dbg.next = savedNext
+		dbg.stepIn = savedStepIn
+		dbg.continuing = savedContinuing
+		dbg.stepOverTargetDepth = savedStepOverTargetDepth
+		dbg.stepOverStartLine = savedStepOverStartLine
+		dbg.steppingFilename = savedSteppingFilename
+		dbg.active = savedActive
+		dbg.lastBreakpoint = savedLastBreakpoint
+		dbg.userCommandIssued = savedUserCommandIssued
+		dbg.lifecycleTransition = savedLifecycleTransition
+
+		// Also reset the prg cache since we restored vm.prg.
+		dbg.cachedPrg = nil
+	}()
+
+	result = fn()
+	return result
+}
+
+func (dbg *Debugger) resolveIndirectValue(rawVal Value) Value {
+	if rawVal == nil || dbg.vm == nil || dbg.vm.r == nil {
+		return rawVal
+	}
+	resolved := dbg.withSuppressedDebugger(func() Value {
+		var f func(*vm) Value
+		if err := dbg.vm.r.ExportTo(rawVal, &f); err == nil && f != nil {
+			v := f(dbg.vm)
+			if v != nil {
+				return v
+			}
+		}
+		return rawVal
+	})
+	if resolved == nil {
+		return rawVal
+	}
+	return resolved
+}
+
+func (dbg *Debugger) safeCallGetter(getter func() Value) Value {
+	if dbg.vm == nil {
+		return nil
+	}
+	return dbg.withSuppressedDebugger(getter)
+}
+
+func (dbg *Debugger) getValueFromLocation(varLoc VarLocation) (Value, error) {
+	if varLoc.InStash {
+		if dbg.vm.stash != nil {
+			stashIdx := int(varLoc.StashIdx)
+			if dbg.vm.stash.values != nil && stashIdx < len(dbg.vm.stash.values) {
+				val := dbg.vm.stash.values[stashIdx]
+				if val != nil && !isNullValue(val) {
+					if dbg.vm.stash.names != nil {
+						for name, idx := range dbg.vm.stash.names {
+							actualIdx := idx & uint32(maskIndex)
+							if int(actualIdx) == stashIdx && (idx&maskIndirect) != 0 {
+								nameStr := name.String()
+								if lifecycleFunctionKeys[nameStr] {
+									break
+								}
+								val = dbg.resolveIndirectValue(val)
+								break
+							}
+						}
+					}
+					return val, nil
+				}
+				if dbg.vm.debugMode {
+					return _undefined, nil
+				}
+			}
+		}
+	} else {
+		stackIdx := varLoc.StackIdx
+		if stackIdx < 0 {
+			stackIdx = dbg.vm.sb + stackIdx
+		} else {
+			stackIdx = dbg.vm.sb + 1 + stackIdx
+		}
+		if stackIdx >= 0 && stackIdx < len(dbg.vm.stack) {
+			val := dbg.vm.stack[stackIdx]
+			if val != nil && !isNullValue(val) {
+				return val, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("variable not found")
 }
 
 func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
@@ -992,6 +2969,9 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 	}
 
 	if dbg.vm.sb < 0 {
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] GetLocalVariables: vm.sb=%d at PC=%d (function stash not yet pushed), returning empty locals\n", dbg.vm.sb, dbg.vm.pc)
+		}
 		return locals, nil
 	}
 
@@ -999,120 +2979,321 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 		return locals, nil
 	}
 
-	// In debug mode, variables are in stash with different scopes
-	// Stash level 0 = current function scope (locals + inherited globals)
-	// Stash level 1+ = outer scopes (module scope, global scope)
-
-	stashLevel := 0
-	stashCount := 0
-	for s := dbg.vm.stash; s != nil; s = s.outer {
-		stashCount++
-		if s.names != nil {
+	if dbg.vm.debugMode && dbg.vm.prg.debugSymbols != nil {
+		if dbg.vm.prg.funcName == "" {
 			if dbg.enableDebugLogging {
-				fmt.Printf("[DEBUGGER] GetLocalVariables: processing stash level %d with %d variables\n", 
-					stashLevel, len(s.names))
+				fmt.Printf("[DEBUGGER] GetLocalVariables: at module-level code (funcName=''), returning empty locals (globals handled by GetGlobalVariables)\n")
 			}
-			for name, idx := range s.names {
-				nameStr := name.String()
+			return locals, nil
+		}
 
-				// Ignore stash entries that cannot be valid identifiers (e.g., folder paths).
-				if !isIdentifierLike(nameStr) {
-					continue
-				}
+		varLocs := dbg.debugVarLocations()
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] GetLocalVariables: using debug symbols, found %d variables at PC %d (funcName=%s)\n",
+				len(varLocs), dbg.vm.pc, dbg.vm.prg.funcName)
+		}
 
-				// Skip if already found in inner scope
-				if _, exists := locals[nameStr]; exists {
-					continue
-				}
-
-				// Skip global builtins at outermost level
-				if s.outer == nil && globalBuiltinKeys[nameStr] {
-					continue
-				}
-
-				actualIdx := idx & uint32(maskIndex)
-				isIndirect := (idx & maskIndirect) != 0
-
-				var val Value
-				var found bool
-
-				if isIndirect {
-					// Indirect variable: stored in THIS stash's values array
-					// The actualIdx is the direct index into s.values
-					if int(actualIdx) >= 0 && int(actualIdx) < len(s.values) {
-						val = s.values[actualIdx]
-						// Skip nil values (uninitialized TDZ variables)
-						if val != nil && !isNullValue(val) {
-							found = true
-						}
-					}
-				} else {
-					// Non-indirect variable: look in PARENT stash chain
-					nameUni := unistring.String(nameStr)
-					for parent := s.outer; parent != nil; parent = parent.outer {
-						if parent.names != nil {
-							if parentRawIdx, exists := parent.names[nameUni]; exists {
-								parentActualIdx := parentRawIdx & 0x00FFFFFF
-								if int(parentActualIdx) < len(parent.values) {
-									val = parent.values[parentActualIdx]
-									if val != nil {
-										found = true
-										break
-									}
-								}
-							}
-						}
-
-						if !found && parent.obj != nil {
-							if v := parent.obj.self.getStr(nameUni, nil); v != nil {
-								val = v
-								found = true
-								break
-							}
-						}
-					}
-				}
-
-				if found {
-					// Determine if this is a function-local or global variable
-					// Function locals are in stash level 0, globals are in outer levels
-					if stashLevel == 0 {
-						// Function-local variable
-						locals["__stack_"+nameStr] = val
-					} else {
-						// Global/module-level variable
-						locals[nameStr] = val
-					}
-				}
+		for _, varLoc := range varLocs {
+			if !isIdentifierLike(varLoc.Name) {
+				continue
+			}
+			val, err := dbg.getValueFromLocation(varLoc)
+			if err == nil && val != nil && !isNullValue(val) {
+				locals[varLoc.Name] = val
 			}
 		}
 
-		// Also check the stash's object for additional properties
-		if s.obj != nil {
-			for item, next := s.obj.self.iterateStringKeys()(); next != nil; item, next = next() {
-				keyStr := item.name.String()
-				if !isIdentifierLike(keyStr) {
-					continue
-				}
-				if _, exists := locals[keyStr]; !exists {
-					keyUniStr := unistring.String(keyStr)
-					if v := s.obj.self.getStr(keyUniStr, nil); v != nil {
-						// Object properties are always global-ish
-						locals[keyStr] = v
-					}
-				}
-			}
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] GetLocalVariables: collected %d function-local variables from debug symbols\n", len(locals))
 		}
-
-		stashLevel++
+		return locals, nil
 	}
-	
+
+	if dbg.vm.stash != nil && dbg.vm.stash.names != nil {
+		for name, idx := range dbg.vm.stash.names {
+			nameStr := name.String()
+			if !isIdentifierLike(nameStr) || nameStr == "" {
+				continue
+			}
+			actualIdx := idx & uint32(maskIndex)
+			if int(actualIdx) >= 0 && int(actualIdx) < len(dbg.vm.stash.values) {
+				val := dbg.vm.stash.values[actualIdx]
+				if val != nil && !isNullValue(val) {
+					if (idx&maskIndirect) != 0 && !lifecycleFunctionKeys[nameStr] {
+						val = dbg.resolveIndirectValue(val)
+					}
+					locals[nameStr] = val
+				}
+			}
+		}
+	}
+
 	if dbg.enableDebugLogging {
-		fmt.Printf("[DEBUGGER] GetLocalVariables: processed %d stash levels, found %d variables\n", 
-			stashCount, len(locals))
+		fmt.Printf("[DEBUGGER] GetLocalVariables: collected %d variables (legacy mode)\n", len(locals))
 	}
 
 	return locals, nil
+}
+
+func (dbg *Debugger) CaptureGlobalNames() {
+	if dbg.globalsCaptured {
+		return
+	}
+	names := make(map[string]bool)
+	for s := dbg.vm.stash; s != nil; s = s.outer {
+		if s.names != nil {
+			for name := range s.names {
+				nameStr := name.String()
+				if isIdentifierLike(nameStr) && nameStr != "" {
+					if s.outer == nil && globalBuiltinKeys[nameStr] {
+						continue
+					}
+					names[nameStr] = true
+				}
+			}
+		}
+	}
+	if dbg.vm.r != nil {
+		if globalObj := dbg.vm.r.globalObject; globalObj != nil {
+			for _, keyStr := range safeStringKeys(globalObj) {
+				if isIdentifierLike(keyStr) && keyStr != "" &&
+					!globalBuiltinKeys[keyStr] && !globalUnsafeKeys[keyStr] {
+					names[keyStr] = true
+				}
+			}
+		}
+	}
+	dbg.cachedGlobalNames = names
+	dbg.globalsCaptured = true
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] CaptureGlobalNames: captured %d global names\n", len(names))
+	}
+}
+
+func (dbg *Debugger) GetGlobalVariables() map[string]Value {
+	globals := make(map[string]Value)
+	if dbg.vm == nil || dbg.vm.prg == nil {
+		return globals
+	}
+	if !dbg.globalsCaptured && !dbg.initPhase {
+		dbg.CaptureGlobalNames()
+	}
+
+	skipLevel0 := dbg.vm.prg.funcName != ""
+	stashLevel := 0
+	for s := dbg.vm.stash; s != nil; s = s.outer {
+		if (stashLevel > 0 || !skipLevel0) && s.names != nil {
+			for name, idx := range s.names {
+				nameStr := name.String()
+				if !isIdentifierLike(nameStr) || nameStr == "" {
+					continue
+				}
+				if _, exists := globals[nameStr]; exists {
+					continue
+				}
+				if s.outer == nil && globalBuiltinKeys[nameStr] {
+					continue
+				}
+				if dbg.globalsCaptured && !dbg.cachedGlobalNames[nameStr] {
+					continue
+				}
+				actualIdx := idx & uint32(maskIndex)
+				if int(actualIdx) >= 0 && int(actualIdx) < len(s.values) {
+					val := s.values[actualIdx]
+					if val != nil && !isNullValue(val) {
+						if (idx&maskIndirect) != 0 && !lifecycleFunctionKeys[nameStr] {
+							val = dbg.resolveIndirectValue(val)
+						}
+						globals[nameStr] = val
+						if dbg.enableDebugLogging {
+							fmt.Printf("[DEBUGGER] GetGlobalVariables: captured %s from stash level %d (idx=%d)\n",
+								nameStr, stashLevel, actualIdx)
+						}
+					}
+				}
+			}
+		}
+		stashLevel++
+	}
+
+	if dbg.vm.r != nil {
+		if globalObj := dbg.vm.r.globalObject; globalObj != nil {
+			for _, keyStr := range safeStringKeys(globalObj) {
+				if !isIdentifierLike(keyStr) || keyStr == "" {
+					continue
+				}
+				if _, exists := globals[keyStr]; exists {
+					continue
+				}
+				if globalBuiltinKeys[keyStr] || globalUnsafeKeys[keyStr] {
+					continue
+				}
+				if dbg.globalsCaptured && !dbg.cachedGlobalNames[keyStr] {
+					continue
+				}
+				keyUniStr := unistring.String(keyStr)
+				if v := safeGetGlobalProperty(globalObj, keyUniStr); v != nil && !isNullValue(v) {
+					globals[keyStr] = v
+				}
+			}
+		}
+	}
+
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] GetGlobalVariables: collected %d global variables\n", len(globals))
+	}
+	return globals
+}
+
+func (dbg *Debugger) GetAllStashVariablesQuiet() map[string]Value {
+	savedLogging := dbg.enableDebugLogging
+	dbg.enableDebugLogging = false
+	defer func() { dbg.enableDebugLogging = savedLogging }()
+	return dbg.GetAllStashVariables()
+}
+
+func (dbg *Debugger) GetAllStashVariables() map[string]Value {
+	vars := make(map[string]Value)
+	if dbg.vm == nil {
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] GetAllStashVariables: vm is nil\n")
+		}
+		return vars
+	}
+
+	stashLevel := 0
+	for s := dbg.vm.stash; s != nil; s = s.outer {
+		dbg.extractStashVars(s, vars, stashLevel, "vm.stash")
+		stashLevel++
+	}
+
+	if dbg.vm.r != nil {
+		globalStashPtr := &dbg.vm.r.global.stash
+		if globalStashPtr != nil {
+			dbg.extractStashVars(globalStashPtr, vars, stashLevel, "global.stash")
+			stashLevel++
+		}
+	}
+
+	if dbg.vm.r != nil && dbg.vm.r.modules != nil {
+		moduleCount := 0
+		for _, mi := range dbg.vm.r.modules {
+			if stmi, ok := mi.(*SourceTextModuleInstance); ok && stmi.exportGetters != nil {
+				for name, getter := range stmi.exportGetters {
+					if _, exists := vars[name]; exists {
+						continue
+					}
+					if !isIdentifierLike(name) || globalBuiltinKeys[name] {
+						continue
+					}
+					if lifecycleFunctionKeys[name] {
+						continue
+					}
+					val := dbg.safeCallGetter(getter)
+					if val != nil && !isNullValue(val) {
+						vars[name] = val
+						if dbg.enableDebugLogging {
+							fmt.Printf("[DEBUGGER] GetAllStashVariables: captured %s from module (getter)\n", name)
+						}
+					}
+				}
+				moduleCount++
+			}
+		}
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] GetAllStashVariables: checked %d module instances\n", moduleCount)
+		}
+	}
+
+	if dbg.vm.r != nil {
+		if globalObj := dbg.vm.r.globalObject; globalObj != nil {
+			for _, keyStr := range safeStringKeys(globalObj) {
+				if !isIdentifierLike(keyStr) || keyStr == "" {
+					continue
+				}
+				if _, exists := vars[keyStr]; exists {
+					continue
+				}
+				if globalBuiltinKeys[keyStr] || globalUnsafeKeys[keyStr] {
+					continue
+				}
+				keyUniStr := unistring.String(keyStr)
+				if v := safeGetGlobalProperty(globalObj, keyUniStr); v != nil && !isNullValue(v) {
+					vars[keyStr] = v
+				}
+			}
+		}
+	}
+
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] GetAllStashVariables: found %d variables across %d stash sources\n",
+			len(vars), stashLevel)
+	}
+	return vars
+}
+
+func (dbg *Debugger) extractStashVars(s *stash, vars map[string]Value, level int, source string) {
+	if s == nil {
+		return
+	}
+	namesCount := 0
+	if s.names != nil {
+		namesCount = len(s.names)
+	}
+	valuesCount := 0
+	if s.values != nil {
+		valuesCount = len(s.values)
+	}
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] GetAllStashVariables: %s level %d - names=%d, values=%d, hasObj=%v\n",
+			source, level, namesCount, valuesCount, s.obj != nil)
+	}
+
+	if s.names != nil {
+		for name, idx := range s.names {
+			nameStr := name.String()
+			if !isIdentifierLike(nameStr) {
+				continue
+			}
+			if _, exists := vars[nameStr]; exists {
+				continue
+			}
+			if globalBuiltinKeys[nameStr] {
+				continue
+			}
+			actualIdx := idx & uint32(maskIndex)
+			if int(actualIdx) >= 0 && int(actualIdx) < len(s.values) {
+				val := s.values[actualIdx]
+				if val != nil && !isNullValue(val) {
+					if (idx&maskIndirect) != 0 && !lifecycleFunctionKeys[nameStr] {
+						val = dbg.resolveIndirectValue(val)
+					}
+					vars[nameStr] = val
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] GetAllStashVariables: captured %s from %s (idx=%d)\n",
+							nameStr, source, actualIdx)
+					}
+				}
+			}
+		}
+	}
+
+	if s.obj != nil {
+		for _, keyStr := range safeStringKeys(s.obj) {
+			if !isIdentifierLike(keyStr) {
+				continue
+			}
+			if globalBuiltinKeys[keyStr] || globalUnsafeKeys[keyStr] {
+				continue
+			}
+			if _, exists := vars[keyStr]; !exists {
+				keyUniStr := unistring.String(keyStr)
+				if v := safeGetGlobalProperty(s.obj, keyUniStr); v != nil {
+					vars[keyStr] = v
+				}
+			}
+		}
+	}
 }
 
 func (dbg *Debugger) getValue(varName string) (val Value, err error) {
@@ -1122,15 +3303,14 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 		}
 	}()
 
-	if dbg.vm.sb < 0 {
+	isLifecycleEntry := dbg.vm.sb < 0 && dbg.vm.pc == 0
+	if dbg.vm.sb < 0 && !isLifecycleEntry {
 		return nil, fmt.Errorf("cannot access variables during context transition (vm.sb=%d)", dbg.vm.sb)
 	}
-
-	if dbg.vm.stash == nil {
+	if dbg.vm.stash == nil && !isLifecycleEntry {
 		return nil, fmt.Errorf("variable '%s' not accessible (no execution context)", varName)
 	}
 
-	// First, try to find in current function's return value cache
 	if retVal, found := dbg.returnValueCache[varName]; found {
 		if dbg.enableDebugLogging {
 			fmt.Printf("[DEBUGGER] getValue('%s'): Found in return value cache\n", varName)
@@ -1138,7 +3318,6 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 		return retVal, nil
 	}
 
-	// Then, try to find in scope variables
 	if scopeVars, hasScope := dbg.scopeVariables[dbg.currentScopeDepth]; hasScope {
 		if val, found := scopeVars[varName]; found {
 			if dbg.enableDebugLogging {
@@ -1148,62 +3327,32 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 		}
 	}
 
-	// STRATEGY: Use debug symbols first (most accurate), then stash, then stack analysis
 	name := unistring.String(varName)
-	
-	// 0. First try debug symbols - they have the exact location
+
 	if dbg.vm.prg != nil && dbg.vm.prg.debugSymbols != nil {
 		if varLocs, exists := dbg.vm.prg.debugSymbols.scopeMap[dbg.vm.pc]; exists {
 			for _, varLoc := range varLocs {
 				if varLoc.Name == varName {
-					var val Value
-					//var found bool
-					
 					if varLoc.InStash {
-						// Variable is in stash - find it in stash chain
 						if dbg.vm.stash != nil {
 							stashIdx := int(varLoc.StashIdx)
-							stashLevel := 0
-							for s := dbg.vm.stash; s != nil && stashLevel <= 2; s = s.outer {
-								if s.values != nil {
-									if stashIdx < len(s.values) {
-										val = s.values[stashIdx]
-										if val != nil && !isNullValue(val) {
-											if dbg.enableDebugLogging {
-												fmt.Printf("[DEBUGGER] getValue('%s'): Found in stash level %d, idx %d (from debug symbols)\n", 
-													varName, stashLevel, stashIdx)
-											}
-											return val, nil
-										} else {
-											if dbg.enableDebugLogging && stashLevel == 0 {
-												fmt.Printf("[DEBUGGER] getValue('%s'): Stash idx %d is nil/invalid (val=%v)\n",
-													varName, stashIdx, val)
-											}
-										}
-									} else {
-										if dbg.enableDebugLogging && stashLevel == 0 {
-											fmt.Printf("[DEBUGGER] getValue('%s'): Stash idx %d out of range (len=%d)\n",
-												varName, stashIdx, len(s.values))
-										}
+							if dbg.vm.stash.values != nil && stashIdx < len(dbg.vm.stash.values) {
+								val = dbg.vm.stash.values[stashIdx]
+								if val != nil && !isNullValue(val) {
+									if dbg.enableDebugLogging {
+										fmt.Printf("[DEBUGGER] getValue('%s'): Found in stash level 0, idx %d (from debug symbols)\n",
+											varName, stashIdx)
 									}
+									return val, nil
 								}
-								stashLevel++
-							}
-						} else {
-							if dbg.enableDebugLogging {
-								fmt.Printf("[DEBUGGER] getValue('%s'): No stash available\n", varName)
 							}
 						}
 					} else {
-						// Variable is on stack
-						// StackIdx from debug symbols: negative for args, positive for locals
 						var stackPos int
 						if varLoc.IsParam || varLoc.StackIdx < 0 {
-							// Argument: StackIdx is negative like -(i+1)
 							argNum := -int(varLoc.StackIdx) - 1
 							stackPos = dbg.vm.sb + 1 + argNum
 						} else {
-							// Local variable: try both positions (args in stash vs on stack)
 							stackPos = dbg.vm.sb + int(varLoc.StackIdx)
 							if stackPos < dbg.vm.sb || stackPos >= dbg.vm.sp {
 								if dbg.vm.args > 0 {
@@ -1211,77 +3360,44 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 								}
 							}
 						}
-						
 						if stackPos >= dbg.vm.sb && stackPos < dbg.vm.sp && stackPos >= 0 && stackPos < len(dbg.vm.stack) {
 							val = dbg.vm.stack[stackPos]
 							if val != nil && !isNullValue(val) && !isFunctionValue(val) {
 								if dbg.enableDebugLogging {
-									fmt.Printf("[DEBUGGER] getValue('%s'): Found on stack at pos %d (stackIdx=%d, isParam=%v, from debug symbols)\n", 
+									fmt.Printf("[DEBUGGER] getValue('%s'): Found on stack at pos %d (stackIdx=%d, isParam=%v, from debug symbols)\n",
 										varName, stackPos, varLoc.StackIdx, varLoc.IsParam)
 								}
 								return val, nil
-							} else {
-								if dbg.enableDebugLogging {
-									fmt.Printf("[DEBUGGER] getValue('%s'): Stack pos %d exists but val is nil/invalid (val=%v, type=%T)\n",
-										varName, stackPos, val, val)
-								}
-							}
-						} else {
-							if dbg.enableDebugLogging {
-								fmt.Printf("[DEBUGGER] getValue('%s'): Stack pos %d out of range (sb=%d, sp=%d, len=%d, stackIdx=%d, isParam=%v, args=%d)\n",
-									varName, stackPos, dbg.vm.sb, dbg.vm.sp, len(dbg.vm.stack), varLoc.StackIdx, varLoc.IsParam, dbg.vm.args)
 							}
 						}
 					}
 				}
 			}
-		} else {
-			if dbg.enableDebugLogging {
-				fmt.Printf("[DEBUGGER] getValue('%s'): No debug symbols at PC=%d\n", varName, dbg.vm.pc)
-			}
-		}
-	} else {
-		if dbg.enableDebugLogging {
-			if dbg.vm.prg == nil {
-				fmt.Printf("[DEBUGGER] getValue('%s'): No program available\n", varName)
-			} else if dbg.vm.prg.debugSymbols == nil {
-				fmt.Printf("[DEBUGGER] getValue('%s'): WARNING - No debug symbols available! (debugMode=%v)\n", 
-					varName, dbg.vm.debugMode)
-			}
 		}
 	}
 
-	// 1. Check stash chain - this is the most reliable source
 	stashLevel := 0
 	for s := dbg.vm.stash; s != nil; s = s.outer {
-		// Check names map
 		if s.names != nil {
 			if idx, exists := s.names[name]; exists {
 				actualIdx := idx & uint32(maskIndex)
 				isIndirect := (idx & maskIndirect) != 0
 
 				if isIndirect {
-					// Indirect variable: stored in THIS stash's values array
-					// The actualIdx is the direct index into s.values for indirect variables
 					if int(actualIdx) >= 0 && int(actualIdx) < len(s.values) {
 						val := s.values[actualIdx]
-						// Skip nil values (uninitialized TDZ variables)
 						if val != nil && !isNullValue(val) {
-							if dbg.enableDebugLogging {
-								fmt.Printf("[DEBUGGER] getValue('%s'): Found indirect in stash level %d, idx=%d\n", varName, stashLevel, actualIdx)
+							if lifecycleFunctionKeys[varName] {
+								return val, nil
 							}
-							return val, nil
-						} else if dbg.enableDebugLogging {
-							fmt.Printf("[DEBUGGER] getValue('%s'): Indirect variable at idx %d is nil/uninitialized (TDZ)\n", varName, actualIdx)
-						}
-					} else {
-						if dbg.enableDebugLogging {
-							fmt.Printf("[DEBUGGER] getValue('%s'): Indirect idx %d out of range (len=%d) at stash level %d\n", 
-								varName, actualIdx, len(s.values), stashLevel)
+							resolved := dbg.resolveIndirectValue(val)
+							if dbg.enableDebugLogging {
+								fmt.Printf("[DEBUGGER] getValue('%s'): Found indirect in stash level %d, idx %d (resolved)\n", varName, stashLevel, actualIdx)
+							}
+							return resolved, nil
 						}
 					}
 				} else {
-					// Non-indirect variable: look in parent stash chain
 					for parent := s.outer; parent != nil; parent = parent.outer {
 						if parent.names != nil {
 							if parentRawIdx, exists := parent.names[name]; exists {
@@ -1297,13 +3413,14 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 								}
 							}
 						}
-
 						if parent.obj != nil {
-							if v := parent.obj.self.getStr(name, nil); v != nil {
-								if dbg.enableDebugLogging {
-									fmt.Printf("[DEBUGGER] getValue('%s'): Found in parent object\n", varName)
+							if !globalUnsafeKeys[varName] {
+								if v := safeGetGlobalProperty(parent.obj, name); v != nil {
+									if dbg.enableDebugLogging {
+										fmt.Printf("[DEBUGGER] getValue('%s'): Found in parent object\n", varName)
+									}
+									return v, nil
 								}
-								return v, nil
 							}
 						}
 					}
@@ -1311,39 +3428,81 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 			}
 		}
 
-		// Check object properties
 		if s.obj != nil {
-			if v := s.obj.self.getStr(name, nil); v != nil {
-				if dbg.enableDebugLogging {
-					fmt.Printf("[DEBUGGER] getValue('%s'): Found in object properties\n", varName)
+			if !globalUnsafeKeys[varName] {
+				if v := safeGetGlobalProperty(s.obj, name); v != nil {
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] getValue('%s'): Found in object properties\n", varName)
+					}
+					return v, nil
 				}
-				return v, nil
 			}
 		}
-
 		stashLevel++
 	}
 
-	// 2. Check global builtins
-	if globalBuiltinKeys[varName] {
+	if dbg.vm.r != nil {
+		globalStash := &dbg.vm.r.global.stash
+		if globalStash != nil && globalStash.names != nil {
+			if idx, exists := globalStash.names[name]; exists {
+				actualIdx := idx & uint32(maskIndex)
+				if int(actualIdx) >= 0 && int(actualIdx) < len(globalStash.values) {
+					val := globalStash.values[actualIdx]
+					if val != nil && !isNullValue(val) {
+						if dbg.enableDebugLogging {
+							fmt.Printf("[DEBUGGER] getValue('%s'): Found in global stash, idx=%d\n", varName, actualIdx)
+						}
+						return val, nil
+					}
+				}
+			}
+		}
+	}
+
+	if dbg.vm.r != nil && dbg.vm.r.modules != nil {
+		for _, mi := range dbg.vm.r.modules {
+			if stmi, ok := mi.(*SourceTextModuleInstance); ok && stmi.exportGetters != nil {
+				if getter, exists := stmi.exportGetters[varName]; exists {
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								if dbg.enableDebugLogging {
+									fmt.Printf("[DEBUGGER] getValue('%s'): module export getter panicked: %v\n", varName, r)
+								}
+							}
+						}()
+						v := getter()
+						if v != nil && !isNullValue(v) {
+							if dbg.enableDebugLogging {
+								fmt.Printf("[DEBUGGER] getValue('%s'): Found via module export getter\n", varName)
+							}
+							val = v
+						}
+					}()
+					if val != nil {
+						return val, nil
+					}
+				}
+			}
+		}
+	}
+
+	if dbg.vm.r != nil && !globalUnsafeKeys[varName] {
 		if globalObj := dbg.vm.r.globalObject; globalObj != nil {
-			if v := globalObj.self.getStr(name, nil); v != nil {
+			if v := safeGetGlobalProperty(globalObj, name); v != nil {
 				if dbg.enableDebugLogging {
-					fmt.Printf("[DEBUGGER] getValue('%s'): Found in global builtins\n", varName)
+					fmt.Printf("[DEBUGGER] getValue('%s'): Found in global object\n", varName)
 				}
 				return v, nil
 			}
 		}
 	}
 
-	// 3. Try stack-based lookup using source analysis (for locals not yet in stash)
 	currentLine := dbg.Line()
 	if varInfo := dbg.getSourceVarInfo(currentLine); varInfo != nil {
-		// Check parameters first
 		if paramIdx, isParam := varInfo.params[varName]; isParam {
 			pIdx := -(paramIdx + 1)
 			stackPos := dbg.vm.sb + 1 + pIdx
-
 			if stackPos >= dbg.vm.sb && stackPos < dbg.vm.sp && stackPos < len(dbg.vm.stack) {
 				val := dbg.vm.stack[stackPos]
 				if val != nil && !isNullValue(val) && !isFunctionValue(val) {
@@ -1354,14 +3513,10 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 				}
 			}
 		}
-
-		// Check local variables
 		if localIdx, isLocal := varInfo.locals[varName]; isLocal {
-			// Verify variable has been declared
 			declLine := varInfo.declLines[varName]
 			if declLine <= currentLine {
 				stackPos := dbg.vm.sb + 2 + localIdx
-
 				if stackPos >= dbg.vm.sb && stackPos < dbg.vm.sp && stackPos < len(dbg.vm.stack) {
 					val := dbg.vm.stack[stackPos]
 					if val != nil && !isNullValue(val) && !isFunctionValue(val) {
@@ -1375,14 +3530,10 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 		}
 	}
 
-	// 4. FALLBACK: Try global registry for cross-phase variables
 	if registry := GetGlobalRegistry(); registry != nil {
-		// Try to find variable in init stash or other phases
 		if dbg.enableDebugLogging {
 			fmt.Printf("[DEBUGGER] getValue('%s'): Trying global registry for cross-phase lookup\n", varName)
 		}
-		
-		// Use a simple eval through the registry with panic recovery
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -1391,7 +3542,6 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 					}
 				}
 			}()
-			
 			result, regErr := registry.MultiScopeEval(dbg.vm.r, varName)
 			if regErr == nil && result != nil && !isNullValue(result) {
 				if dbg.enableDebugLogging {
@@ -1401,7 +3551,6 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 				err = nil
 			}
 		}()
-		
 		if err == nil && val != nil {
 			return val, nil
 		}
@@ -1410,7 +3559,6 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 	return nil, fmt.Errorf("variable '%s' not found in any scope", varName)
 }
 
-// Helper function to check if a value is null or undefined
 func isNullValue(v Value) bool {
 	if v == nil {
 		return true
@@ -1424,12 +3572,10 @@ func isNullValue(v Value) bool {
 	return false
 }
 
-// Helper function to check if a value is a function object
 func isFunctionValue(v Value) bool {
 	if v == nil {
 		return false
 	}
-	// Check if it's a function/callable object
 	if obj, ok := v.(*Object); ok {
 		_, isCallable := obj.self.assertCallable()
 		return isCallable
@@ -1437,23 +3583,52 @@ func isFunctionValue(v Value) bool {
 	return false
 }
 
-
-
 func (dbg *Debugger) GetCallStack() ([]StackFrame, error) {
-	frames := make([]StackFrame, 0, len(dbg.vm.callStack))
+	frames := make([]StackFrame, 0, len(dbg.vm.callStack)+1)
 
-	for i, frame := range dbg.vm.callStack {
+	topFrame := StackFrame{
+		Index:    0,
+		pc:       dbg.vm.pc,
+		funcName: "",
+		File:     dbg.Filename(),
+		Line:     dbg.Line(),
+	}
+	if dbg.vm.prg != nil {
+		topFrame.prg = dbg.vm.prg
+		topFrame.funcName = dbg.vm.prg.funcName
+		if topFrame.funcName == "" {
+			topFrame.funcName = "<module>"
+		}
+	}
+	frames = append(frames, topFrame)
+
+	for i := len(dbg.vm.callStack) - 1; i >= 0; i-- {
+		frame := dbg.vm.callStack[i]
 		frameInfo := StackFrame{
-			Index:    i,
+			Index:    len(frames),
 			pc:       frame.pc,
 			funcName: "unknown",
-			File:     dbg.Filename(),
-			Line:     dbg.Line(),
 		}
 
-		// Try to get function name
-		if frame.prg != nil && frame.prg.funcName != "" {
-			frameInfo.funcName = frame.prg.funcName
+		if frame.prg != nil {
+			frameInfo.prg = frame.prg
+			if frame.prg.funcName != "" {
+				frameInfo.funcName = frame.prg.funcName
+			} else {
+				frameInfo.funcName = "<anonymous>"
+			}
+			if frame.prg.src != nil {
+				pos := frame.prg.src.Position(frame.prg.sourceOffset(frame.pc))
+				frameInfo.File = frame.prg.src.Name()
+				frameInfo.Line = pos.Line
+			} else {
+				frameInfo.File = "<unknown>"
+				frameInfo.Line = 0
+			}
+		} else {
+			frameInfo.funcName = "<native>"
+			frameInfo.File = "<native>"
+			frameInfo.Line = 0
 		}
 
 		frames = append(frames, frameInfo)
@@ -1462,12 +3637,10 @@ func (dbg *Debugger) GetCallStack() ([]StackFrame, error) {
 	return frames, nil
 }
 
-// SetInitRuntime stores a reference to the init VM for cross-VM variable access
 func (dbg *Debugger) SetInitRuntime(rt *Runtime) {
 	dbg.initRuntime = rt
 }
 
-// SetSetupData stores the return value from setup() for access in VU/teardown
 func (dbg *Debugger) SetSetupData(data Value) {
 	dbg.setupData = data
 }
