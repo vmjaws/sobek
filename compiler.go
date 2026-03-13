@@ -666,29 +666,11 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 	stackIdx, stashIdx := 0, 0
 	allInStash := s.isDynamic() || s.c.debug
 
-	if s.c.debug {
-		// CRITICAL FIX: In debug mode, if all variables go in stash, args must too!
-		// This ensures function parameters are accessible when allInStash=true
-		if allInStash && s.isFunction() && !argsInStash {
-			// Check if this scope has any argument bindings
-			hasArgs := false
-			for _, b := range s.bindings {
-				if b.isArg {
-					hasArgs = true
-					break
-				}
-			}
-			if hasArgs {
-				s.moveArgsToStash()
-				argsInStash = true
-			}
-		}
-
 		if debugCompiler {
 			fmt.Printf("[COMPILER-DEBUG] finaliseVarAlloc: allInStash=%v (isDynamic=%v, debug=%v), argsInStash=%v\n",
 				allInStash, s.isDynamic(), s.c.debug, argsInStash)
 		}
-	}
+
 
 	var derivedCtor bool
 	if fs := s.nearestThis(); fs != nil && fs.funcType == funcDerivedCtor {
@@ -1050,12 +1032,11 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 			}
 		}
 
-		// CRITICAL: Increment counters for ALL bindings (including 'this') using the SAME logic as main loop
+		// Mirror finaliseVarAlloc counter increments exactly — including 'this'
 		if bindingInStash {
 			stashIdx++
-		} else if !isThisBinding {
-			// Only increment stackIdx for non-'this' stack bindings
-			if !b.isArg {
+		} else {
+			if !isThisBinding && !b.isArg {
 				stackIdx++
 			}
 		}
@@ -1333,14 +1314,31 @@ func (s *scope) makeNamesMap() map[unistring.String]uint32 {
 	}
 	names := make(map[unistring.String]uint32, l)
 
-	for i, b := range s.bindings {
-		if s.c.debug {
-			// Skip 'this' binding in the names map as it's handled specially
-			if b.name == thisBindingName {
-				continue
+	allInStash := s.isDynamic() || s.c.debug
+	stashIdx := uint32(0)
+	stackIdx := uint32(0)
+
+	for _, b := range s.bindings {
+		// Skip 'this' — it's handled by loadThisStash/loadThisStack, not by name lookup.
+		// But we MUST still advance the counter so subsequent bindings get the right index.
+		if b.name == thisBindingName {
+			if allInStash || b.inStash {
+				stashIdx++
+			} else {
+				stackIdx++
 			}
+			continue
 		}
-		idx := uint32(i)
+
+		var idx uint32
+		if allInStash || b.inStash {
+			idx = stashIdx
+			stashIdx++
+		} else {
+			idx = stackIdx
+			stackIdx++
+		}
+
 		if b.isConst {
 			idx |= maskConst
 			if b.isStrict {
@@ -1355,10 +1353,9 @@ func (s *scope) makeNamesMap() map[unistring.String]uint32 {
 		}
 		names[b.name] = idx
 	}
-	if s.c.debug {
-		if len(names) == 0 {
-			return nil
-		}
+
+	if len(names) == 0 {
+		return nil
 	}
 	return names
 }
