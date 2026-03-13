@@ -1520,36 +1520,12 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				}
 			}
 		}
-		if e.c.debug {
-			// CAPTURE varScope info BEFORE popping
-			varScopeNames := varScope.makeNamesMap()
-			varScopeDynamic := varScope.dynamic
-			varScopeStashSize := 0
-			varScopeStackSize := 0
-			for _, b := range varScope.bindings {
-				if b.inStash {
-					varScopeStashSize++
-				} else {
-					varScopeStackSize++
-				}
-			}
-
-			e.c.popScope() // Now pop varScope
-
-			// Now create enterFuncBody with captured varScope info
-			if enterFunc2Mark != -1 {
-				ef2 := &enterFuncBody{
-					enterBlock: enterBlock{
-						names:     varScopeNames,
-						stashSize: uint32(varScopeStashSize),
-						stackSize: uint32(varScopeStackSize),
-					},
-					extensible: varScopeDynamic,
-					funcType:   e.typ,
-				}
-				e.c.p.code[enterFunc2Mark] = ef2
-			}
-		}
+		// NOTE: Do NOT pop varScope here.  compileStatements (below) still
+		// needs it alive so that lexical declarations (const/let inside
+		// the function body) can be looked up in boundNames.
+		// The enterFuncBody instruction is filled in later (around
+		// enterFunc2Mark) after finaliseVarAlloc, where varScope info
+		// is captured correctly for both debug and non-debug paths.
 	} else {
 		// To avoid triggering variable conflict when binding from non-strict direct eval().
 		// Parameters are supposed to be in a parent scope, hence no conflict.
@@ -2961,6 +2937,10 @@ func (e *compiledObjectLiteral) emitGetter(putOnStack bool) {
 	for _, prop := range e.expr.Value {
 		switch prop := prop.(type) {
 		case *ast.PropertyKeyed:
+			// Emit a source map entry for each property so the debugger
+			// can step through object literal properties line by line
+			// (matching Node.js / TypeScript debugger behaviour).
+			e.c.p.addSrcMap(int(prop.Idx0()) - 1)
 			key, computed := e.c.processKey(prop.Key)
 			valueExpr := e.c.compileExpression(prop.Value)
 			var ne namedEmitter
@@ -3033,6 +3013,7 @@ func (e *compiledObjectLiteral) emitGetter(putOnStack bool) {
 				}
 			}
 		case *ast.PropertyShort:
+			e.c.p.addSrcMap(int(prop.Idx0()) - 1)
 			key := prop.Name.Name
 			if prop.Initializer != nil {
 				e.c.throwSyntaxError(int(prop.Initializer.Idx0())-1, "Invalid shorthand property initializer")
@@ -3043,6 +3024,7 @@ func (e *compiledObjectLiteral) emitGetter(putOnStack bool) {
 			e.c.compileIdentifierExpression(&prop.Name).emitGetter(true)
 			e.c.emit(putProp(key))
 		case *ast.SpreadElement:
+			e.c.p.addSrcMap(int(prop.Idx0()) - 1)
 			e.c.compileExpression(prop.Expression).emitGetter(true)
 			e.c.emit(copySpread)
 		default:

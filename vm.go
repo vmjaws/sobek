@@ -732,6 +732,24 @@ func (vm *vm) debug() {
 	if vm.profTracker != nil && !vm.runWithProfiler() {
 		return
 	}
+
+	// ARROW-DEBUG: Log when debug() starts with step flags active at function entry (PC=0)
+	// This helps trace arrow function callbacks entering the debug loop
+	if vm.debugger != nil && vm.pc == 0 && (vm.debugger.next || vm.debugger.stepIn) {
+		srcName := ""
+		if vm.prg != nil && vm.prg.src != nil {
+			srcName = vm.prg.src.Name()
+		}
+		funcName := ""
+		if vm.prg != nil {
+			funcName = string(vm.prg.funcName)
+		}
+		fmt.Printf("[ARROW-DEBUG] debug() entered at PC=0: func=%q, file=%s, stepIn=%v, next=%v, depth=%d, lastBP={file=%s, line=%d, pc=%d, depth=%d}, suppressDebugger=%v\n",
+			funcName, srcName, vm.debugger.stepIn, vm.debugger.next, len(vm.callStack),
+			vm.debugger.lastBreakpoint.filename, vm.debugger.lastBreakpoint.line, vm.debugger.lastBreakpoint.pc, vm.debugger.lastBreakpoint.stackDepth,
+			vm.debugger.suppressDebugger)
+	}
+
 	count := 0
 	interrupted := false
 	for {
@@ -761,6 +779,11 @@ func (vm *vm) debug() {
 			// User files are those with breakpoints set on them
 			skipBreakpoints := false
 
+			// PERF: refresh the filename cache once per instruction (O(1) when prg unchanged).
+			// All code below uses cachedFilename / cachedNormFile instead of
+			// calling Filename() + strings.HasPrefix/TrimPrefix repeatedly.
+			vm.debugger.refreshFilenameCache()
+
 			// CRITICAL: First check if init was already completed for ANY user file
 			// This check happens REGARDLESS of whether initPhase is set
 			// It prevents re-hitting init breakpoints on subsequent VUs (VU 0 for teardown/handleSummary)
@@ -774,12 +797,8 @@ func (vm *vm) debug() {
 			// (setup/default/teardown), breakpoints should work normally even if they happen
 			// to be on the same line number as something that was executed during init.
 			if vm.prg != nil && vm.prg.src != nil {
-				currentFilename := vm.debugger.Filename()
-				// Normalize filename - use strings.HasPrefix for reliable prefix checking
-				normalizedFilename := currentFilename
-				if strings.HasPrefix(normalizedFilename, "file://") {
-					normalizedFilename = strings.TrimPrefix(normalizedFilename, "file://")
-				}
+				// Use cached normalized filename (refreshed above)
+				normalizedFilename := vm.debugger.cachedNormFile
 
 				// CRITICAL: Check if ANY file's init was completed
 				// Skip ANY breakpoint that was hit during the original init - this handles both:
@@ -795,10 +814,6 @@ func (vm *vm) debug() {
 					// was hit during init (because it's a DIFFERENT execution context)
 					inStepMode := vm.debugger.stepIn || vm.debugger.next
 
-					// Also check if we're NOT in init phase (initPhase is false after init completes)
-					// If initPhase is false and we're at a lifecycle function entry, don't skip
-					notInInitPhase := !vm.debugger.initPhase
-
 					// Only apply init breakpoint skipping if we're NOT in step mode
 					// AND we're still potentially in module-level code (initPhase is true or we just started)
 					if !inStepMode {
@@ -806,15 +821,14 @@ func (vm *vm) debug() {
 						// Check if this specific line was hit during init in ANY file
 						// This is important because during module evaluation the current file may be an import
 						// but the breakpoints were recorded for the main script
-						wasHitDuringInit := GetGlobalInitTracker().WasAnyBreakpointHitDuringInit(currentLine)
-						// Also check file-specific
-						wasHitInThisFile := GetGlobalInitTracker().WasBreakpointHitDuringInit(normalizedFilename, currentLine)
-						if wasHitDuringInit || wasHitInThisFile {
+						wasHitDuringInit := GetGlobalInitTracker().WasAnyBreakpointHitDuringInit(normalizedFilename, currentLine)
+						// The wasHitInThisFile check is now redundant (composite key covers it) — remove it:
+						// wasHitInThisFile := GetGlobalInitTracker().WasBreakpointHitDuringInit(normalizedFilename, currentLine)
+						if wasHitDuringInit {
 							skipBreakpoints = true
-							// Log when skipping init breakpoints (conditional)
 							if vmDebugEnabled {
-								fmt.Printf("[VM-INIT-CHECK] ✅ Skipping init breakpoint at line %d for '%s' - already hit during init (anyFile=%v, thisFile=%v, notInInit=%v)\n",
-									currentLine, normalizedFilename, wasHitDuringInit, wasHitInThisFile, notInInitPhase)
+								fmt.Printf("[VM-INIT-CHECK] Skipping init breakpoint at line %d for '%s'\n",
+									currentLine, normalizedFilename)
 							}
 						}
 					}
@@ -823,11 +837,8 @@ func (vm *vm) debug() {
 
 			// Now handle the init phase logic for the FIRST VU
 			if !skipBreakpoints && vm.debugger.initPhase && vm.prg != nil && vm.prg.src != nil {
-				currentFilename := vm.debugger.Filename()
-				normalizedFilename := currentFilename
-				if strings.HasPrefix(normalizedFilename, "file://") {
-					normalizedFilename = strings.TrimPrefix(normalizedFilename, "file://")
-				}
+				currentFilename := vm.debugger.cachedFilename
+				normalizedFilename := vm.debugger.cachedNormFile
 
 				// Check if this file has breakpoints - if yes, it's a user file and we should process breakpoints
 				globalBPs := GetGlobalBreakpoints().GetAllBreakpoints()
@@ -931,7 +942,8 @@ func (vm *vm) debug() {
 				}
 
 				if !vm.debugger.active && (hasBreakpoint || vm.debugger.next || vm.debugger.stepIn) {
-					currentFilename := vm.debugger.Filename()
+					currentFilename := vm.debugger.cachedFilename
+					normalizedCurrentFilename := vm.debugger.cachedNormFile
 					currentLine := vm.debugger.Line()
 					currentStackDepth := vm.debugger.callStackDepth()
 					currentPC := vm.pc
@@ -952,11 +964,6 @@ func (vm *vm) debug() {
 					isUserFile := false
 					steppingFilename := vm.debugger.steppingFilename
 
-					// Normalize the current filename for comparison
-					normalizedCurrentFilename := currentFilename
-					if strings.HasPrefix(normalizedCurrentFilename, "file://") {
-						normalizedCurrentFilename = strings.TrimPrefix(normalizedCurrentFilename, "file://")
-					}
 					normalizedSteppingFilename := steppingFilename
 					if strings.HasPrefix(normalizedSteppingFilename, "file://") {
 						normalizedSteppingFilename = strings.TrimPrefix(normalizedSteppingFilename, "file://")
@@ -1043,53 +1050,72 @@ func (vm *vm) debug() {
 						}
 					}
 
-					if vm.debugger.stepIn {
-					// For step-in: break only if:
-					// 1. We've advanced past the initial PC (ensuring we executed at least one instruction)
-					// 2. We're at a DIFFERENT line (currentLine != prevLine), AND
-					// 3. VM is in a valid state (vm.sb >= 0, not transitioning contexts)
-					//    EXCEPTION: At PC=0 with prevPC=-1 (lifecycle function entry after ResetLastBreakpoint),
-					//    vm.sb is -1 because the scope-setup instruction hasn't executed yet.
-					//    We treat this as valid to avoid skipping the first line of lifecycle functions.
-					// 4. We're in a user file (not internal k6 code)
-					// Note: We DON'T check stack depth - we want to step into function calls
-					pcAdvanced := currentPC != prevPC
-					lineChanged := prevLine != currentLine
-					// LIFECYCLE FIX: At function entry (PC=0, prevPC=-1), vm.sb is -1 because
-					// the scope-setup instruction at PC=0 hasn't executed yet (debug check runs BEFORE
-					// the instruction). Treat this as valid state so the first line of setup(),
-					// default(), teardown(), handleSummary() is not skipped during step-in.
-					isLifecycleFunctionEntry := currentPC == 0 && prevPC == -1
-					vmInValidState := vm.sb >= 0 || isLifecycleFunctionEntry
-
-					// LAST-LINE FIX: Detect when the current instruction is ret/cret.
-					// When stepping and the current instruction is a function return, check
-					// if we're about to leave the function without ever breaking on this line.
-					// This handles the case where the function's last statement and the
-					// implicit return (loadUndef + ret) share the same source line, so
-					// lineChanged is never true for the return bytecodes.
-					//
-					// The fix in compiler_stmt.go (addSrcMap for return keyword) handles
-					// EXPLICIT return statements. This check handles the IMPLICIT return
-					// case where no return statement exists in the source.
-					isRetInstruction := false
-					if !lineChanged && pcAdvanced && vmInValidState && isUserFile && currentPC >= 0 && currentPC < len(vm.prg.code) {
-						switch vm.prg.code[currentPC].(type) {
-						case _ret, cret:
-							isRetInstruction = true
+					// Fuzzy match for .ts -> .js transpilation
+					if !isUserFile && normalizedSteppingFilename != "" {
+						if normalizeFilenameForMatch(normalizedCurrentFilename) == normalizeFilenameForMatch(normalizedSteppingFilename) {
+							isUserFile = true
 						}
 					}
-					// For implicit returns: if we're about to execute ret and we've never
-					// broken on this line (prevLine == currentLine because the last statement
-					// and ret share a source line), check if the NEXT instruction after ret
-					// would be at a different depth. This means we're leaving the function.
-					// In this case, we should have already broken on this line (when we first
-					// arrived from a different line). So don't force a double-break.
-					// The source map fix in compiler_stmt.go is the primary fix.
-					_ = isRetInstruction
 
-					shouldBreak = pcAdvanced && lineChanged && vmInValidState && isUserFile
-					breakReason = "stepIn"
+					// Also check globalBPs with fuzzy match (both .ts and .js variants)
+					if !isUserFile {
+						globalBPs := GetGlobalBreakpoints().GetAllBreakpoints()
+						baseCurrentFile := normalizeFilenameForMatch(normalizedCurrentFilename)
+						for bpFile := range globalBPs {
+							if normalizeFilenameForMatch(bpFile) == baseCurrentFile {
+								isUserFile = true
+								break
+							}
+						}
+					}
+
+					if vm.debugger.stepIn {
+						// For step-in: break only if:
+						// 1. We've advanced past the initial PC (ensuring we executed at least one instruction)
+						// 2. We're at a DIFFERENT line (currentLine != prevLine), AND
+						// 3. VM is in a valid state (vm.sb >= 0, not transitioning contexts)
+						//    EXCEPTION: At PC=0 with prevPC=-1 (lifecycle function entry after ResetLastBreakpoint),
+						//    vm.sb is -1 because the scope-setup instruction hasn't executed yet.
+						//    We treat this as valid to avoid skipping the first line of lifecycle functions.
+						// 4. We're in a user file (not internal k6 code)
+						// Note: We DON'T check stack depth - we want to step into function calls
+						pcAdvanced := currentPC != prevPC
+						lineChanged := prevLine != currentLine
+						// LIFECYCLE FIX: At function entry (PC=0, prevPC=-1), vm.sb is -1 because
+						// the scope-setup instruction at PC=0 hasn't executed yet (debug check runs BEFORE
+						// the instruction). Treat this as valid state so the first line of setup(),
+						// default(), teardown(), handleSummary() is not skipped during step-in.
+						isLifecycleFunctionEntry := currentPC == 0 && prevPC == -1
+						vmInValidState := vm.sb >= 0 || isLifecycleFunctionEntry
+
+						// LAST-LINE FIX: Detect when the current instruction is ret/cret.
+						// When stepping and the current instruction is a function return, check
+						// if we're about to leave the function without ever breaking on this line.
+						// This handles the case where the function's last statement and the
+						// implicit return (loadUndef + ret) share the same source line, so
+						// lineChanged is never true for the return bytecodes.
+						//
+						// The fix in compiler_stmt.go (addSrcMap for return keyword) handles
+						// EXPLICIT return statements. This check handles the IMPLICIT return
+						// case where no return statement exists in the source.
+						isRetInstruction := false
+						if !lineChanged && pcAdvanced && vmInValidState && isUserFile && currentPC >= 0 && currentPC < len(vm.prg.code) {
+							switch vm.prg.code[currentPC].(type) {
+							case _ret, cret:
+								isRetInstruction = true
+							}
+						}
+						// For implicit returns: if we're about to execute ret and we've never
+						// broken on this line (prevLine == currentLine because the last statement
+						// and ret share a source line), check if the NEXT instruction after ret
+						// would be at a different depth. This means we're leaving the function.
+						// In this case, we should have already broken on this line (when we first
+						// arrived from a different line). So don't force a double-break.
+						// The source map fix in compiler_stmt.go is the primary fix.
+						_ = isRetInstruction
+
+						shouldBreak = pcAdvanced && lineChanged && vmInValidState && isUserFile
+						breakReason = "stepIn"
 						if isLifecycleFunctionEntry && isUserFile && debugVM {
 							fmt.Printf("[VM-LIFECYCLE-ENTRY] 🎯 Lifecycle function entry detected at line %d (PC=0, prevPC=-1, sb=%d). vmInValidState forced to %v (would be %v without fix). shouldBreak=%v\n",
 								currentLine, vm.sb, vmInValidState, vm.sb >= 0, shouldBreak)
@@ -1215,6 +1241,18 @@ func (vm *vm) debug() {
 						if vm.debugger.enableDebugLogging {
 							fmt.Printf("[VM] breakpoint check: continuing=%v, sameLocation=%v (file:%v line:%v PC:%d->%d), shouldBreak=%v, reason=%s\n",
 								vm.debugger.continuing, sameLocation, prevFilename == currentFilename, prevLine == currentLine, prevPC, currentPC, shouldBreak, breakReason)
+						}
+					}
+
+					// In the shouldBreak computation for regular breakpoints,
+					// after hasBreakpoint is set to true:
+					if hasBreakpoint && breakReason == "breakpoint" {
+						// CONDITIONAL BP CHECK — wrapped in debug-enabled guard since it calls Evaluate
+						if vm.debugger.conditionalBPs != nil {
+							if !vm.debugger.shouldFireBreakpoint(normalizedCurrentFilename, currentLine) {
+								hasBreakpoint = false // treat as no breakpoint
+								shouldBreak = false
+							}
 						}
 					}
 
@@ -1359,7 +1397,19 @@ func (vm *vm) debug() {
 	}
 }
 
-//func (vm *vm) debug() {
+// normalizeFilenameForMatch strips extension for comparison.
+// Used only in isUserFile checks, NOT for breakpoint lookup.
+func normalizeFilenameForMatch(f string) string {
+	f = normalizeFilename(f)
+	// Strip .ts/.tsx/.js/.mjs extension for fuzzy matching
+	for _, ext := range []string{".ts", ".tsx", ".js", ".mjs"} {
+		if strings.HasSuffix(f, ext) {
+			return f[:len(f)-len(ext)]
+		}
+	}
+	return f
+}
+
 //	if vm.profTracker != nil && !vm.runWithProfiler() {
 //		return
 //	}

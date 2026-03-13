@@ -430,6 +430,22 @@ func (f *baseJsFuncObject) __call(args []Value, newTarget, this Value) (Value, *
 	vm.privEnv = f.privEnv
 	vm.newTarget = newTarget
 	vm.pc = 0
+
+	// ARROW-DEBUG: Log when a JS function is called from Go while step flags are active.
+	// This traces arrow function callbacks (e.g., gherkin calling step definitions).
+	if vm.debugger != nil && (vm.debugger.next || vm.debugger.stepIn) {
+		srcName := ""
+		if f.prg != nil && f.prg.src != nil {
+			srcName = f.prg.src.Name()
+		}
+		funcName := ""
+		if f.prg != nil {
+			funcName = string(f.prg.funcName)
+		}
+		fmt.Printf("[ARROW-DEBUG] __call entering JS func from Go: func=%q, file=%s, stepIn=%v, next=%v, depth=%d, debugMode=%v, steppingFile=%s\n",
+			funcName, srcName, vm.debugger.stepIn, vm.debugger.next, len(vm.callStack), vm.debugMode, vm.debugger.steppingFilename)
+	}
+
 	for {
 		ex := vm.runTryInner()
 		if ex != nil {
@@ -438,6 +454,12 @@ func (f *baseJsFuncObject) __call(args []Value, newTarget, this Value) (Value, *
 		if vm.halted() {
 			break
 		}
+	}
+
+	// ARROW-DEBUG: Log after the JS function returns
+	if vm.debugger != nil && debugVM {
+		fmt.Printf("[ARROW-DEBUG] __call returned from JS func: stepIn=%v, next=%v, depth=%d\n",
+			vm.debugger.stepIn, vm.debugger.next, len(vm.callStack))
 	}
 	if needPop {
 		vm.popCtx()

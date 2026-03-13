@@ -666,11 +666,29 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 	stackIdx, stashIdx := 0, 0
 	allInStash := s.isDynamic() || s.c.debug
 
-		if debugCompiler {
-			fmt.Printf("[COMPILER-DEBUG] finaliseVarAlloc: allInStash=%v (isDynamic=%v, debug=%v), argsInStash=%v\n",
-				allInStash, s.isDynamic(), s.c.debug, argsInStash)
+	if s.c.debug {
+		// CRITICAL FIX: In debug mode, if all variables go in stash, args must too!
+		// This ensures function parameters are accessible when allInStash=true
+		if allInStash && s.isFunction() && !argsInStash {
+			// Check if this scope has any argument bindings
+			hasArgs := false
+			for _, b := range s.bindings {
+				if b.isArg {
+					hasArgs = true
+					break
+				}
+			}
+			if hasArgs {
+				s.moveArgsToStash()
+				argsInStash = true
+			}
 		}
+	}
 
+	if debugCompiler {
+		fmt.Printf("[COMPILER-DEBUG] finaliseVarAlloc: allInStash=%v (isDynamic=%v, debug=%v), argsInStash=%v\n",
+			allInStash, s.isDynamic(), s.c.debug, argsInStash)
+	}
 
 	var derivedCtor bool
 	if fs := s.nearestThis(); fs != nil && fs.funcType == funcDerivedCtor {

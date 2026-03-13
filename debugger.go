@@ -168,6 +168,12 @@ func (gdc *GlobalDebugCoordinator) SetGlobalConnection(connected bool) {
 	}
 }
 
+type WatchResult struct {
+	ID    int
+	Value Value
+	Err   error
+}
+
 func (gdc *GlobalDebugCoordinator) HasGlobalConnection() bool {
 	gdc.mu.RLock()
 	defer gdc.mu.RUnlock()
@@ -279,6 +285,16 @@ type VMRegistry interface {
 	RefreshInitStash()
 }
 
+// conditionalBreakpoints maps normalizedFilename:line -> condition expression
+// A breakpoint only fires if the condition evaluates to truthy.
+// An empty/missing condition means "always fire" (normal breakpoint).
+type conditionalBreakpoint struct {
+	condition  string // JS expression; empty = unconditional
+	logMessage string // if non-empty, this is a logpoint (don't pause, just log)
+	hitCount   int    // current hit count
+	hitTarget  int    // if > 0, only fire when hitCount % hitTarget == 0
+}
+
 const (
 	PhaseInit = "init"
 	PhaseVU   = "vu"
@@ -287,6 +303,7 @@ const (
 var (
 	globalVMRegistry   VMRegistry
 	globalVMRegistryMu sync.RWMutex
+	watchExprCounter   int
 )
 
 func SetGlobalRegistry(registry VMRegistry) {
@@ -321,15 +338,19 @@ var globalBreakpoints = &GlobalBreakpointRegistry{
 	nextID:        0,
 }
 
+// use composite key to avoid cross-file false positives
+type initBPKey struct {
+	file string
+	line int
+}
+
 // GlobalInitTracker tracks which files have completed their init phase.
 type GlobalInitTracker struct {
 	mu            sync.RWMutex
 	initCompleted map[string]bool
 
-	// PERF: flat set instead of map[string][]int — O(1) lookup vs O(files*lines) scan.
-	// WasAnyBreakpointHitDuringInit is called on every VM instruction; the linear
-	// scan in the original was the dominant cost in the hot path.
-	initBreakpointSet map[int]bool // all init-hit lines across all files — O(1)
+	// FIXED: composite key prevents line-number collisions across files
+	initBreakpointSet map[initBPKey]bool
 
 	// Per-file set kept for WasBreakpointHitDuringInit (file-specific check).
 	initBreakpointsByFile map[string]map[int]bool
@@ -337,7 +358,7 @@ type GlobalInitTracker struct {
 
 var globalInitTracker = &GlobalInitTracker{
 	initCompleted:         make(map[string]bool),
-	initBreakpointSet:     make(map[int]bool),
+	initBreakpointSet:     make(map[initBPKey]bool),
 	initBreakpointsByFile: make(map[string]map[int]bool),
 }
 
@@ -371,8 +392,8 @@ func (git *GlobalInitTracker) RecordInitBreakpoint(filename string, line int) {
 	defer git.mu.Unlock()
 	normalizedFilename := normalizeFilename(filename)
 
-	// PERF: O(1) set insert instead of linear duplicate check.
-	git.initBreakpointSet[line] = true
+	// FIXED: composite key — no cross-file false positives
+	git.initBreakpointSet[initBPKey{normalizedFilename, line}] = true
 
 	if git.initBreakpointsByFile[normalizedFilename] == nil {
 		git.initBreakpointsByFile[normalizedFilename] = make(map[int]bool)
@@ -398,9 +419,10 @@ func (git *GlobalInitTracker) WasBreakpointHitDuringInit(filename string, line i
 
 // WasAnyBreakpointHitDuringInit checks if this line was hit during init in ANY file.
 // PERF: O(1) map lookup — was O(files * lines) linear scan under RLock.
-func (git *GlobalInitTracker) WasAnyBreakpointHitDuringInit(line int) bool {
+// Callers must pass the normalized filename.
+func (git *GlobalInitTracker) WasAnyBreakpointHitDuringInit(normalizedFilename string, line int) bool {
 	git.mu.RLock()
-	found := git.initBreakpointSet[line]
+	found := git.initBreakpointSet[initBPKey{normalizedFilename, line}]
 	git.mu.RUnlock()
 	return found
 }
@@ -415,7 +437,7 @@ func (git *GlobalInitTracker) Reset() {
 	git.mu.Lock()
 	defer git.mu.Unlock()
 	git.initCompleted = make(map[string]bool)
-	git.initBreakpointSet = make(map[int]bool)
+	git.initBreakpointSet = make(map[initBPKey]bool)
 	git.initBreakpointsByFile = make(map[string]map[int]bool)
 }
 
@@ -527,9 +549,11 @@ type Debugger struct {
 	currentLine     int
 	lastLine        int
 	lastDebugLine   int
+	lastDebugDepth  int
 	breakpoints     map[string][]int // normalized filename -> sorted lines
 	breakpointMutex sync.RWMutex
 	breakpointIDs   map[bpKey]int // PERF: struct key, no string alloc on lookup
+	conditionalBPs  map[bpKey]*conditionalBreakpoint
 	breakPointCount int
 	activationCh    chan chan DebuggerActivation
 	currentCh       chan DebuggerActivation
@@ -557,6 +581,8 @@ type Debugger struct {
 
 	initPhase    bool
 	initFilename string
+
+	watchExpressions []watchExpr
 
 	// --- PERF: hot-path caches ---
 
@@ -633,6 +659,11 @@ type sourceVarInfo struct {
 	numParams int
 }
 
+type watchExpr struct {
+	id         int
+	expression string
+}
+
 func newDebugger(vm *vm) *Debugger {
 	inheritConnection := false
 	globalInitialized := globalDebugCoordinator.IsInitialized()
@@ -648,6 +679,7 @@ func newDebugger(vm *vm) *Debugger {
 		breakpointIDs:      make(map[bpKey]int),
 		lastLine:           0,
 		lastDebugLine:      -1,
+		lastDebugDepth:     -1,
 		configuredCh:       make(chan struct{}),
 		waitingForConfig:   true,
 		varDeclLines:       make(map[string]int),
@@ -1402,6 +1434,101 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 	}
 }
 
+// SetConditionalBreakpoint sets a breakpoint that only fires when condition is truthy.
+// condition="" means unconditional (same as SetBreakpoint).
+func (dbg *Debugger) SetConditionalBreakpoint(filename string, line int, condition string) (id int, err error) {
+	id, err = dbg.SetBreakpoint(filename, line)
+	if err != nil && err.Error() == "breakpoint exists" {
+		id = globalBreakpoints.GetBreakpointID(normalizeFilename(filename), line)
+		err = nil
+	}
+	if condition != "" {
+		if dbg.conditionalBPs == nil {
+			dbg.conditionalBPs = make(map[bpKey]*conditionalBreakpoint)
+		}
+		key := bpKey{normalizeFilename(filename), line}
+		dbg.conditionalBPs[key] = &conditionalBreakpoint{condition: condition}
+	}
+	return
+}
+
+// shouldFireBreakpoint checks conditional breakpoints.
+// Returns true if the breakpoint should cause a pause.
+func (dbg *Debugger) shouldFireBreakpoint(normalizedFilename string, line int) bool {
+	if dbg.conditionalBPs == nil {
+		return true
+	}
+	key := bpKey{normalizedFilename, line}
+	cond, exists := dbg.conditionalBPs[key]
+	if !exists {
+		return true // unconditional
+	}
+	cond.hitCount++
+	// Hit count condition
+	if cond.hitTarget > 0 && cond.hitCount%cond.hitTarget != 0 {
+		return false
+	}
+	// Logpoint — evaluate message, print, don't pause
+	if cond.logMessage != "" {
+		msg, evalErr := dbg.Evaluate(cond.logMessage)
+		if evalErr == nil && msg != nil {
+			fmt.Printf("[LOGPOINT] %s:%d: %s\n", normalizedFilename, line, msg.String())
+		} else {
+			fmt.Printf("[LOGPOINT] %s:%d: %s\n", normalizedFilename, line, cond.logMessage)
+		}
+		return false // logpoints never pause
+	}
+	// Expression condition
+	if cond.condition != "" {
+		result, evalErr := dbg.Evaluate(cond.condition)
+		if evalErr != nil {
+			// Condition error — fire the breakpoint so the user sees the problem
+			if debugBreakpoint {
+				fmt.Printf("[CONDITIONAL-BP] Condition error at %s:%d: %v\n", normalizedFilename, line, evalErr)
+			}
+			return true
+		}
+		fires := result != nil && result.ToBoolean()
+		if debugBreakpoint {
+			fmt.Printf("[CONDITIONAL-BP] %s:%d condition=%q result=%v fires=%v\n",
+				normalizedFilename, line, cond.condition, result, fires)
+		}
+		return fires
+	}
+	return true
+}
+
+// SetLogpoint sets a breakpoint that logs a message without pausing execution.
+// message is a JS expression that gets evaluated and printed.
+func (dbg *Debugger) SetLogpoint(filename string, line int, message string) (id int, err error) {
+	id, err = dbg.SetBreakpoint(filename, line)
+	if err != nil && err.Error() == "breakpoint exists" {
+		id = globalBreakpoints.GetBreakpointID(normalizeFilename(filename), line)
+		err = nil
+	}
+	if dbg.conditionalBPs == nil {
+		dbg.conditionalBPs = make(map[bpKey]*conditionalBreakpoint)
+	}
+	key := bpKey{normalizeFilename(filename), line}
+	dbg.conditionalBPs[key] = &conditionalBreakpoint{logMessage: message}
+	return
+}
+
+// SetHitCountBreakpoint fires only every N hits.
+func (dbg *Debugger) SetHitCountBreakpoint(filename string, line int, every int) (id int, err error) {
+	id, err = dbg.SetBreakpoint(filename, line)
+	if err != nil && err.Error() == "breakpoint exists" {
+		id = globalBreakpoints.GetBreakpointID(normalizeFilename(filename), line)
+		err = nil
+	}
+	if dbg.conditionalBPs == nil {
+		dbg.conditionalBPs = make(map[bpKey]*conditionalBreakpoint)
+	}
+	key := bpKey{normalizeFilename(filename), line}
+	dbg.conditionalBPs[key] = &conditionalBreakpoint{hitTarget: every}
+	return
+}
+
 func (dbg *Debugger) SetConfigured() {
 	if dbg.waitingForConfig {
 		dbg.waitingForConfig = false
@@ -1528,6 +1655,37 @@ func (dbg *Debugger) GetRuntime() *Runtime {
 
 func (dbg *Debugger) IsActive() bool {
 	return dbg.active
+}
+
+// AddWatch registers a watch expression. Returns its ID.
+func (dbg *Debugger) AddWatch(expression string) int {
+	watchExprCounter++
+	id := watchExprCounter
+	dbg.watchExpressions = append(dbg.watchExpressions, watchExpr{id: id, expression: expression})
+	return id
+}
+
+// RemoveWatch removes a watch expression by ID.
+func (dbg *Debugger) RemoveWatch(id int) bool {
+	for i, w := range dbg.watchExpressions {
+		if w.id == id {
+			dbg.watchExpressions = append(dbg.watchExpressions[:i], dbg.watchExpressions[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// EvaluateWatches evaluates all registered watch expressions at the current pause point.
+// Returns a map of expression -> (value, error).
+// Call this from your DAP handler when paused, to populate the "Watch" panel.
+func (dbg *Debugger) EvaluateWatches() map[string]WatchResult {
+	results := make(map[string]WatchResult, len(dbg.watchExpressions))
+	for _, w := range dbg.watchExpressions {
+		val, err := dbg.Evaluate(w.expression)
+		results[w.expression] = WatchResult{ID: w.id, Value: val, Err: err}
+	}
+	return results
 }
 
 func (dbg *Debugger) ActivationCh() chan chan DebuggerActivation {
@@ -1824,8 +1982,12 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 	dbg.lastBreakpoint.pc = -1
 	dbg.lastBreakpoint.stackDepth = 0
 	dbg.lastDebugLine = -1
+	dbg.lastDebugDepth = -1
 	dbg.lastLine = 0
 	dbg.currentLine = 0
+
+	// Conditional breakpoints — stale from previous phase
+	dbg.conditionalBPs = nil
 
 	// Variable / scope caches — stale from previous phase
 	// PERF: set to nil instead of make() — nil map reads return zero value safely in Go.
@@ -1902,6 +2064,9 @@ func (dbg *Debugger) ResetForNewRun() {
 	dbg.initPhase = false
 	dbg.initFilename = ""
 	dbg.initComplete = false
+
+	// Conditional breakpoints
+	dbg.conditionalBPs = nil
 
 	// Variable / scope caches
 	// PERF: set to nil instead of make() — nil map reads return zero value safely in Go.
@@ -2026,9 +2191,9 @@ func (dbg *Debugger) breakpoint() bool {
 		dbg.initComplete = globalInitTracker.HasAnyInitCompleted()
 	}
 	if dbg.initComplete {
-		// PERF: single RLock for both init-hit checks instead of two separate lock acquisitions.
 		globalInitTracker.mu.RLock()
-		hitGlobal := globalInitTracker.initBreakpointSet[line]
+		// FIXED: use composite key — normalizedFilename is already computed above
+		hitGlobal := globalInitTracker.initBreakpointSet[initBPKey{normalizedFilename, line}]
 		var hitFile bool
 		if !hitGlobal {
 			if fs := globalInitTracker.initBreakpointsByFile[normalizedFilename]; fs != nil {
@@ -2044,9 +2209,13 @@ func (dbg *Debugger) breakpoint() bool {
 		}
 	}
 
-	isNewLine := dbg.lastDebugLine != line
+	//  also reset when the call stack depth increased (new function entry)
+	// This detects re-entry into the same arrow function from a loop.
+	currentDepth := len(dbg.vm.callStack)
+	isNewLine := dbg.lastDebugLine != line || currentDepth != dbg.lastDebugDepth
 	if isNewLine {
 		dbg.lastDebugLine = line
+		dbg.lastDebugDepth = currentDepth
 	}
 
 	// PERF: check local breakpoints first (no lock needed for empty map fast path,
@@ -2326,6 +2495,62 @@ func (dbg *Debugger) List() ([]string, error) {
 	return stringToLines(dbg.vm.prg.src.Source())
 }
 
+// StepOut resumes execution until the current function returns,
+// then breaks at the call site in the parent frame.
+func (dbg *Debugger) StepOut() error {
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-STEPOUT] Called: depth=%d, stepIn=%v, next=%v\n",
+			dbg.callStackDepth(), dbg.stepIn, dbg.next)
+	}
+	dbg.stepIn = false
+	dbg.next = false
+	dbg.continuing = false
+	dbg.lifecycleTransition = false
+	dbg.userCommandIssued = true
+	dbg.pausedVarSnapshot = nil
+
+	// Target depth is ONE LESS than current — we want to break when we return
+	// to the caller.
+	currentDepth := dbg.callStackDepth()
+	targetDepth := currentDepth - 1
+	if targetDepth < 0 {
+		targetDepth = 0
+	}
+
+	steppingFilename := ""
+	if dbg.vm != nil && dbg.vm.prg != nil {
+		steppingFilename = dbg.Filename()
+	}
+
+	// Reuse the global step state mechanism — but use stepOut sentinel:
+	// We encode step-out as next=true with targetDepth = current-1.
+	// The vm.debug() loop's atValidDepth check handles this correctly:
+	//   atValidDepth := currentStackDepth <= stepOverTargetDepth
+	// When we return from the function, depth drops to targetDepth, and
+	// the NEXT line at that depth will trigger a break.
+	dbg.next = true // use next's depth-gated break logic
+	dbg.stepOverTargetDepth = targetDepth
+	dbg.stepOverStartLine = dbg.Line() // don't re-break on current line
+	dbg.steppingFilename = steppingFilename
+
+	globalDebugCoordinator.SetGlobalStepState(true, false, steppingFilename, targetDepth)
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-STEPOUT] targetDepth=%d, steppingFilename=%s\n", targetDepth, steppingFilename)
+	}
+
+	if dbg.pendingCh != nil {
+		if dbg.pendingCh == dbg.currentCh {
+			safeCloseActivationCh(dbg.pendingCh)
+			dbg.pendingCh = nil
+			dbg.currentCh = nil
+		} else {
+			safeCloseActivationCh(dbg.pendingCh)
+			dbg.pendingCh = nil
+		}
+	}
+	return nil
+}
+
 // getSourceVarInfo parses the source to find params and locals visible at the current line.
 // PERF: cache is now keyed by (functionStartLine, currentLine) so it correctly
 // invalidates when the current line changes, and correctly reuses within the same pause.
@@ -2370,11 +2595,21 @@ func (dbg *Debugger) getSourceVarInfo(functionStartLine int) *sourceVarInfo {
 				braceDepth--
 				if braceDepth < 0 {
 					trimmed := strings.TrimSpace(line)
-					if strings.Contains(trimmed, "function") {
+					// FIXED: detect arrow functions AND regular functions AND methods
+					isFunctionLike := strings.Contains(trimmed, "function") ||
+						strings.Contains(trimmed, "=>") ||
+						isMethodOrConstructorLine(trimmed)
+					if isFunctionLike {
 						functionStart = i
 						functionLine = trimmed
 						goto foundFunction
 					}
+					// Even if not a function-like line, treat any opening brace
+					// that closes our scan as a function boundary (handles
+					// shorthand methods in object literals: { myMethod(x) { )
+					functionStart = i
+					functionLine = trimmed
+					goto foundFunction
 				}
 			}
 		}
@@ -2389,21 +2624,36 @@ foundFunction:
 		return info
 	}
 
+	// Extract params — handles:
+	//   function foo(a, b)
+	//   (a, b) =>
+	//   foo(a, b) {        (method)
+	//   constructor(a, b)
 	if openParen := strings.Index(functionLine, "("); openParen >= 0 {
-		if closeParen := strings.Index(functionLine[openParen:], ")"); closeParen >= 0 {
-			paramsStr := functionLine[openParen+1 : openParen+closeParen]
+		// Find matching close paren (handles nested parens in default values)
+		depth := 0
+		closeParen := -1
+		for j := openParen; j < len(functionLine); j++ {
+			switch functionLine[j] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					closeParen = j
+				}
+			}
+			if closeParen >= 0 {
+				break
+			}
+		}
+		if closeParen > openParen {
+			paramsStr := functionLine[openParen+1 : closeParen]
 			if strings.TrimSpace(paramsStr) != "" {
-				params := strings.Split(paramsStr, ",")
+				params := splitParams(paramsStr)
 				for _, param := range params {
-					paramName := strings.TrimSpace(param)
-					if colonIdx := strings.Index(paramName, ":"); colonIdx >= 0 {
-						paramName = strings.TrimSpace(paramName[:colonIdx])
-					}
-					if eqIdx := strings.Index(paramName, "="); eqIdx >= 0 {
-						paramName = strings.TrimSpace(paramName[:eqIdx])
-					}
-					if paramName != "" && isSimpleIdentifier(paramName) &&
-						!strings.Contains(paramName, "{") && !strings.Contains(paramName, "[") {
+					paramName := extractParamName(param)
+					if paramName != "" && isSimpleIdentifier(paramName) {
 						info.params[paramName] = -(len(info.params) + 1)
 						info.numParams++
 					}
@@ -2444,9 +2694,6 @@ foundFunction:
 						info.locals[varName] = localVarCount
 						localVarCount++
 						info.declLines[varName] = i + 1
-						if dbg.enableDebugLogging {
-							fmt.Printf("[PARSER] Found variable '%s' at line %d (index %d)\n", varName, i+1, localVarCount-1)
-						}
 					}
 					break
 				}
@@ -2459,6 +2706,78 @@ foundFunction:
 	}
 	dbg.sourceVarCache[key] = info
 	return info
+}
+
+// isMethodOrConstructorLine detects shorthand object/class methods:
+//
+//	myMethod(x, y) {
+//	constructor(x) {
+//	async fetchData(url) {
+func isMethodOrConstructorLine(trimmed string) bool {
+	// Must end with { or have { before a comment
+	hasBrace := strings.Contains(trimmed, "{")
+	if !hasBrace {
+		return false
+	}
+	// Strip async/static/get/set prefixes
+	s := trimmed
+	for _, prefix := range []string{"async ", "static ", "get ", "set ", "public ", "private ", "protected "} {
+		s = strings.TrimPrefix(s, prefix)
+	}
+	// Must have identifier followed by (
+	parenIdx := strings.Index(s, "(")
+	if parenIdx <= 0 {
+		return false
+	}
+	name := strings.TrimSpace(s[:parenIdx])
+	return isSimpleIdentifier(name) || name == "constructor"
+}
+
+// splitParams splits a parameter string by top-level commas
+// (respecting nested parens/brackets for destructuring and defaults).
+func splitParams(s string) []string {
+	var params []string
+	depth := 0
+	start := 0
+	for i, ch := range s {
+		switch ch {
+		case '(', '[', '{', '<':
+			depth++
+		case ')', ']', '}', '>':
+			depth--
+		case ',':
+			if depth == 0 {
+				params = append(params, strings.TrimSpace(s[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if rest := strings.TrimSpace(s[start:]); rest != "" {
+		params = append(params, rest)
+	}
+	return params
+}
+
+// extractParamName gets the binding identifier from a param pattern.
+// Handles: plain `x`, typed `x: string`, defaulted `x = 5`,
+// rest `...x`, destructured `{ x }` (skipped — can't be a simple identifier).
+func extractParamName(param string) string {
+	param = strings.TrimSpace(param)
+	// Skip destructured params
+	if strings.HasPrefix(param, "{") || strings.HasPrefix(param, "[") {
+		return ""
+	}
+	// Strip rest prefix
+	param = strings.TrimPrefix(param, "...")
+	// Strip type annotation
+	if colonIdx := strings.Index(param, ":"); colonIdx >= 0 {
+		param = strings.TrimSpace(param[:colonIdx])
+	}
+	// Strip default value
+	if eqIdx := strings.Index(param, "="); eqIdx >= 0 {
+		param = strings.TrimSpace(param[:eqIdx])
+	}
+	return strings.TrimSpace(param)
 }
 
 func isSimpleIdentifier(s string) bool {
