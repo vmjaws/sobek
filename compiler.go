@@ -371,9 +371,12 @@ type block struct {
 
 func (c *compiler) leaveScopeBlock(enter *enterBlock) {
 	c.updateEnterBlock(enter)
+	if c.debug && enter.stashSize == 0 && len(enter.names) == 0 {
+		enter.needStash = true
+	}
 	leave := &leaveBlock{
 		stackSize: enter.stackSize,
-		popStash:  enter.stashSize > 0,
+		popStash:  enter.stashSize > 0 || enter.needStash,
 	}
 	c.emit(leave)
 	for _, pc := range c.block.breaks {

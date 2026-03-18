@@ -735,7 +735,7 @@ func (vm *vm) debug() {
 
 	// ARROW-DEBUG: Log when debug() starts with step flags active at function entry (PC=0)
 	// This helps trace arrow function callbacks entering the debug loop
-	if vm.debugger != nil && vm.pc == 0 && (vm.debugger.next || vm.debugger.stepIn) {
+	if vm.debugger != nil && vm.pc == 0 && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
 		srcName := ""
 		if vm.prg != nil && vm.prg.src != nil {
 			srcName = vm.prg.src.Name()
@@ -767,9 +767,10 @@ func (vm *vm) debug() {
 
 		if vm.debugger != nil {
 			// CRITICAL: When suppressDebugger is set, skip ALL debugger processing.
-			// This is used during getter evaluation (resolveIndirectValue/safeCallGetter)
-			// to prevent variable inspection from triggering breakpoints, corrupting
-			// step state, or executing lifecycle functions as side effects.
+			// This is set by gherkin.Run() during orchestration and cleared only by
+			// gherkin's runPickleStep when executing step functions.
+			// Init, setup, teardown, and handleSummary never set suppressDebugger,
+			// so breakpoints work normally in those phases.
 			if vm.debugger.suppressDebugger {
 				goto executeInstruction
 			}
@@ -3221,7 +3222,6 @@ type putProp unistring.String
 
 func (p putProp) exec(vm *vm) {
 	vm.r.toObject(vm.stack[vm.sp-2]).self._putProp(unistring.String(p), vm.stack[vm.sp-1], true, true, true)
-
 	vm.sp--
 	vm.pc++
 }
@@ -4577,6 +4577,7 @@ type enterBlock struct {
 	names     map[unistring.String]uint32
 	stashSize uint32
 	stackSize uint32
+	needStash bool // set by compiler in debug mode for empty scopes
 }
 
 func (e *enterBlock) exec(vm *vm) {
@@ -4605,6 +4606,13 @@ func (e *enterBlock) exec(vm *vm) {
 				}
 			}
 		}
+	} else if e.needStash {
+		// In debug mode, the compiler counts ALL scopes as stash
+		// levels (via sc.c.debug in finaliseVarAlloc level loop). The runtime must
+		// create a stash for every scope to match, even empty ones. Without this,
+		// loadStashLex reads from the wrong stash level.
+		// Only applies to code compiled in debug mode (needStash is set by compiler).
+		vm.newStash()
 	}
 	ss := int(e.stackSize)
 	vm.stack.expand(vm.sp + ss - 1)

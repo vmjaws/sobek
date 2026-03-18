@@ -46,7 +46,9 @@ func init() {
 		debugBP = true
 		debugContinue = true
 		debugVM = true
-		debugCompiler = true
+		// NOTE: debugCompiler is NOT enabled by SOBEK_DEBUG_ALL because it
+		// generates massive output (1000+ lines per run). Use
+		// SOBEK_DEBUG_COMPILER=1 separately when debugging scope/binding issues.
 	}
 }
 
@@ -66,6 +68,12 @@ type GlobalDebugCoordinator struct {
 	pendingLifecycleStepIn bool
 	waitForFunctionEntry   bool
 	globalActivationEpoch  uint64
+
+	// suppressDefaultEntry: when set, sobek suppresses the debugger the moment
+	// the "default" exported function is entered. Gherkin sets this after
+	// LoadFeature so breakpoints in step-definition bodies don't fire during
+	// the default() setup phase. runPickleStep clears it before each step call.
+	suppressDefaultEntry bool
 }
 
 var globalDebugCoordinator = &GlobalDebugCoordinator{
@@ -138,6 +146,20 @@ func (gdc *GlobalDebugCoordinator) GetActiveDebugger() *Debugger {
 
 func (gdc *GlobalDebugCoordinator) ActivationChannel() chan chan DebuggerActivation {
 	return gdc.activationCh
+}
+
+// DrainActivationChannel removes any stale entries from the global activation
+// channel. Call this before setting stepIn for a new gherkin step to prevent
+// activate() from picking up a stale Continue() signal (0ms handshake).
+func (gdc *GlobalDebugCoordinator) DrainActivationChannel() {
+	for {
+		select {
+		case <-gdc.activationCh:
+			// drained one stale entry
+		default:
+			return
+		}
+	}
 }
 
 func (gdc *GlobalDebugCoordinator) NextGlobalEpoch() uint64 {
@@ -642,6 +664,18 @@ type Debugger struct {
 	pendingCh chan DebuggerActivation
 
 	suppressDebugger bool
+
+	// inTestExecution is set true only while a Gherkin step function is being
+	// called by runPickleStep. When false, ALL breakpoint/stepping logic is
+	// skipped in vm.debug() so the debugger never fires during init, default()
+	// setup, or gherkin orchestration — only inside actual step functions.
+	inTestExecution bool
+
+	// mu protects fields that may be written from external goroutines (e.g. RequestPause)
+	mu sync.Mutex
+
+	// lastException stores the most recent uncaught exception for exceptionInfo requests
+	lastException Value
 }
 
 // sourceVarCacheKey includes currentLine so variables declared after the current
@@ -882,7 +916,11 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 					dbg.next = globalNext
 					dbg.stepIn = globalStepIn
 					dbg.steppingFilename = globalSteppingFile
-					dbg.stepOverTargetDepth = localDepth
+					if globalTargetDepth > 0 && globalTargetDepth < localDepth {
+						dbg.stepOverTargetDepth = globalTargetDepth
+					} else {
+						dbg.stepOverTargetDepth = localDepth
+					}
 					dbg.stepOverStartLine = line
 					dbg.userCommandIssued = true
 					globalDebugCoordinator.ClearGlobalStepState()
@@ -914,7 +952,11 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 					dbg.next = globalNext
 					dbg.stepIn = globalStepIn
 					dbg.steppingFilename = globalSteppingFile
-					dbg.stepOverTargetDepth = localDepth
+					if globalTargetDepth > 0 && globalTargetDepth < localDepth {
+						dbg.stepOverTargetDepth = globalTargetDepth
+					} else {
+						dbg.stepOverTargetDepth = localDepth
+					}
 					dbg.stepOverStartLine = line
 					dbg.userCommandIssued = true
 					globalDebugCoordinator.ClearGlobalStepState()
@@ -964,11 +1006,17 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 					dbg.stepIn = globalStepIn
 					dbg.steppingFilename = globalSteppingFile
 					localDepth := savedCallDepth
-					if debugActivate {
-						fmt.Printf("[DEBUGGER-ACTIVATE] ✅ Using LOCAL call depth=%d (global was=%d, line=%d)\n",
-							localDepth, globalTargetDepth, line)
+					// For step-out, globalTargetDepth < localDepth. Use it so we
+					// break when depth drops to the caller's level.
+					if globalTargetDepth > 0 && globalTargetDepth < localDepth {
+						dbg.stepOverTargetDepth = globalTargetDepth
+					} else {
+						dbg.stepOverTargetDepth = localDepth
 					}
-					dbg.stepOverTargetDepth = localDepth
+					if debugActivate {
+						fmt.Printf("[DEBUGGER-ACTIVATE] ✅ Using depth=%d (local=%d, global=%d, line=%d)\n",
+							dbg.stepOverTargetDepth, localDepth, globalTargetDepth, line)
+					}
 					dbg.stepOverStartLine = line
 					dbg.userCommandIssued = true
 					globalDebugCoordinator.ClearGlobalStepState()
@@ -987,16 +1035,18 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 					dbg.stepIn = globalStepIn
 					dbg.steppingFilename = globalSteppingFile
 					localDepth := savedCallDepth
-					if debugActivate {
-						fmt.Printf("[DEBUGGER-ACTIVATE] ✅ Using LOCAL call depth=%d (global was=%d, line=%d)\n",
-							localDepth, globalTargetDepth, line)
+					// For step-out, globalTargetDepth < localDepth. Use it so we
+					// break when depth drops to the caller's level.
+					if globalTargetDepth > 0 && globalTargetDepth < localDepth {
+						dbg.stepOverTargetDepth = globalTargetDepth
+					} else {
+						dbg.stepOverTargetDepth = localDepth
 					}
-					dbg.stepOverTargetDepth = localDepth
 					dbg.stepOverStartLine = line
 					dbg.userCommandIssued = true
 					if debugActivate {
-						fmt.Printf("[DEBUGGER-ACTIVATE] Non-lifecycle global: applied global step state: next=%v, stepIn=%v, file=%s, targetDepth=%d (localDepth=%d)\n",
-							globalNext, globalStepIn, globalSteppingFile, globalTargetDepth, localDepth)
+						fmt.Printf("[DEBUGGER-ACTIVATE] Applied user command from global state: next=%v, stepIn=%v, file=%s, globalDepth=%d, localDepth=%d, appliedDepth=%d, startLine=%d\n",
+							globalNext, globalStepIn, globalSteppingFile, globalTargetDepth, localDepth, dbg.stepOverTargetDepth, line)
 					}
 					globalDebugCoordinator.ClearGlobalStepState()
 				}
@@ -1055,12 +1105,18 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 				dbg.steppingFilename = globalSteppingFile
 			}
 			localDepth := savedCallDepth
-			dbg.stepOverTargetDepth = localDepth
+			// For step-out, globalTargetDepth < localDepth. Use it so we
+			// break when depth drops to the caller's level.
+			if globalTargetDepth > 0 && globalTargetDepth < localDepth {
+				dbg.stepOverTargetDepth = globalTargetDepth
+			} else {
+				dbg.stepOverTargetDepth = localDepth
+			}
 			dbg.stepOverStartLine = line
 			globalDebugCoordinator.ClearGlobalStepState()
 			if debugActivate {
-				fmt.Printf("[DEBUGGER-ACTIVATE] Applied user command from global state: next=%v, stepIn=%v, file=%s, globalDepth=%d, localDepth=%d, startLine=%d\n",
-					globalNext, globalStepIn, globalSteppingFile, globalTargetDepth, localDepth, line)
+				fmt.Printf("[DEBUGGER-ACTIVATE] Applied user command from global state: next=%v, stepIn=%v, file=%s, globalDepth=%d, localDepth=%d, appliedDepth=%d, startLine=%d\n",
+					globalNext, globalStepIn, globalSteppingFile, globalTargetDepth, localDepth, dbg.stepOverTargetDepth, line)
 			}
 		}
 	}
@@ -1110,7 +1166,12 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 		dbg.lastBreakpoint.stackDepth = savedCallDepth
 		if dbg.next {
 			dbg.stepOverStartLine = line
-			dbg.stepOverTargetDepth = savedCallDepth
+			// Only reset targetDepth to current depth for normal step-over.
+			// For step-out, stepOverTargetDepth was already set to a shallower
+			// depth by the post-Continue code — don't overwrite it.
+			if dbg.stepOverTargetDepth == 0 || dbg.stepOverTargetDepth >= savedCallDepth {
+				dbg.stepOverTargetDepth = savedCallDepth
+			}
 			if dbg.steppingFilename == "" {
 				dbg.steppingFilename = filename
 			}
@@ -1554,6 +1615,43 @@ func (dbg *Debugger) HasConnection() bool {
 		return globalDebugCoordinator.HasGlobalConnection()
 	}
 	return false
+}
+
+// SetSuppressBreakpoints temporarily suppresses ALL debugger activity when v=true.
+// Use this to prevent breakpoints firing during Go→JS orchestration calls (e.g.
+// gherkin's Run() internals). Un-suppress before calling actual user step functions.
+func (dbg *Debugger) SetSuppressBreakpoints(v bool) {
+	dbg.suppressDebugger = v
+}
+
+// SetInTestExecution marks whether the VM is currently executing a Gherkin step
+// function. When false, vm.debug() skips ALL breakpoint and stepping logic so
+// the debugger never fires during init, default() setup, or gherkin orchestration.
+// Set true before calling the step callable; defer reset to false.
+func (dbg *Debugger) SetInTestExecution(v bool) {
+	dbg.inTestExecution = v
+}
+
+// SetLifecycleTransition controls the lifecycleTransition flag.
+// Set true before calling a user JS function from Go; set false after.
+func (dbg *Debugger) SetLifecycleTransition(v bool) {
+	dbg.lifecycleTransition = v
+}
+
+// SetSuppressDefaultEntry tells sobek to suppress all breakpoints when the
+// "default" JS function is next entered. Gherkin calls this after LoadFeature
+// to prevent the debugger stopping on step-definition bodies during setup.
+func (c *GlobalDebugCoordinator) SetSuppressDefaultEntry(v bool) {
+	c.mu.Lock()
+	c.suppressDefaultEntry = v
+	c.mu.Unlock()
+}
+
+// GetSuppressDefaultEntry returns the current suppressDefaultEntry flag.
+func (c *GlobalDebugCoordinator) GetSuppressDefaultEntry() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.suppressDefaultEntry
 }
 
 func (dbg *Debugger) EnableDebugLogging() {
@@ -2458,11 +2556,19 @@ func (dbg *Debugger) SetStepIn(v bool) {
 	dbg.stepIn = v
 }
 
+func (dbg *Debugger) GetStepIn() bool {
+	return dbg.stepIn
+}
+
 func (dbg *Debugger) SetNext(v bool) {
 	if dbg.enableDebugLogging {
 		fmt.Printf("[DEBUGGER] SetNext: %v (was: %v)\n", v, dbg.next)
 	}
 	dbg.next = v
+}
+
+func (dbg *Debugger) GetNext() bool {
+	return dbg.next
 }
 
 func (dbg *Debugger) SetContinuing(v bool) {
@@ -3221,7 +3327,7 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 }
 
 func (dbg *Debugger) resolveIndirectValue(rawVal Value) Value {
-	if rawVal == nil || dbg.vm == nil || dbg.vm.r == nil {
+	if rawVal == nil || dbg.vm == nil {
 		return rawVal
 	}
 	resolved := dbg.withSuppressedDebugger(func() Value {
@@ -3345,14 +3451,19 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 			if !isIdentifierLike(nameStr) || nameStr == "" {
 				continue
 			}
-			actualIdx := idx & uint32(maskIndex)
-			if int(actualIdx) >= 0 && int(actualIdx) < len(dbg.vm.stash.values) {
-				val := dbg.vm.stash.values[actualIdx]
-				if val != nil && !isNullValue(val) {
-					if (idx&maskIndirect) != 0 && !lifecycleFunctionKeys[nameStr] {
-						val = dbg.resolveIndirectValue(val)
+			if _, exists := locals[nameStr]; exists {
+				continue
+			}
+			if dbg.vm.stash.values != nil {
+				actualIdx := idx & uint32(maskIndex)
+				if int(actualIdx) < len(dbg.vm.stash.values) {
+					val := dbg.vm.stash.values[actualIdx]
+					if val != nil && !isNullValue(val) {
+						if (idx&maskIndirect) != 0 && !lifecycleFunctionKeys[nameStr] {
+							val = dbg.resolveIndirectValue(val)
+						}
+						locals[nameStr] = val
 					}
-					locals[nameStr] = val
 				}
 			}
 		}
@@ -3431,14 +3542,11 @@ func (dbg *Debugger) GetGlobalVariables() map[string]Value {
 				if int(actualIdx) >= 0 && int(actualIdx) < len(s.values) {
 					val := s.values[actualIdx]
 					if val != nil && !isNullValue(val) {
-						if (idx&maskIndirect) != 0 && !lifecycleFunctionKeys[nameStr] {
-							val = dbg.resolveIndirectValue(val)
-						}
-						globals[nameStr] = val
 						if dbg.enableDebugLogging {
 							fmt.Printf("[DEBUGGER] GetGlobalVariables: captured %s from stash level %d (idx=%d)\n",
 								nameStr, stashLevel, actualIdx)
 						}
+						globals[nameStr] = val
 					}
 				}
 			}
@@ -3655,6 +3763,20 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 			}
 			return val, nil
 		}
+	}
+
+	// Check the paused var snapshot BEFORE debug symbols. The snapshot walks
+	// the full stash chain and correctly resolves variables from all scope
+	// levels. The debug symbols path only stores stashIdx without a level,
+	// so outer-scope variables (e.g. stepDefinitions in a for-of loop) get
+	// incorrectly resolved from the innermost stash instead of their actual
+	// stash depth.
+	snap := dbg.buildPausedVarSnapshot()
+	if snapVal, found := snap[varName]; found {
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] getValue('%s'): Found in paused var snapshot\n", varName)
+		}
+		return snapVal, nil
 	}
 
 	name := unistring.String(varName)
@@ -3889,88 +4011,112 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 	return nil, fmt.Errorf("variable '%s' not found in any scope", varName)
 }
 
+// isNullValue returns true for nil, undefined, and null sobek values.
 func isNullValue(v Value) bool {
 	if v == nil {
 		return true
 	}
-	if _, isNull := v.(valueNull); isNull {
+	if v == _undefined || v == _null {
 		return true
 	}
-	if _, isUndef := v.(valueUndefined); isUndef {
+	if IsUndefined(v) || IsNull(v) {
 		return true
 	}
 	return false
 }
 
+// isFunctionValue returns true if v is a callable JS function.
 func isFunctionValue(v Value) bool {
 	if v == nil {
 		return false
 	}
-	if obj, ok := v.(*Object); ok {
-		_, isCallable := obj.self.assertCallable()
-		return isCallable
+	_, isFn := AssertFunction(v)
+	return isFn
+}
+
+// SetVariable sets a variable's value in the current scope.
+// Tries local scope first, then walks up to global scope.
+// Used by the DAP setVariable request to modify variables from the IDE.
+func (dbg *Debugger) SetVariable(name string, val Value) error {
+	vm := dbg.vm
+	if vm == nil {
+		return fmt.Errorf("VM not available")
+	}
+
+	// Try setting in the current stash chain (locals first, then enclosing scopes)
+	if vm.stash != nil {
+		if dbg.setStashVariable(vm.stash, name, val) {
+			return nil
+		}
+	}
+
+	// Try setting as a global property
+	rt := dbg.GetRuntime()
+	if rt != nil {
+		globalObj := rt.GlobalObject()
+		if globalObj != nil {
+			if prop := globalObj.self.getStr(unistring.NewFromString(name), nil); prop != nil {
+				globalObj.self.setOwnStr(unistring.NewFromString(name), val, false)
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("variable '%s' not found in any scope", name)
+}
+
+// setStashVariable walks the stash chain looking for a binding named `name`
+// and sets it to val. Returns true if found and set.
+func (dbg *Debugger) setStashVariable(s *stash, name string, val Value) bool {
+	nameUni := unistring.NewFromString(name)
+	for current := s; current != nil; current = current.outer {
+		if current.names != nil {
+			if idx, exists := current.names[nameUni]; exists {
+				actualIdx := idx & uint32(maskIndex)
+				if int(actualIdx) < len(current.values) {
+					current.values[actualIdx] = val
+					return true
+				}
+			}
+		}
 	}
 	return false
 }
 
-func (dbg *Debugger) GetCallStack() ([]StackFrame, error) {
-	frames := make([]StackFrame, 0, len(dbg.vm.callStack)+1)
+// RequestPause requests the VM to pause at the next opportunity.
+// Used by the DAP pause request to pause a running script.
+func (dbg *Debugger) RequestPause() {
+	dbg.mu.Lock()
+	dbg.stepIn = true
+	dbg.next = false
+	dbg.continuing = false
+	dbg.mu.Unlock()
+}
 
-	topFrame := StackFrame{
-		Index:    0,
-		pc:       dbg.vm.pc,
-		funcName: "",
-		File:     dbg.Filename(),
-		Line:     dbg.Line(),
+// GetLastException returns the last exception message and stack trace.
+// Used by the DAP exceptionInfo request.
+func (dbg *Debugger) GetLastException() (message string, stack string) {
+	vm := dbg.vm
+	if vm == nil {
+		return "", ""
 	}
-	if dbg.vm.prg != nil {
-		topFrame.prg = dbg.vm.prg
-		topFrame.funcName = dbg.vm.prg.funcName
-		if topFrame.funcName == "" {
-			topFrame.funcName = "<module>"
-		}
-	}
-	frames = append(frames, topFrame)
-
-	for i := len(dbg.vm.callStack) - 1; i >= 0; i-- {
-		frame := dbg.vm.callStack[i]
-		frameInfo := StackFrame{
-			Index:    len(frames),
-			pc:       frame.pc,
-			funcName: "unknown",
-		}
-
-		if frame.prg != nil {
-			frameInfo.prg = frame.prg
-			if frame.prg.funcName != "" {
-				frameInfo.funcName = frame.prg.funcName
-			} else {
-				frameInfo.funcName = "<anonymous>"
+	if dbg.lastException != nil {
+		if obj, ok := dbg.lastException.(*Object); ok {
+			rt := dbg.GetRuntime()
+			if rt != nil {
+				if msgVal := obj.self.getStr(unistring.NewFromString("message"), nil); msgVal != nil {
+					message = msgVal.String()
+				}
+				if stackVal := obj.self.getStr(unistring.NewFromString("stack"), nil); stackVal != nil {
+					stack = stackVal.String()
+				}
 			}
-			if frame.prg.src != nil {
-				pos := frame.prg.src.Position(frame.prg.sourceOffset(frame.pc))
-				frameInfo.File = frame.prg.src.Name()
-				frameInfo.Line = pos.Line
-			} else {
-				frameInfo.File = "<unknown>"
-				frameInfo.Line = 0
+			if message == "" {
+				message = dbg.lastException.String()
 			}
 		} else {
-			frameInfo.funcName = "<native>"
-			frameInfo.File = "<native>"
-			frameInfo.Line = 0
+			message = dbg.lastException.String()
 		}
-
-		frames = append(frames, frameInfo)
 	}
-
-	return frames, nil
-}
-
-func (dbg *Debugger) SetInitRuntime(rt *Runtime) {
-	dbg.initRuntime = rt
-}
-
-func (dbg *Debugger) SetSetupData(data Value) {
-	dbg.setupData = data
+	return message, stack
 }

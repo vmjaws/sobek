@@ -447,6 +447,14 @@ func (c *compiler) compileLabeledForInOfStatement(into ast.ForInto, source ast.E
 				}
 			}
 		}
+		// In debug mode, the compiler counts ALL scopes as stash levels
+		// (via sc.c.debug in finaliseVarAlloc). If this scope is not used
+		// but debug is on, force it to be used so an enterBlock/leaveBlock
+		// pair is emitted and a stash is created at runtime, matching the
+		// level that the compiler will encode into loadStashLex instructions.
+		if !used && c.debug {
+			used = true
+		}
 		if used {
 			// We need the stack untouched because it contains the source.
 			// This is not the most optimal way, but it's an edge case, hopefully quite rare.

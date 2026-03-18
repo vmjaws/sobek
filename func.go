@@ -433,7 +433,7 @@ func (f *baseJsFuncObject) __call(args []Value, newTarget, this Value) (Value, *
 
 	// ARROW-DEBUG: Log when a JS function is called from Go while step flags are active.
 	// This traces arrow function callbacks (e.g., gherkin calling step definitions).
-	if vm.debugger != nil && (vm.debugger.next || vm.debugger.stepIn) {
+	if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
 		srcName := ""
 		if f.prg != nil && f.prg.src != nil {
 			srcName = f.prg.src.Name()
