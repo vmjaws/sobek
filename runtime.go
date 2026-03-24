@@ -1345,6 +1345,15 @@ func (r *Runtime) IsDebugMode() bool {
 	return r.vm.debugMode
 }
 
+// SetDebugMode enables debug mode on the runtime without attaching a full debugger.
+// Used by the throwaway VU 0 in newBundle() which runs debug-compiled code (stash-based
+// variable allocation) but doesn't need a DAP server or debugger instance.
+// Without this, loadStashLex throws TDZ errors for class declarations because the
+// debug-mode TDZ relaxation check (vm.debugMode) is false.
+func (r *Runtime) SetDebugMode(enabled bool) {
+	r.vm.debugMode = enabled
+}
+
 // Compile creates an internal representation of the JavaScript code that can be later run using the Runtime.RunProgram()
 // method. This representation is not linked to a runtime in any way and can be run in multiple runtimes (possibly
 // at the same time).

@@ -74,6 +74,13 @@ type GlobalDebugCoordinator struct {
 	// LoadFeature so breakpoints in step-definition bodies don't fire during
 	// the default() setup phase. runPickleStep clears it before each step call.
 	suppressDefaultEntry bool
+
+	// onPause/onResume are global callbacks invoked by every Debugger instance
+	// when the VM pauses/resumes in activate(). k6 registers
+	// ExecutionState.Pause/Resume here so debug-pause time is excluded from
+	// iteration-duration metrics. Protected by mu.
+	onPause  func()
+	onResume func()
 }
 
 var globalDebugCoordinator = &GlobalDebugCoordinator{
@@ -300,6 +307,39 @@ func (gdc *GlobalDebugCoordinator) HasWaitForFunctionEntry() bool {
 	return gdc.waitForFunctionEntry
 }
 
+// SetPauseResumeCallbacks registers global callbacks for debugger pause/resume.
+// k6 calls this with ExecutionState.Pause / ExecutionState.Resume so that
+// debug-pause time is excluded from iteration-duration metrics.
+// Both callbacks must be goroutine-safe. Pass nil to clear.
+func (gdc *GlobalDebugCoordinator) SetPauseResumeCallbacks(onPause, onResume func()) {
+	gdc.mu.Lock()
+	gdc.onPause = onPause
+	gdc.onResume = onResume
+	gdc.mu.Unlock()
+}
+
+// callPause invokes the registered onPause callback (if any).
+// Called from Debugger.activateWithStepState before blocking.
+func (gdc *GlobalDebugCoordinator) callPause() {
+	gdc.mu.RLock()
+	fn := gdc.onPause
+	gdc.mu.RUnlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// callResume invokes the registered onResume callback (if any).
+// Called from Debugger.activateWithStepState after unblocking.
+func (gdc *GlobalDebugCoordinator) callResume() {
+	gdc.mu.RLock()
+	fn := gdc.onResume
+	gdc.mu.RUnlock()
+	if fn != nil {
+		fn()
+	}
+}
+
 type VMRegistry interface {
 	MultiScopeEval(rt *Runtime, expr string) (Value, error)
 	RegisterVM(phase string, vuID uint64, rt *Runtime)
@@ -410,9 +450,24 @@ func getMapKeys(m map[string]bool) []string {
 }
 
 func (git *GlobalInitTracker) RecordInitBreakpoint(filename string, line int) {
+	normalizedFilename := normalizeFilename(filename)
+
+	// PERF: Check under RLock first — the common case is that the breakpoint
+	// was already recorded (multiple bytecodes per source line).
+	git.mu.RLock()
+	already := git.initBreakpointSet[initBPKey{normalizedFilename, line}]
+	git.mu.RUnlock()
+	if already {
+		return
+	}
+
 	git.mu.Lock()
 	defer git.mu.Unlock()
-	normalizedFilename := normalizeFilename(filename)
+
+	// Double-check under exclusive lock.
+	if git.initBreakpointSet[initBPKey{normalizedFilename, line}] {
+		return
+	}
 
 	// FIXED: composite key — no cross-file false positives
 	git.initBreakpointSet[initBPKey{normalizedFilename, line}] = true
@@ -561,6 +616,16 @@ func (gbr *GlobalBreakpointRegistry) Count() int {
 	return len(gbr.breakpoints)
 }
 
+// FileHasBreakpoints returns true if the file has any breakpoints registered.
+// PERF: O(1) map lookup under RLock — no allocation. Caller must pass a
+// normalized filename (or raw filename if that's how it was registered).
+func (gbr *GlobalBreakpointRegistry) FileHasBreakpoints(normalizedFilename string) bool {
+	gbr.mu.RLock()
+	lines := gbr.breakpoints[normalizedFilename]
+	gbr.mu.RUnlock()
+	return len(lines) > 0
+}
+
 func GetGlobalBreakpoints() *GlobalBreakpointRegistry {
 	return globalBreakpoints
 }
@@ -676,6 +741,14 @@ type Debugger struct {
 
 	// lastException stores the most recent uncaught exception for exceptionInfo requests
 	lastException Value
+
+	// onPause is called when the debugger pauses the VM (entering activate()).
+	// k6 registers ExecutionState.Pause here so debug-pause time is excluded
+	// from iteration duration metrics. May be nil.
+	onPause func()
+	// onResume is called when the debugger resumes the VM (leaving activate()).
+	// k6 registers ExecutionState.Resume here. May be nil.
+	onResume func()
 }
 
 // sourceVarCacheKey includes currentLine so variables declared after the current
@@ -1073,14 +1146,55 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 
 	dbg.pendingCh = ch
 
-	ch <- DebuggerActivation{
+	// Notify k6 that the VM is now paused so iteration-duration timers
+	// stop counting while the user inspects variables / steps.
+	if globalDebugCoordinator.IsInitialized() {
+		globalDebugCoordinator.callPause()
+	} else if dbg.onPause != nil {
+		dbg.onPause()
+	}
+
+	// CRITICAL FIX: Protect the send from panicking when the channel was
+	// closed by a concurrent Continue()/Next()/StepIn() call on another
+	// goroutine. This race happens during multi-VU instantiation: VU1's
+	// activate() picks up a channel from the global coordinator, but the
+	// DAP handler's Continue() call (for VU0's previous breakpoint) closes
+	// that same channel before VU1 can send on it.
+	//
+	// Recovery: If the channel was closed, the DAP side already moved on.
+	// We clean up and return so the VM continues executing without pausing.
+	sendOK := safeSendActivation(ch, DebuggerActivation{
 		Reason:   reason,
 		Filename: filename,
 		Line:     line,
 		ID:       id,
 		Epoch:    epoch,
+	})
+	if !sendOK {
+		if debugActivate {
+			fmt.Printf("[DEBUGGER-ACTIVATE] ⚠️ Channel was closed before send at %s:%d — skipping pause (concurrent Continue/Next/StepIn)\n",
+				filename, line)
+		}
+		// Resume k6 timers since we didn't actually pause.
+		if globalDebugCoordinator.IsInitialized() {
+			globalDebugCoordinator.callResume()
+		} else if dbg.onResume != nil {
+			dbg.onResume()
+		}
+		dbg.pendingCh = nil
+		dbg.active = false
+		return
 	}
+
+	// Wait for Continue signal (close of ch).
 	<-ch
+
+	// Notify k6 that the VM is about to resume — restart iteration-duration timers.
+	if globalDebugCoordinator.IsInitialized() {
+		globalDebugCoordinator.callResume()
+	} else if dbg.onResume != nil {
+		dbg.onResume()
+	}
 
 	dbg.pendingCh = nil
 
@@ -1234,18 +1348,42 @@ func safeCloseActivationCh(ch chan DebuggerActivation) {
 	if ch == nil {
 		return
 	}
-	// Use select to check if the channel is already closed before closing.
-	// A closed channel will immediately return on receive; an open one won't.
+	// Use defer+recover to handle the race where another goroutine closes
+	// the channel between our check and our close() call.
+	defer func() {
+		if r := recover(); r != nil {
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-SAFE-CLOSE] Recovered from close on already-closed channel: %v\n", r)
+			}
+		}
+	}()
+	// A closed channel returns immediately on receive; an open one enters default.
 	select {
 	case <-ch:
-		// Channel was already closed (or had a buffered value drained — either
-		// way, closing it again would panic). Do nothing.
+		// Channel was already closed (or had a buffered value drained).
 		if debugContinue {
 			fmt.Printf("[DEBUGGER-SAFE-CLOSE] Channel already closed, skipping\n")
 		}
 	default:
 		close(ch)
 	}
+}
+
+// safeSendActivation sends an activation on ch, recovering gracefully if ch
+// was closed by a concurrent Continue()/Next()/StepIn() call.
+// Returns true if the send succeeded, false if the channel was closed.
+func safeSendActivation(ch chan DebuggerActivation, activation DebuggerActivation) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			// "send on closed channel" — the DAP handler already moved on.
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-SAFE-SEND] Recovered from send on closed channel: %v\n", r)
+			}
+			ok = false
+		}
+	}()
+	ch <- activation
+	return true
 }
 
 func (dbg *Debugger) Continue() DebuggerActivation {
@@ -1302,7 +1440,13 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 
 	// PERF: allocate timers once and Reset() on retry rather than creating a new
 	// timer (and goroutine) on every loop iteration via time.After().
-	retryTimer := time.NewTimer(200 * time.Millisecond)
+	// Use adaptive backoff: start at 200ms, increase to 1s after 5 retries,
+	// then to 5s after 15 retries. This keeps the debugger responsive for fast
+	// operations while reducing CPU/log overhead during long native Go calls
+	// (e.g., HTTP requests that can take 10-30s).
+	retryInterval := 200 * time.Millisecond
+	retryCount := 0
+	retryTimer := time.NewTimer(retryInterval)
 	outerTimer := time.NewTimer(2 * time.Second)
 	defer retryTimer.Stop()
 	defer outerTimer.Stop()
@@ -1317,14 +1461,17 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 		}
 	}
 
-	waitForActivation := func(source string, skipVMDone bool) (DebuggerActivation, bool) {
+	// waitForActivation returns (activation, ok, vmExited)
+	// ok=true means we got an activation
+	// vmExited=true means the VM exited (vmDoneCh closed) during the wait
+	waitForActivation := func(source string, skipVMDone bool) (DebuggerActivation, bool, bool) {
 		var waitStart time.Time
 		if debugContinue {
 			waitStart = time.Now()
 		}
 
 		stopTimer(retryTimer)
-		retryTimer.Reset(200 * time.Millisecond)
+		retryTimer.Reset(retryInterval)
 
 		if skipVMDone {
 			select {
@@ -1334,13 +1481,22 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 						source, activation.Filename, activation.Line,
 						time.Since(waitStart).Milliseconds(), time.Since(continueStart).Milliseconds())
 				}
-				return activation, true
+				retryCount = 0
+				retryInterval = 200 * time.Millisecond
+				return activation, true, false
 			case <-retryTimer.C:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Retry timeout waiting for activation from %s (200ms, total=%dms)\n",
-						source, time.Since(continueStart).Milliseconds())
+				retryCount++
+				// Adaptive backoff: increase interval for long-running native calls
+				if retryCount > 15 && retryInterval < 5*time.Second {
+					retryInterval = 5 * time.Second
+				} else if retryCount > 5 && retryInterval < 1*time.Second {
+					retryInterval = 1 * time.Second
 				}
-				return DebuggerActivation{}, false
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Retry timeout waiting for activation from %s (%dms, total=%dms, retries=%d)\n",
+						source, retryInterval.Milliseconds(), time.Since(continueStart).Milliseconds(), retryCount)
+				}
+				return DebuggerActivation{}, false, false
 			}
 		}
 		select {
@@ -1350,7 +1506,9 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 					source, activation.Filename, activation.Line,
 					time.Since(waitStart).Milliseconds(), time.Since(continueStart).Milliseconds())
 			}
-			return activation, true
+			retryCount = 0
+			retryInterval = 200 * time.Millisecond
+			return activation, true, false
 		case <-dbg.vmDoneCh:
 			if debugContinue {
 				fmt.Printf("[DEBUGGER-CONTINUE] VM exited (vmDoneCh closed) while waiting on %s (%dms, total=%dms) - switching to global\n",
@@ -1363,11 +1521,18 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 				}
 			default:
 			}
-			return DebuggerActivation{}, false
+			return DebuggerActivation{}, false, true
 		case <-retryTimer.C:
+			retryCount++
+			// Adaptive backoff: increase interval for long-running native calls
+			if retryCount > 15 && retryInterval < 5*time.Second {
+				retryInterval = 5 * time.Second
+			} else if retryCount > 5 && retryInterval < 1*time.Second {
+				retryInterval = 1 * time.Second
+			}
 			if debugContinue {
-				fmt.Printf("[DEBUGGER-CONTINUE] Retry timeout waiting for activation from %s (200ms, total=%dms)\n",
-					source, time.Since(continueStart).Milliseconds())
+				fmt.Printf("[DEBUGGER-CONTINUE] Retry timeout waiting for activation from %s (%dms, total=%dms, retries=%d)\n",
+					source, retryInterval.Milliseconds(), time.Since(continueStart).Milliseconds(), retryCount)
 			}
 			select {
 			case <-dbg.activationCh:
@@ -1376,7 +1541,7 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 				}
 			default:
 			}
-			return DebuggerActivation{}, false
+			return DebuggerActivation{}, false, false
 		}
 	}
 
@@ -1394,10 +1559,10 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 			if debugContinue {
 				fmt.Printf("[DEBUGGER-CONTINUE] Sent to global coordinator (local VM exited), waiting for activation\n")
 			}
-			if activation, ok := waitForActivation("global", true); ok {
+			if activation, ok, _ := waitForActivation("global", true); ok {
 				return activation
 			}
-			dbg.currentCh = make(chan DebuggerActivation)
+			// DON'T create a new currentCh — reuse the same one so activate() can still send on it
 		} else if hasGlobalStepState {
 			stopTimer(outerTimer)
 			outerTimer.Reset(2 * time.Second)
@@ -1406,11 +1571,11 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 				if debugContinue {
 					fmt.Printf("[DEBUGGER-CONTINUE] Sent to global coordinator (preferred due to global step state), waiting for activation\n")
 				}
-				if activation, ok := waitForActivation("global", false); ok {
+				if activation, ok, vmExited := waitForActivation("global", false); ok {
 					return activation
+				} else if vmExited {
+					localTimedOut = true
 				}
-				localTimedOut = true
-				dbg.currentCh = make(chan DebuggerActivation)
 				// re-read global state only after a transition
 				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
 				hasGlobalStepState = globalNext || globalStepIn
@@ -1418,11 +1583,11 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 				if debugContinue {
 					fmt.Printf("[DEBUGGER-CONTINUE] Sent to local channel (fallback), waiting for activation\n")
 				}
-				if activation, ok := waitForActivation("local", false); ok {
+				if activation, ok, vmExited := waitForActivation("local", false); ok {
 					return activation
+				} else if vmExited {
+					localTimedOut = true
 				}
-				localTimedOut = true
-				dbg.currentCh = make(chan DebuggerActivation)
 				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
 				hasGlobalStepState = globalNext || globalStepIn
 			case <-dbg.vmDoneCh:
@@ -1452,24 +1617,23 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 				if debugContinue {
 					fmt.Printf("[DEBUGGER-CONTINUE] Sent to local channel, waiting for activation\n")
 				}
-				if activation, ok := waitForActivation("local", false); ok {
+				if activation, ok, vmExited := waitForActivation("local", false); ok {
 					return activation
+				} else if vmExited {
+					localTimedOut = true
+					if debugContinue {
+						fmt.Printf("[DEBUGGER-CONTINUE] Local VM exited, switching to global-only mode (hasGlobalStepState=%v)\n", hasGlobalStepState)
+					}
 				}
-				localTimedOut = true
-				dbg.currentCh = make(chan DebuggerActivation)
 				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
 				hasGlobalStepState = globalNext || globalStepIn
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Local VM exited, switching to global-only mode (hasGlobalStepState=%v)\n", hasGlobalStepState)
-				}
 			case globalDebugCoordinator.ActivationChannel() <- dbg.currentCh:
 				if debugContinue {
 					fmt.Printf("[DEBUGGER-CONTINUE] Sent to global coordinator, waiting for activation\n")
 				}
-				if activation, ok := waitForActivation("global", false); ok {
+				if activation, ok, _ := waitForActivation("global", false); ok {
 					return activation
 				}
-				dbg.currentCh = make(chan DebuggerActivation)
 				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
 				hasGlobalStepState = globalNext || globalStepIn
 			case <-dbg.vmDoneCh:
@@ -1615,6 +1779,20 @@ func (dbg *Debugger) HasConnection() bool {
 		return globalDebugCoordinator.HasGlobalConnection()
 	}
 	return false
+}
+
+// SetPauseResumeCallbacks registers callbacks that are invoked when the debugger
+// pauses and resumes the VM. k6 uses this to call ExecutionState.Pause()/Resume()
+// so that debug-pause time is excluded from iteration duration metrics and the
+// progress bar freezes while the user is inspecting variables / stepping.
+//
+// Both callbacks must be goroutine-safe. They are called on the VM goroutine
+// inside activate(). Pass nil to clear a previously registered callback.
+func (dbg *Debugger) SetPauseResumeCallbacks(onPause, onResume func()) {
+	dbg.mu.Lock()
+	dbg.onPause = onPause
+	dbg.onResume = onResume
+	dbg.mu.Unlock()
 }
 
 // SetSuppressBreakpoints temporarily suppresses ALL debugger activity when v=true.
@@ -1810,29 +1988,18 @@ func (dbg *Debugger) GetActivationEpoch() uint64 {
 }
 
 func (dbg *Debugger) Detach() {
-	safeClose := func(ch chan DebuggerActivation) {
-		if ch == nil {
-			return
-		}
-		select {
-		case <-ch:
-			// Already closed
-		default:
-			close(ch)
-		}
-	}
 	dbg.vm.debugger = nil
 	dbg.vm.debugMode = false
 	dbg.vm = nil
 	dbg.active = false
 	if dbg.pendingCh != nil {
 		if dbg.pendingCh != dbg.currentCh {
-			safeClose(dbg.pendingCh)
+			safeCloseActivationCh(dbg.pendingCh)
 		}
 		dbg.pendingCh = nil
 	}
 	if dbg.currentCh != nil {
-		safeClose(dbg.currentCh)
+		safeCloseActivationCh(dbg.currentCh)
 		dbg.currentCh = nil
 	}
 }
@@ -3355,43 +3522,55 @@ func (dbg *Debugger) safeCallGetter(getter func() Value) Value {
 
 func (dbg *Debugger) getValueFromLocation(varLoc VarLocation) (Value, error) {
 	if varLoc.InStash {
-		if dbg.vm.stash != nil {
-			stashIdx := int(varLoc.StashIdx)
-			if dbg.vm.stash.values != nil && stashIdx < len(dbg.vm.stash.values) {
-				val := dbg.vm.stash.values[stashIdx]
-				if val != nil && !isNullValue(val) {
-					if dbg.vm.stash.names != nil {
-						for name, idx := range dbg.vm.stash.names {
-							actualIdx := idx & uint32(maskIndex)
-							if int(actualIdx) == stashIdx && (idx&maskIndirect) != 0 {
-								nameStr := name.String()
-								if lifecycleFunctionKeys[nameStr] {
-									break
-								}
+		// Look up the variable by NAME in the stash chain.
+		//
+		// We cannot rely on the compile-time stash level and index because:
+		// 1. Block scopes (try/catch/for) create and destroy stashes at runtime.
+		// 2. The debugger may break at a PC where a block stash has been popped
+		//    (e.g., `return age < expiryMs` inside a try{} — the leaveBlock
+		//    instruction pops the try stash BEFORE the return expression).
+		// 3. The stash chain layout at runtime may differ from compile-time assumptions.
+		//
+		// By scanning the chain for the matching name, we always find the correct
+		// value regardless of which stashes are currently alive.
+		for s := dbg.vm.stash; s != nil; s = s.outer {
+			if s.names == nil {
+				continue
+			}
+			for n, idx := range s.names {
+				if n.String() == varLoc.Name {
+					actualIdx := int(idx & uint32(maskIndex))
+					if s.values != nil && actualIdx < len(s.values) {
+						val := s.values[actualIdx]
+						if val != nil && !isNullValue(val) {
+							if (idx&maskIndirect) != 0 && !lifecycleFunctionKeys[varLoc.Name] {
 								val = dbg.resolveIndirectValue(val)
-								break
 							}
+							return val, nil
+						}
+						if dbg.vm.debugMode {
+							return _undefined, nil
 						}
 					}
-					return val, nil
-				}
-				if dbg.vm.debugMode {
-					return _undefined, nil
+					// Found the name but value is nil/null — variable exists but uninitialized
+					return nil, fmt.Errorf("variable %s found but uninitialized", varLoc.Name)
 				}
 			}
 		}
+		// Variable name not found in any stash — block stash was popped
+		return nil, fmt.Errorf("variable %s not found in stash chain", varLoc.Name)
+	}
+	// Stack-based variable
+	stackIdx := varLoc.StackIdx
+	if stackIdx < 0 {
+		stackIdx = dbg.vm.sb + stackIdx
 	} else {
-		stackIdx := varLoc.StackIdx
-		if stackIdx < 0 {
-			stackIdx = dbg.vm.sb + stackIdx
-		} else {
-			stackIdx = dbg.vm.sb + 1 + stackIdx
-		}
-		if stackIdx >= 0 && stackIdx < len(dbg.vm.stack) {
-			val := dbg.vm.stack[stackIdx]
-			if val != nil && !isNullValue(val) {
-				return val, nil
-			}
+		stackIdx = dbg.vm.sb + 1 + stackIdx
+	}
+	if stackIdx >= 0 && stackIdx < len(dbg.vm.stack) {
+		val := dbg.vm.stack[stackIdx]
+		if val != nil && !isNullValue(val) {
+			return val, nil
 		}
 	}
 	return nil, fmt.Errorf("variable not found")
@@ -3433,9 +3612,61 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 			if !isIdentifierLike(varLoc.Name) {
 				continue
 			}
-			val, err := dbg.getValueFromLocation(varLoc)
-			if err == nil && val != nil && !isNullValue(val) {
-				locals[varLoc.Name] = val
+			// Wrap in recovery — getValueFromLocation calls resolveIndirectValue
+			// which executes getter functions that can panic/throw.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						if dbg.enableDebugLogging {
+							fmt.Printf("[DEBUGGER] GetLocalVariables: getValueFromLocation panicked for '%s': %v\n", varLoc.Name, r)
+						}
+					}
+				}()
+				val, err := dbg.getValueFromLocation(varLoc)
+				if err == nil && val != nil && !isNullValue(val) {
+					locals[varLoc.Name] = val
+				}
+			}()
+		}
+
+		// Catch-block fallback: the catch parameter (e.g., `error`) may have a
+		// debug symbol PC range that starts AFTER the current PC because the
+		// exception handler jumps before the enterBlock instruction.
+		// getValueFromLocation already does name-based lookup, so if the catch
+		// stash is active at runtime, the variable will be found above.
+		// But if the debug symbols excluded it (PC out of range), the varLocs
+		// loop above won't even try it. Scan the innermost stash for any named
+		// variables that are NOT in the debug symbols but ARE in the stash.
+		if dbg.vm.stash != nil && dbg.vm.stash.names != nil {
+			for name, idx := range dbg.vm.stash.names {
+				nameStr := name.String()
+				if !isIdentifierLike(nameStr) || nameStr == "" {
+					continue
+				}
+				if _, exists := locals[nameStr]; exists {
+					continue
+				}
+				// Only add if this is a user variable (not this, not module-level)
+				// Check: the name must not exist in the outer stash chain (module scope)
+				isModuleLevel := false
+				if dbg.vm.stash.outer != nil && dbg.vm.stash.outer.names != nil {
+					for outerName := range dbg.vm.stash.outer.names {
+						if outerName.String() == nameStr {
+							isModuleLevel = true
+							break
+						}
+					}
+				}
+				if isModuleLevel {
+					continue
+				}
+				actualIdx := int(idx & uint32(maskIndex))
+				if dbg.vm.stash.values != nil && actualIdx < len(dbg.vm.stash.values) {
+					val := dbg.vm.stash.values[actualIdx]
+					if val != nil && !isNullValue(val) {
+						locals[nameStr] = val
+					}
+				}
 			}
 		}
 
@@ -3785,43 +4016,13 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 		if varLocs, exists := dbg.vm.prg.debugSymbols.scopeMap[dbg.vm.pc]; exists {
 			for _, varLoc := range varLocs {
 				if varLoc.Name == varName {
-					if varLoc.InStash {
-						if dbg.vm.stash != nil {
-							stashIdx := int(varLoc.StashIdx)
-							if dbg.vm.stash.values != nil && stashIdx < len(dbg.vm.stash.values) {
-								val = dbg.vm.stash.values[stashIdx]
-								if val != nil && !isNullValue(val) {
-									if dbg.enableDebugLogging {
-										fmt.Printf("[DEBUGGER] getValue('%s'): Found in stash level 0, idx %d (from debug symbols)\n",
-											varName, stashIdx)
-									}
-									return val, nil
-								}
-							}
+					// Use getValueFromLocation which does name-based stash lookup
+					val, err := dbg.getValueFromLocation(varLoc)
+					if err == nil && val != nil && !isNullValue(val) {
+						if dbg.enableDebugLogging {
+							fmt.Printf("[DEBUGGER] getValue('%s'): Found via getValueFromLocation (from debug symbols)\n", varName)
 						}
-					} else {
-						var stackPos int
-						if varLoc.IsParam || varLoc.StackIdx < 0 {
-							argNum := -int(varLoc.StackIdx) - 1
-							stackPos = dbg.vm.sb + 1 + argNum
-						} else {
-							stackPos = dbg.vm.sb + int(varLoc.StackIdx)
-							if stackPos < dbg.vm.sb || stackPos >= dbg.vm.sp {
-								if dbg.vm.args > 0 {
-									stackPos = dbg.vm.sb + dbg.vm.args + int(varLoc.StackIdx)
-								}
-							}
-						}
-						if stackPos >= dbg.vm.sb && stackPos < dbg.vm.sp && stackPos >= 0 && stackPos < len(dbg.vm.stack) {
-							val = dbg.vm.stack[stackPos]
-							if val != nil && !isNullValue(val) && !isFunctionValue(val) {
-								if dbg.enableDebugLogging {
-									fmt.Printf("[DEBUGGER] getValue('%s'): Found on stack at pos %d (stackIdx=%d, isParam=%v, from debug symbols)\n",
-										varName, stackPos, varLoc.StackIdx, varLoc.IsParam)
-								}
-								return val, nil
-							}
-						}
+						return val, nil
 					}
 				}
 			}

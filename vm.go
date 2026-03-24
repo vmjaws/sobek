@@ -841,17 +841,31 @@ func (vm *vm) debug() {
 				currentFilename := vm.debugger.cachedFilename
 				normalizedFilename := vm.debugger.cachedNormFile
 
-				// Check if this file has breakpoints - if yes, it's a user file and we should process breakpoints
-				globalBPs := GetGlobalBreakpoints().GetAllBreakpoints()
-				_, hasGlobalBP := globalBPs[currentFilename]
-				_, hasNormalizedGlobalBP := globalBPs[normalizedFilename]
+				// PERF: Use Count() + HasBreakpoint() instead of GetAllBreakpoints() which
+				// allocates a new map on every call. We only need to know if the file has
+				// ANY breakpoint, not which specific lines — so checking HasBreakpoint at
+				// the current line (already computed) is sufficient combined with the
+				// hasLocalBPs/hasGlobalBPs fast-path flags.
+				gbr := GetGlobalBreakpoints()
+				hasAnyGlobalBP := gbr.Count() > 0
+				var hasGlobalBP bool
+				if hasAnyGlobalBP {
+					// Check if the global registry has any breakpoint for this file.
+					// We only need a file-level check, not line-level, but HasBreakpoint
+					// is still cheaper than GetAllBreakpoints. Use line 0 sentinel? No —
+					// just check if any breakpoint exists for either filename variant.
+					// PERF: fileHasBreakpoint does a single RLock + map lookup.
+					hasGlobalBP = gbr.FileHasBreakpoints(normalizedFilename) || gbr.FileHasBreakpoints(currentFilename)
+				}
+				vm.debugger.breakpointMutex.RLock()
 				_, hasLocalBP := vm.debugger.breakpoints[currentFilename]
 				_, hasNormalizedLocalBP := vm.debugger.breakpoints[normalizedFilename]
+				vm.debugger.breakpointMutex.RUnlock()
 
 				// If this is a user file, capture the init filename for later
 				// This ensures MarkInitCompleted works even if SetInitPhase(true) was called
 				// before the program was loaded
-				isUserFile := hasGlobalBP || hasNormalizedGlobalBP || hasLocalBP || hasNormalizedLocalBP
+				isUserFile := hasGlobalBP || hasLocalBP || hasNormalizedLocalBP
 				if isUserFile && vm.debugger.initFilename == "" {
 					vm.debugger.initFilename = normalizedFilename
 				}
@@ -987,9 +1001,9 @@ func (vm *vm) debug() {
 					// (like handleSummary). We must stop stepping in those internal scripts.
 					fileChanged := normalizedCurrentFilename != normalizedSteppingFilename && normalizedSteppingFilename != ""
 					if fileChanged && (vm.debugger.next || vm.debugger.stepIn) {
-						// Check if the NEW file has breakpoints - if not, check if it's still a user file
-						globalBPs := GetGlobalBreakpoints().GetAllBreakpoints()
-						_, newFileHasGlobalBP := globalBPs[normalizedCurrentFilename]
+						// PERF: Use FileHasBreakpoints() instead of GetAllBreakpoints()
+						// to avoid map allocation on every file-change check.
+						newFileHasGlobalBP := GetGlobalBreakpoints().FileHasBreakpoints(normalizedCurrentFilename)
 						vm.debugger.breakpointMutex.RLock()
 						_, newFileHasLocalBP := vm.debugger.breakpoints[normalizedCurrentFilename]
 						vm.debugger.breakpointMutex.RUnlock()
@@ -1030,9 +1044,8 @@ func (vm *vm) debug() {
 					if normalizedCurrentFilename == normalizedSteppingFilename && normalizedSteppingFilename != "" {
 						isUserFile = true
 					} else {
-						// Check if file has breakpoints (global or local)
-						globalBPs := GetGlobalBreakpoints().GetAllBreakpoints()
-						if _, hasGlobalBP := globalBPs[normalizedCurrentFilename]; hasGlobalBP {
+						// PERF: Use FileHasBreakpoints() instead of GetAllBreakpoints()
+						if GetGlobalBreakpoints().FileHasBreakpoints(normalizedCurrentFilename) {
 							isUserFile = true
 						}
 						vm.debugger.breakpointMutex.RLock()
@@ -1059,11 +1072,13 @@ func (vm *vm) debug() {
 					}
 
 					// Also check globalBPs with fuzzy match (both .ts and .js variants)
+					// PERF: Use FileHasBreakpoints with both .ts/.js variants instead of
+					// iterating all breakpoints with GetAllBreakpoints().
 					if !isUserFile {
-						globalBPs := GetGlobalBreakpoints().GetAllBreakpoints()
 						baseCurrentFile := normalizeFilenameForMatch(normalizedCurrentFilename)
-						for bpFile := range globalBPs {
-							if normalizeFilenameForMatch(bpFile) == baseCurrentFile {
+						// Try common extensions against the base name
+						for _, ext := range []string{".ts", ".js", ".mjs", ".tsx"} {
+							if GetGlobalBreakpoints().FileHasBreakpoints(baseCurrentFile + ext) {
 								isUserFile = true
 								break
 							}
@@ -1372,10 +1387,29 @@ func (vm *vm) debug() {
 			// breaks at its first line, but does NOT re-step through module init code
 			GetGlobalCoordinator().SetWaitForFunctionEntry(true)
 		} else {
+			// VM exited at depth > 1 with step flags still active. This happens when:
+			// - An abort/exception propagated up from a nested function during step-over
+			// - The inner function's debug() loop ended but the outer function won't
+			//   re-enter debug() (the exception bypasses it via panic/recover)
+			//
+			// We MUST notify vmDoneCh and clear step flags here, otherwise Continue()
+			// spins forever waiting for an activation that will never come.
 			if debugVM {
-				fmt.Printf("[VM-EXIT] Step operation active but NOT at top-level (next=%v, stepIn=%v, depth=%d) - not propagating\n",
+				fmt.Printf("[VM-EXIT] 🔄 Step operation active at deep exit (next=%v, stepIn=%v, depth=%d) — notifying vmDoneCh and clearing step flags\n",
 					vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth())
 			}
+			vm.debugger.vmExited = true
+			if vm.debugger.vmDoneCh != nil {
+				select {
+				case <-vm.debugger.vmDoneCh:
+					// Already closed
+				default:
+					close(vm.debugger.vmDoneCh)
+				}
+			}
+			vm.debugger.next = false
+			vm.debugger.stepIn = false
+			GetGlobalCoordinator().ClearGlobalStepState()
 		}
 	} else if vm.debugger != nil && debugVM {
 		// Only log normal VM exits at shallow depths to avoid massive spam
@@ -3954,14 +3988,21 @@ func (g loadStashLex) exec(vm *vm) {
 
 	v := stash.getByIdx(idx)
 	if v == nil {
-		if vm != nil && vm.debugMode {
-			// In debug mode, return undefined instead of throwing TDZ error
-			// This handles function parameters and variables not yet initialized
-			v = _undefined
-		} else {
-			vm.throw(errAccessBeforeInit)
-			return
+		if debugCompiler {
+			srcName := ""
+			if vm.prg != nil && vm.prg.src != nil {
+				srcName = vm.prg.src.Name()
+			}
+			fmt.Printf("[LOADSTASHLEX-TDZ] level=%d, idx=%d, stashLen=%d, pc=%d, src=%s\n",
+				level, idx, len(stash.values), vm.pc, srcName)
+			if stash.names != nil {
+				for name, sidx := range stash.names {
+					fmt.Printf("[LOADSTASHLEX-TDZ]   stash name=%s idx=%d\n", name, sidx)
+				}
+			}
 		}
+		vm.throw(errAccessBeforeInit)
+		return
 	}
 	vm.push(v)
 	vm.pc++

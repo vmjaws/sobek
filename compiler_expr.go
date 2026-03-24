@@ -1614,11 +1614,11 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 
 	needInitThis := false
 	if thisBinding != nil {
-		if !s.isDynamic() && thisBinding.useCount() == 0 {
+		if !s.isDynamic() && !s.c.debug && thisBinding.useCount() == 0 {
 			s.deleteBinding(thisBinding)
 			thisBinding = nil
 		} else {
-			if thisBinding.inStash || s.isDynamic() {
+			if thisBinding.inStash || s.isDynamic() || s.c.debug {
 				delta++
 				thisBinding.emitInitAtScope(s, preambleLen-delta)
 				needInitThis = true
@@ -2271,8 +2271,8 @@ func (e *compiledClassLiteral) compileFieldsAndStaticBlocks(elements []clsElemen
 			}
 		}
 	}
-	if s.isDynamic() || thisBinding.useCount() > 0 {
-		if s.isDynamic() || thisBinding.inStash {
+	if s.isDynamic() || s.c.debug || thisBinding.useCount() > 0 {
+		if s.isDynamic() || s.c.debug || thisBinding.inStash {
 			thisBinding.emitInitAt(1)
 		}
 	} else {

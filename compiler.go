@@ -90,14 +90,15 @@ type DebugSymbols struct {
 }
 
 type VarLocation struct {
-	Name     string
-	InStash  bool
-	StashIdx uint32 // if InStash=true, the stash index
-	StackIdx int    // if InStash=false, the stack index
-	IsParam  bool
-	IsConst  bool
-	StartPC  int // PC where variable becomes available
-	EndPC    int // PC where variable goes out of scope
+	Name       string
+	InStash    bool
+	StashIdx   uint32 // if InStash=true, the stash index within that stash level
+	StackIdx   int    // if InStash=false, the stack index
+	StashLevel int    // 0 = innermost (current) stash, 1 = parent stash, etc.
+	IsParam    bool
+	IsConst    bool
+	StartPC    int // PC where variable becomes available
+	EndPC      int // PC where variable goes out of scope
 }
 
 type compiler struct {
@@ -371,9 +372,6 @@ type block struct {
 
 func (c *compiler) leaveScopeBlock(enter *enterBlock) {
 	c.updateEnterBlock(enter)
-	if c.debug && enter.stashSize == 0 && len(enter.names) == 0 {
-		enter.needStash = true
-	}
 	leave := &leaveBlock{
 		stackSize: enter.stackSize,
 		popStash:  enter.stashSize > 0 || enter.needStash,
@@ -714,14 +712,19 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 		if allInStash || b.inStash {
 
 			if s.c.debug {
-				// CRITICAL: Mark binding as in stash
+				// CRITICAL: Mark binding as in stash and flag scope as needing stash
 				b.inStash = true
+				s.needStash = true
 			}
 
 			for scope, aps := range b.accessPoints {
 				var level uint32
 				for sc := scope; sc != nil && sc != s; sc = sc.outer {
-					if sc.needStash || sc.isDynamic() || sc.c.debug {
+					if sc.needStash || sc.isDynamic() {
+						level++
+					} else if s.c.debug && len(sc.bindings) > 0 {
+						// In debug mode, allInStash=true forces every scope with bindings
+						// to emit an enterBlock that pushes a stash. Count these too.
 						level++
 					}
 				}
@@ -829,7 +832,7 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 			for scope, aps := range b.accessPoints {
 				var level int
 				for sc := scope; sc != nil && sc != s; sc = sc.outer {
-					if sc.needStash || sc.isDynamic() || sc.c.debug {
+					if sc.needStash || sc.isDynamic() {
 						level++
 					}
 				}
@@ -953,9 +956,30 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 	stashIdx := 0
 	stackIdx := 0
 
+	// Compute the stash nesting level of THIS scope relative to the enclosing
+	// function. The function scope itself is level 0. Each stash-creating block
+	// scope inside the function increments the level by 1.
+	// At runtime, vm.stash is the innermost; getValueFromLocation uses this to
+	// compute how many .outer hops are needed.
+	stashLevel := 0
+	if !s.isFunction() {
+		// Count all stash-creating scopes from our parent up to (not including)
+		// the function scope, then add 1 for ourselves.
+		for p := s.outer; p != nil && !p.isFunction(); p = p.outer {
+			if p.needStash || p.isDynamic() || (p.c != nil && p.c.debug && len(p.bindings) > 0) {
+				stashLevel++
+			}
+		}
+		// The current scope itself is one level deeper than whatever we counted.
+		if s.needStash || s.isDynamic() || (s.c != nil && s.c.debug && len(s.bindings) > 0) {
+			stashLevel++
+		}
+	}
+	// stashLevel=0 for the function scope, 1 for try/catch/block directly in function, etc.
+
 	// First, let's see ALL bindings to understand the mismatch
 	if debugCompiler {
-		fmt.Printf("[COMPILER-DEBUG] collectAllDebugSymbols: Processing %d bindings\n", len(s.bindings))
+		fmt.Printf("[COMPILER-DEBUG] collectAllDebugSymbols: Processing %d bindings (stashLevel=%d)\n", len(s.bindings), stashLevel)
 		for i, b := range s.bindings {
 			fmt.Printf("[COMPILER-DEBUG]   Binding[%d]: name=%s, inStash=%v, isArg=%v\n", i, b.name, b.inStash, b.isArg)
 		}
@@ -974,10 +998,11 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 		// Only create and emit debug symbols for user-visible variables (not 'this')
 		if !isThisBinding {
 			varLoc := VarLocation{
-				Name:    b.name.String(),
-				InStash: bindingInStash,
-				IsParam: b.isArg,
-				IsConst: b.isConst,
+				Name:       b.name.String(),
+				InStash:    bindingInStash,
+				IsParam:    b.isArg,
+				IsConst:    b.isConst,
+				StashLevel: stashLevel,
 			}
 
 			if bindingInStash {
@@ -1021,14 +1046,11 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 				minPC = scopeStart
 				maxPC = scopeEnd - 1
 			} else {
-				// Extend range: parameters and function-scoped variables should be
-				// visible from function start; all variables should be visible to function end
-				if b.isArg || s.funcType != funcNone {
-					// For function parameters and top-level function bindings,
-					// make visible from function start
-					if scopeStart < minPC {
-						minPC = scopeStart
-					}
+				// Extend range: all variables should be visible from their scope's
+				// start to end. This covers function parameters, block-scoped
+				// variables, and catch block parameters.
+				if scopeStart < minPC {
+					minPC = scopeStart
 				}
 				// Extend to end of scope for all variables
 				if maxPC < scopeEnd-1 {
@@ -1048,8 +1070,8 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 			}
 
 			if debugCompiler {
-				fmt.Printf("[COMPILER-DEBUG]   Debug symbol: %s, inStash=%v, stashIdx=%d, stackIdx=%d, PC range=[%d-%d]\n",
-					varLoc.Name, varLoc.InStash, varLoc.StashIdx, varLoc.StackIdx, minPC, maxPC)
+				fmt.Printf("[COMPILER-DEBUG]   Debug symbol: %s, inStash=%v, stashIdx=%d, stackIdx=%d, stashLevel=%d, PC range=[%d-%d]\n",
+					varLoc.Name, varLoc.InStash, varLoc.StashIdx, varLoc.StackIdx, varLoc.StashLevel, minPC, maxPC)
 			}
 		}
 

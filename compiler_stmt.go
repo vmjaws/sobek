@@ -1,6 +1,8 @@
 package sobek
 
 import (
+	"fmt"
+
 	"github.com/grafana/sobek/ast"
 	"github.com/grafana/sobek/file"
 	"github.com/grafana/sobek/token"
@@ -110,6 +112,10 @@ func (c *compiler) updateEnterBlock(enter *enterBlock) {
 			// ALWAYS populate the names map in debug mode
 			enter.names = scope.makeNamesMap()
 		}
+	}
+	if debugCompiler {
+		fmt.Printf("[UPDATE-ENTER-BLOCK] totalBindings=%d, stashSize=%d, stackSize=%d, isDynamic=%v, debug=%v, funcType=%d\n",
+			len(scope.bindings), stashSize, stackSize, scope.isDynamic(), c.debug, scope.funcType)
 	}
 	enter.stashSize, enter.stackSize = uint32(stashSize), uint32(stackSize)
 }
