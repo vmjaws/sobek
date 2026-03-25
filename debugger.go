@@ -742,6 +742,13 @@ type Debugger struct {
 	// lastException stores the most recent uncaught exception for exceptionInfo requests
 	lastException Value
 
+	// breakOnCaughtExceptions: pause on exceptions caught by try/catch ("All Exceptions" in IDE)
+	breakOnCaughtExceptions bool
+	// breakOnUncaughtExceptions: pause on uncaught exceptions ("Uncaught Exceptions" in IDE)
+	breakOnUncaughtExceptions bool
+	// exceptionBreakActive: true when debugger is paused due to an exception
+	exceptionBreakActive bool
+
 	// onPause is called when the debugger pauses the VM (entering activate()).
 	// k6 registers ExecutionState.Pause here so debug-pause time is excluded
 	// from iteration duration metrics. May be nil.
@@ -818,6 +825,7 @@ const (
 	DebuggerStatementActivation ActivationReason = "debugger"
 	BreakpointActivation        ActivationReason = "breakpoint"
 	StepActivation              ActivationReason = "step"
+	ExceptionActivation         ActivationReason = "exception"
 )
 
 type DebuggerActivation struct {
@@ -1156,34 +1164,62 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 
 	// CRITICAL FIX: Protect the send from panicking when the channel was
 	// closed by a concurrent Continue()/Next()/StepIn() call on another
-	// goroutine. This race happens during multi-VU instantiation: VU1's
-	// activate() picks up a channel from the global coordinator, but the
-	// DAP handler's Continue() call (for VU0's previous breakpoint) closes
-	// that same channel before VU1 can send on it.
-	//
-	// Recovery: If the channel was closed, the DAP side already moved on.
-	// We clean up and return so the VM continues executing without pausing.
-	sendOK := safeSendActivation(ch, DebuggerActivation{
-		Reason:   reason,
-		Filename: filename,
-		Line:     line,
-		ID:       id,
-		Epoch:    epoch,
-	})
-	if !sendOK {
+	// goroutine. If the channel is stale (closed), go back and wait for a
+	// fresh channel instead of skipping the pause.
+	for retries := 0; retries < 5; retries++ {
+		sendOK := safeSendActivation(ch, DebuggerActivation{
+			Reason:   reason,
+			Filename: filename,
+			Line:     line,
+			ID:       id,
+			Epoch:    epoch,
+		})
+		if sendOK {
+			break
+		}
 		if debugActivate {
-			fmt.Printf("[DEBUGGER-ACTIVATE] ⚠️ Channel was closed before send at %s:%d — skipping pause (concurrent Continue/Next/StepIn)\n",
-				filename, line)
+			fmt.Printf("[DEBUGGER-ACTIVATE] ⚠️ Channel was closed (stale) at %s:%d — retrying (attempt %d/5)\n",
+				filename, line, retries+1)
 		}
-		// Resume k6 timers since we didn't actually pause.
-		if globalDebugCoordinator.IsInitialized() {
-			globalDebugCoordinator.callResume()
-		} else if dbg.onResume != nil {
-			dbg.onResume()
+		// Wait for a fresh channel from Continue()
+		select {
+		case ch = <-dbg.activationCh:
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] Got fresh channel from local (retry)\n")
+			}
+			dbg.pendingCh = ch
+		case ch = <-globalDebugCoordinator.ActivationChannel():
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] Got fresh channel from global (retry)\n")
+			}
+			dbg.pendingCh = ch
+		case <-time.After(5 * time.Second):
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] ⚠️ Timeout waiting for fresh channel at %s:%d — resuming VM\n",
+					filename, line)
+			}
+			if globalDebugCoordinator.IsInitialized() {
+				globalDebugCoordinator.callResume()
+			} else if dbg.onResume != nil {
+				dbg.onResume()
+			}
+			dbg.pendingCh = nil
+			dbg.active = false
+			return
 		}
-		dbg.pendingCh = nil
-		dbg.active = false
-		return
+		// Check global step state on the fresh channel
+		globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := globalDebugCoordinator.GetGlobalStepState()
+		if globalNext || globalStepIn {
+			dbg.next = globalNext
+			dbg.stepIn = globalStepIn
+			dbg.steppingFilename = globalSteppingFile
+			if globalTargetDepth > 0 {
+				dbg.stepOverTargetDepth = globalTargetDepth
+			}
+			dbg.stepOverStartLine = line
+			dbg.userCommandIssued = true
+			globalDebugCoordinator.ClearGlobalStepState()
+		}
 	}
 
 	// Wait for Continue signal (close of ch).
@@ -3103,40 +3139,27 @@ func (dbg *Debugger) Evaluate(expr string) (Value, error) {
 		rootVal, err := dbg.getValue(parts[0])
 		if err == nil && rootVal != nil {
 			if _, isUnresolved := rootVal.(valueUnresolved); !isUnresolved {
-				var result Value
-				var evalErr error
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							evalErr = fmt.Errorf("property access panicked: %v", r)
-						}
-					}()
+				// Wrap property access in withSuppressedDebugger — obj.Get()
+				// can trigger JS getters which would re-enter vm.debug(),
+				// causing deadlocks or corrupted VM state.
+				result := dbg.withSuppressedDebugger(func() Value {
 					val := rootVal
 					for _, prop := range parts[1:] {
 						obj, ok := val.(*Object)
 						if !ok {
-							val = nil
-							return
+							return nil
 						}
 						propVal := obj.Get(prop)
 						if propVal == nil || propVal == _undefined {
-							val = _undefined
-							return
+							return _undefined
 						}
 						val = propVal
 					}
-					result = val
-				}()
-				if evalErr == nil && result != nil {
+					return val
+				})
+				if result != nil {
 					return result, nil
 				}
-				if evalErr != nil {
-					if dbg.enableDebugLogging {
-						fmt.Printf("[DEBUGGER] Evaluate('%s'): dot-chain root '%s' found but property access failed: %v\n", expr, parts[0], evalErr)
-					}
-					return nil, evalErr
-				}
-				return nil, fmt.Errorf("cannot access property '%s' on non-object value", expr)
 			}
 		}
 	}
@@ -3171,7 +3194,10 @@ func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
 						if isIndirect && !lifecycleFunctionKeys[nameStr] {
 							val = dbg.resolveIndirectValue(val)
 						}
-						if isSimpleIdentifier(nameStr) {
+						// Handle " this" → "this" (sobek stores class this-binding with leading space)
+						if strings.TrimSpace(nameStr) == "this" {
+							snap["this"] = val
+						} else if isSimpleIdentifier(nameStr) {
 							snap[nameStr] = val
 						}
 					}
@@ -3344,7 +3370,16 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 
 	var result Value
 	var evalErr error
-	result, evalErr = dbg.vm.r.RunProgram(prog)
+	// Suppress the debugger during eval execution. Exceptions from the eval
+	// (e.g., "decrypted is not defined") must NOT trigger BreakOnException
+	// or breakpoint checks — this is an internal debugger operation.
+	// Use a wrapper func with defer to ensure suppressDebugger is restored
+	// even if RunProgram panics.
+	func() {
+		dbg.suppressDebugger = true
+		defer func() { dbg.suppressDebugger = false }()
+		result, evalErr = dbg.vm.r.RunProgram(prog)
+	}()
 	if evalErr != nil {
 		if exc, ok := evalErr.(*Exception); ok {
 			evalErr = exc
@@ -3557,7 +3592,24 @@ func (dbg *Debugger) getValueFromLocation(varLoc VarLocation) (Value, error) {
 				}
 			}
 		}
-		// Variable name not found in any stash — block stash was popped
+		// Variable name not found in any named stash — either the block stash was
+		// popped OR the stash doesn't have a names map. The latter is common for
+		// class method function scopes where ' this' is stored without names.
+		// Fall back: scan for stashes WITHOUT names and try the StashIdx directly.
+		if varLoc.StashIdx >= 0 {
+			stashIdx := int(varLoc.StashIdx)
+			for s := dbg.vm.stash; s != nil; s = s.outer {
+				if s.names != nil {
+					continue // already checked by name above
+				}
+				if s.values != nil && stashIdx < len(s.values) {
+					val := s.values[stashIdx]
+					if val != nil && !isNullValue(val) {
+						return val, nil
+					}
+				}
+			}
+		}
 		return nil, fmt.Errorf("variable %s not found in stash chain", varLoc.Name)
 	}
 	// Stack-based variable
@@ -3609,7 +3661,13 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 		}
 
 		for _, varLoc := range varLocs {
-			if !isIdentifierLike(varLoc.Name) {
+			// Handle " this" (leading space) — sobek stores class `this` with
+			// a space prefix. Expose it as "this" so the user can inspect
+			// class instance properties (this.service, this.envId, etc.).
+			displayName := varLoc.Name
+			if strings.TrimSpace(varLoc.Name) == "this" {
+				displayName = "this"
+			} else if !isIdentifierLike(varLoc.Name) {
 				continue
 			}
 			// Wrap in recovery — getValueFromLocation calls resolveIndirectValue
@@ -3624,7 +3682,7 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 				}()
 				val, err := dbg.getValueFromLocation(varLoc)
 				if err == nil && val != nil && !isNullValue(val) {
-					locals[varLoc.Name] = val
+					locals[displayName] = val
 				}
 			}()
 		}
@@ -3980,6 +4038,38 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 		return nil, fmt.Errorf("variable '%s' not accessible (no execution context)", varName)
 	}
 
+	// FAST PATH: resolve "this" directly.
+	// Try stash FIRST — " this" (with space) in the stash is more reliable
+	// than stack[sb] because it works for arrow functions (lexical this
+	// captured from enclosing scope) and avoids stale stack values.
+	if varName == "this" {
+		for s := dbg.vm.stash; s != nil; s = s.outer {
+			if s.names == nil {
+				continue
+			}
+			for n, idx := range s.names {
+				if strings.TrimSpace(n.String()) == "this" {
+					actualIdx := int(idx & uint32(maskIndex))
+					if s.values != nil && actualIdx < len(s.values) {
+						v := s.values[actualIdx]
+						if v != nil && !isNullValue(v) {
+							return v, nil
+						}
+					}
+				}
+			}
+		}
+		// Fall back to stack frame base — works for regular methods
+		if dbg.vm.sb >= 0 && dbg.vm.sb < len(dbg.vm.stack) {
+			v := dbg.vm.stack[dbg.vm.sb]
+			if v != nil && !isNullValue(v) {
+				if _, isUnresolved := v.(valueUnresolved); !isUnresolved {
+					return v, nil
+				}
+			}
+		}
+	}
+
 	if retVal, found := dbg.returnValueCache[varName]; found {
 		if dbg.enableDebugLogging {
 			fmt.Printf("[DEBUGGER] getValue('%s'): Found in return value cache\n", varName)
@@ -4015,7 +4105,11 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 	if dbg.vm.prg != nil && dbg.vm.prg.debugSymbols != nil {
 		if varLocs, exists := dbg.vm.prg.debugSymbols.scopeMap[dbg.vm.pc]; exists {
 			for _, varLoc := range varLocs {
-				if varLoc.Name == varName {
+				// Match by name. For "this", also match " this" (sobek stores
+				// the class this-binding with a leading space).
+				nameMatch := varLoc.Name == varName ||
+					(varName == "this" && strings.TrimSpace(varLoc.Name) == "this")
+				if nameMatch {
 					// Use getValueFromLocation which does name-based stash lookup
 					val, err := dbg.getValueFromLocation(varLoc)
 					if err == nil && val != nil && !isNullValue(val) {
@@ -4321,3 +4415,84 @@ func (dbg *Debugger) GetLastException() (message string, stack string) {
 	}
 	return message, stack
 }
+
+// SetExceptionBreakpoints configures which exception types cause the debugger to pause.
+func (dbg *Debugger) SetExceptionBreakpoints(caught, uncaught bool) {
+	dbg.mu.Lock()
+	defer dbg.mu.Unlock()
+	dbg.breakOnCaughtExceptions = caught
+	dbg.breakOnUncaughtExceptions = uncaught
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] SetExceptionBreakpoints: caught=%v, uncaught=%v\n", caught, uncaught)
+	}
+}
+
+// BreakOnException is called by the VM's handleThrow when an exception occurs.
+// If the matching exception breakpoint is enabled, it pauses the VM.
+func (dbg *Debugger) BreakOnException(exceptionVal Value, caught bool) bool {
+	if dbg == nil || dbg.vm == nil || !dbg.vm.debugMode || dbg.suppressDebugger {
+		return false
+	}
+	if exceptionVal == nil {
+		return false
+	}
+
+	shouldBreak := false
+	if caught && dbg.breakOnCaughtExceptions {
+		shouldBreak = true
+	}
+	if !caught && dbg.breakOnUncaughtExceptions {
+		shouldBreak = true
+	}
+	if !shouldBreak {
+		return false
+	}
+
+	// Store the exception for exceptionInfo requests
+	dbg.lastException = exceptionVal
+	dbg.exceptionBreakActive = true
+
+	// Determine the current source location using existing helpers
+	filename := dbg.Filename()
+	line := dbg.Line()
+
+	// Only break in user files
+	if filename == "" {
+		dbg.exceptionBreakActive = false
+		return false
+	}
+	normFile := normalizeFilename(filename)
+	if !globalBreakpoints.FileHasBreakpoints(normFile) {
+		if dbg.steppingFilename == "" || normalizeFilename(dbg.steppingFilename) != normFile {
+			if dbg.cachedNormFile != normFile {
+				dbg.exceptionBreakActive = false
+				return false
+			}
+		}
+	}
+
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] BreakOnException: caught=%v, exception=%q, at %s:%d\n",
+			caught, exceptionVal.String(), filename, line)
+	}
+
+	// Pause the VM — blocks until user issues Continue/Step in the IDE
+	dbg.activateWithStepState(ExceptionActivation, filename, line, false, false)
+
+	dbg.exceptionBreakActive = false
+	return true
+}
+
+// IsExceptionBreak returns true if the debugger is currently paused due to an exception.
+func (dbg *Debugger) IsExceptionBreak() bool {
+	return dbg.exceptionBreakActive
+}
+
+// SuppressDebuggerFlag sets/clears the suppressDebugger flag.
+// When true, vm.debug() is a no-op — breakpoints, stepping, and exception
+// breaks are all skipped. Used by the DAP layer during property enumeration
+// (obj.Get(), obj.Keys()) to prevent re-entering the debugger from JS getters.
+func (dbg *Debugger) SuppressDebuggerFlag(suppress bool) {
+	dbg.suppressDebugger = suppress
+}
+

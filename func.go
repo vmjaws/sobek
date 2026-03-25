@@ -343,6 +343,32 @@ func (f *classFuncObject) _initFields(instance *Object) {
 			panic(ex)
 		}
 		vm.sp -= 2
+		// After the inner vm.runTry() exits, the debugger step flags may have
+		// been set by the user (e.g., step-over at a breakpoint inside the
+		// class field initializer). The VM-EXIT nested path clears them.
+		// We must NOT let vmExited=true / vmDoneCh closed survive — this VM
+		// is still alive (the constructor caller continues). Restore those
+		// two fields so the outer vm.debug() loop keeps running.
+		if vm.debugMode && vm.debugger != nil {
+			vm.debugger.vmExited = false
+			select {
+			case <-vm.debugger.vmDoneCh:
+				vm.debugger.vmDoneCh = make(chan struct{})
+			default:
+			}
+			// If step-over/step-in was active in the inner loop, update the
+			// target depth to the CURRENT depth (after popCtx). The old target
+			// was set inside the initializer at a deeper depth. The caller
+			// (e.g. chained method calls) needs atValidDepth=true to break.
+			if vm.debugger.next || vm.debugger.stepIn {
+				currentDepth := vm.debugger.callStackDepth()
+				vm.debugger.stepOverTargetDepth = currentDepth
+				if debugVM {
+					fmt.Printf("[INITFIELDS] Updated stepOverTargetDepth=%d after nested exit (next=%v, stepIn=%v, startLine=%d)\n",
+						currentDepth, vm.debugger.next, vm.debugger.stepIn, vm.debugger.stepOverStartLine)
+				}
+			}
+		}
 	}
 }
 

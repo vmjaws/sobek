@@ -729,6 +729,19 @@ func (vm *vm) runWithProfiler() bool {
 }
 
 func (vm *vm) debug() {
+	// Log every debug() entry when step flags are active — unconditionally
+	if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
+		funcName := ""
+		if vm.prg != nil {
+			funcName = string(vm.prg.funcName)
+		}
+		srcName := ""
+		if vm.prg != nil && vm.prg.src != nil {
+			srcName = vm.prg.src.Name()
+		}
+		fmt.Printf("[VM-DEBUG-ENTRY] debug() entered: func=%q, file=%s, PC=%d, next=%v, stepIn=%v, suppress=%v, depth=%d\n",
+			funcName, srcName, vm.pc, vm.debugger.next, vm.debugger.stepIn, vm.debugger.suppressDebugger, vm.debugger.callStackDepth())
+	}
 	if vm.profTracker != nil && !vm.runWithProfiler() {
 		return
 	}
@@ -1130,7 +1143,16 @@ func (vm *vm) debug() {
 						// The source map fix in compiler_stmt.go is the primary fix.
 						_ = isRetInstruction
 
-						shouldBreak = pcAdvanced && lineChanged && vmInValidState && isUserFile
+						// Skip control-flow-only instructions (same as step-over)
+						isControlFlowOnly := false
+						if vm.debugger.active && currentPC >= 0 && currentPC < len(vm.prg.code) {
+							switch vm.prg.code[currentPC].(type) {
+							case jump, *leaveBlock:
+								isControlFlowOnly = true
+							}
+						}
+
+						shouldBreak = pcAdvanced && lineChanged && vmInValidState && isUserFile && !isControlFlowOnly
 						breakReason = "stepIn"
 						if isLifecycleFunctionEntry && isUserFile && debugVM {
 							fmt.Printf("[VM-LIFECYCLE-ENTRY] 🎯 Lifecycle function entry detected at line %d (PC=0, prevPC=-1, sb=%d). vmInValidState forced to %v (would be %v without fix). shouldBreak=%v\n",
@@ -1192,7 +1214,20 @@ func (vm *vm) debug() {
 						// Treat this as valid state for lifecycle function entry.
 						isLifecycleFunctionEntry := currentPC == 0 && prevPC == -1
 						vmInValidState := vm.sb >= 0 || isLifecycleFunctionEntry
-						shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState && isUserFile
+
+						// Skip breaking on control-flow-only instructions (jump, leaveBlock, pop).
+						// The source map may map these to a source line inside a catch/finally block,
+						// but the VM is just jumping over it — the code on that line does not execute.
+						// Without this check, step-over falsely stops inside non-executing catch blocks.
+						isControlFlowOnly := false
+						if vm.debugger.active && currentPC >= 0 && currentPC < len(vm.prg.code) {
+							switch vm.prg.code[currentPC].(type) {
+							case jump, *leaveBlock:
+								isControlFlowOnly = true
+							}
+						}
+
+						shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState && isUserFile && !isControlFlowOnly
 						breakReason = "next"
 						if isLifecycleFunctionEntry && isUserFile && debugVM {
 							fmt.Printf("[VM-LIFECYCLE-ENTRY] 🎯 Lifecycle function entry (next) at line %d (PC=0, prevPC=-1, sb=%d). vmInValidState forced to %v. shouldBreak=%v\n",
@@ -1347,7 +1382,17 @@ func (vm *vm) debug() {
 		if pc < 0 || pc >= len(vm.prg.code) {
 			break
 		}
+		if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
+			fmt.Printf("[VM-EXEC] PC=%d, instr=%T, next=%v, stepIn=%v, suppress=%v, depth=%d\n",
+				pc, vm.prg.code[pc], vm.debugger.next, vm.debugger.stepIn, vm.debugger.suppressDebugger, len(vm.callStack))
+		}
 		vm.prg.code[pc].exec(vm)
+		if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
+			newPC := vm.pc
+			halted := vm.prg == nil || newPC < 0 || newPC >= len(vm.prg.code)
+			fmt.Printf("[VM-POST] PC=%d->%d, halted=%v, next=%v, suppress=%v, depth=%d\n",
+				pc, newPC, halted, vm.debugger.next, vm.debugger.suppressDebugger, len(vm.callStack))
+		}
 	}
 
 	// When a VM finishes executing with a step operation active, we need to decide
@@ -1387,29 +1432,16 @@ func (vm *vm) debug() {
 			// breaks at its first line, but does NOT re-step through module init code
 			GetGlobalCoordinator().SetWaitForFunctionEntry(true)
 		} else {
-			// VM exited at depth > 1 with step flags still active. This happens when:
-			// - An abort/exception propagated up from a nested function during step-over
-			// - The inner function's debug() loop ended but the outer function won't
-			//   re-enter debug() (the exception bypasses it via panic/recover)
-			//
-			// We MUST notify vmDoneCh and clear step flags here, otherwise Continue()
-			// spins forever waiting for an activation that will never come.
+			// VM exited at depth > 1 with step flags still active. This is a
+			// nested vm.runTry() (e.g., class field initializer). Do NOT clear
+			// the step flags — they were set by the user (step-over at a
+			// breakpoint inside the nested program) and must survive to the
+			// outer vm.debug() loop. The caller (_initFields) only resets
+			// vmExited/vmDoneCh.
 			if debugVM {
-				fmt.Printf("[VM-EXIT] 🔄 Step operation active at deep exit (next=%v, stepIn=%v, depth=%d) — notifying vmDoneCh and clearing step flags\n",
+				fmt.Printf("[VM-EXIT] 🔄 Step operation active at nested exit (next=%v, stepIn=%v, depth=%d) — preserving step flags for outer loop\n",
 					vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth())
 			}
-			vm.debugger.vmExited = true
-			if vm.debugger.vmDoneCh != nil {
-				select {
-				case <-vm.debugger.vmDoneCh:
-					// Already closed
-				default:
-					close(vm.debugger.vmDoneCh)
-				}
-			}
-			vm.debugger.next = false
-			vm.debugger.stepIn = false
-			GetGlobalCoordinator().ClearGlobalStepState()
 		}
 	} else if vm.debugger != nil && debugVM {
 		// Only log normal VM exits at shallow depths to avoid massive spam
@@ -1647,6 +1679,14 @@ func (vm *vm) handleThrow(arg interface{}) *Exception {
 
 		if tf.catchPos >= 0 {
 			// exception is caught
+			// Break on caught exception if the debugger has that filter enabled.
+			if vm.debugMode && vm.debugger != nil && ex != nil {
+				vm.debugger.BreakOnException(ex.val, true)
+				if debugVM {
+					fmt.Printf("[HANDLETHROW] After BreakOnException(caught): next=%v, stepIn=%v, suppress=%v, pc will be=%d, depth=%d\n",
+						vm.debugger.next, vm.debugger.stepIn, vm.debugger.suppressDebugger, int(tf.catchPos), len(vm.callStack))
+				}
+			}
 			vm.push(ex.val)
 			vm.pc = int(tf.catchPos)
 			tf.catchPos = -1
@@ -1671,6 +1711,10 @@ func (vm *vm) handleThrow(arg interface{}) *Exception {
 // In all other cases exceptions must be thrown using panic().
 func (vm *vm) throw(v interface{}) {
 	if ex := vm.handleThrow(v); ex != nil {
+		// Break on uncaught exception if the debugger has that filter enabled.
+		if vm.debugMode && vm.debugger != nil {
+			vm.debugger.BreakOnException(ex.val, false)
+		}
 		panic(ex)
 	}
 }

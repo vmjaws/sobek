@@ -150,6 +150,11 @@ func (c *compiler) compileTryStatement(v *ast.TryStatement, needResult bool) {
 		lbl2 := len(c.p.code) // jump over the catch block
 		c.emit(nil)
 		catchOffset = len(c.p.code) - lbl
+		// In debug mode, emit a source map entry for the catch block so the
+		// debugger shows the correct line when stepping after a caught exception.
+		if c.debug {
+			c.p.addSrcMap(int(v.Catch.Idx0()) - 1)
+		}
 		if v.Catch.Parameter != nil {
 			c.block = &block{
 				typ:   blockScope,
@@ -186,7 +191,7 @@ func (c *compiler) compileTryStatement(v *ast.TryStatement, needResult bool) {
 			c.compileFunctions(funcs)
 			c.compileStatements(list, bodyNeedResult)
 			c.leaveScopeBlock(enter)
-			if c.scope.dynLookup || c.scope.bindings[0].inStash {
+			if c.scope.dynLookup || c.scope.bindings[0].inStash || c.debug {
 				c.p.code[lbl+catchOffset] = &enterCatchBlock{
 					names:     enter.names,
 					stashSize: enter.stashSize,

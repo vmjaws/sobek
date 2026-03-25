@@ -995,10 +995,16 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 		// CRITICAL: Use the SAME logic as main loop: allInStash || b.inStash
 		bindingInStash := allInStash || b.inStash
 
-		// Only create and emit debug symbols for user-visible variables (not 'this')
-		if !isThisBinding {
+		// Create debug symbols for all bindings, including 'this'.
+		// For 'this' bindings (stored as " this" with leading space), use
+		// display name "this" so the IDE locals panel shows it correctly.
+		{
+			displayName := b.name.String()
+			if isThisBinding {
+				displayName = "this"
+			}
 			varLoc := VarLocation{
-				Name:       b.name.String(),
+				Name:       displayName,
 				InStash:    bindingInStash,
 				IsParam:    b.isArg,
 				IsConst:    b.isConst,

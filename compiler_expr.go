@@ -1880,6 +1880,7 @@ type clsElement struct {
 	initializer compiledExpr
 	body        *compiledFunctionLiteral
 	computed    bool
+	srcOffset   int // source position of this field/element for source maps
 }
 
 func (e *compiledClassLiteral) emitGetter(putOnStack bool) {
@@ -2022,6 +2023,9 @@ func (e *compiledClassLiteral) emitGetter(putOnStack bool) {
 		case *ast.FieldDefinition:
 			privateName, key, computed := e.processClassKey(elt.Key)
 			var el clsElement
+			if e.c.debug {
+				el.srcOffset = int(elt.Idx) - 1 // source position for stepping through fields
+			}
 			if elt.Initializer != nil {
 				el.initializer = e.c.compileExpression(elt.Initializer)
 			}
@@ -2241,6 +2245,11 @@ func (e *compiledClassLiteral) compileFieldsAndStaticBlocks(elements []clsElemen
 
 	valIdx := 0
 	for _, elt := range elements {
+		// In debug mode, emit a source map entry for each field so the
+		// debugger can step through field declarations line by line.
+		if e.c.debug && elt.srcOffset > 0 {
+			e.c.p.addSrcMap(elt.srcOffset)
+		}
 		if elt.body != nil {
 			e.c.emit(dup) // this
 			elt.body.emitGetter(true)
