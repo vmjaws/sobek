@@ -651,20 +651,21 @@ type Debugger struct {
 		pc         int
 		stackDepth int
 	}
-	next                bool
-	stepIn              bool
-	continuing          bool
-	stepOverTargetDepth int
-	stepOverStartLine   int
-	steppingFilename    string
-	enableDebugLogging  bool
-	skipPhaseEntryBreak bool
-	lifecycleTransition bool
-	userCommandIssued   bool
-	configuredCh        chan struct{}
-	waitingForConfig    bool
-	evalMutex           sync.Mutex
-	hasConnection       bool
+	next                        bool
+	stepIn                      bool
+	continuing                  bool
+	stepOverTargetDepth         int
+	stepOverOriginalTargetDepth int // the depth at which Next() was originally called — never overwritten by re-activation
+	stepOverStartLine           int
+	steppingFilename            string
+	enableDebugLogging          bool
+	skipPhaseEntryBreak         bool
+	lifecycleTransition         bool
+	userCommandIssued           bool
+	configuredCh                chan struct{}
+	waitingForConfig            bool
+	evalMutex                   sync.Mutex
+	hasConnection               bool
 
 	initPhase    bool
 	initFilename string
@@ -684,10 +685,30 @@ type Debugger struct {
 	cachedPC   int
 	cachedLine int
 
+	// PERF: cached source line split — avoids allocating a []string slice on every
+	// getSourceVarInfo cache miss. Keyed by prg pointer since source is stable per-Program.
+	cachedSourceLines    []string
+	cachedSourceLinesPrg *Program
+
+	// PERF: cached isUserFile result — avoids 3 lock acquisitions + string ops per instruction.
+	// Invalidated when vm.prg changes, when breakpoints change, or on phase/run reset.
+	cachedIsUserFile    bool
+	cachedIsUserFilePrg *Program
+
+	// PERF: cached normalizeFilenameForMatch result — avoids extension stripping per instruction.
+	cachedBaseFile    string
+	cachedBaseFilePrg *Program
+
 	// initComplete is a local monotonic copy of globalInitTracker.HasAnyInitCompleted().
 	// It is only ever flipped from false→true, never backwards, so once true we stop
 	// asking the global tracker entirely (eliminating an RLock per instruction).
 	initComplete bool
+
+	// initBPSnapshot is a read-only copy of globalInitTracker.initBreakpointSet,
+	// taken once when initComplete flips true. After that, all init-breakpoint
+	// lookups use this local map with zero lock acquisitions.
+	initBPSnapshot     map[initBPKey]bool
+	initBPSnapshotDone bool
 
 	// hasLocalBPs / hasGlobalBPs are set/cleared by SetBreakpoint/ClearBreakpoint.
 	// When both are false, breakpoint() returns immediately with no lock acquisitions.
@@ -832,6 +853,7 @@ type DebuggerActivation struct {
 	Reason   ActivationReason
 	Filename string
 	Line     int
+	Column   int // 1-based column from source map — enables VS Code token highlighting
 	ID       int
 	Epoch    uint64
 }
@@ -1171,6 +1193,7 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 			Reason:   reason,
 			Filename: filename,
 			Line:     line,
+			Column:   dbg.Column(),
 			ID:       id,
 			Epoch:    epoch,
 		})
@@ -1287,7 +1310,10 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 		dbg.lastBreakpoint.filename = filename
 		dbg.lastBreakpoint.pc = dbg.vm.pc
 		dbg.lastBreakpoint.stackDepth = savedCallDepth
+		// For lifecycle transitions, reset target depth to the new phase's depth
+		// and also reset the original target since this is a new stepping context
 		dbg.stepOverTargetDepth = savedCallDepth
+		dbg.stepOverOriginalTargetDepth = savedCallDepth
 
 		if userCommand {
 			dbg.steppingFilename = filename
@@ -1321,6 +1347,7 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 			// depth by the post-Continue code — don't overwrite it.
 			if dbg.stepOverTargetDepth == 0 || dbg.stepOverTargetDepth >= savedCallDepth {
 				dbg.stepOverTargetDepth = savedCallDepth
+				dbg.stepOverOriginalTargetDepth = savedCallDepth
 			}
 			if dbg.steppingFilename == "" {
 				dbg.steppingFilename = filename
@@ -1336,10 +1363,18 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 		dbg.next = savedNext
 		if dbg.next {
 			dbg.stepOverStartLine = line
-			dbg.stepOverTargetDepth = savedCallDepth
+			// FIXED: never let a re-activation during a step raise the target depth.
+			// Use the original target depth from when Next() was called, not savedCallDepth
+			// which may be deeper (inside a called function).
+			if dbg.stepOverOriginalTargetDepth > 0 {
+				dbg.stepOverTargetDepth = dbg.stepOverOriginalTargetDepth
+			} else if savedCallDepth < dbg.stepOverTargetDepth || dbg.stepOverTargetDepth == 0 {
+				dbg.stepOverTargetDepth = savedCallDepth
+			}
 			dbg.steppingFilename = filename
 			if debugActivate {
-				fmt.Printf("[DEBUGGER-ACTIVATE] Restored next=true, set stepOverStartLine=%d, targetDepth=%d\n", line, dbg.stepOverTargetDepth)
+				fmt.Printf("[DEBUGGER-ACTIVATE] Restored next=true, set stepOverStartLine=%d, targetDepth=%d (original=%d, saved=%d)\n",
+					line, dbg.stepOverTargetDepth, dbg.stepOverOriginalTargetDepth, savedCallDepth)
 			}
 		}
 		if debugActivate {
@@ -2072,6 +2107,9 @@ func (dbg *Debugger) SetBreakpoint(filename string, line int) (id int, err error
 	// Keep hasGlobalBPs in sync.
 	dbg.hasGlobalBPs = globalBreakpoints.Count() > 0
 
+	// Invalidate isUserFile cache — breakpoint changes affect the result.
+	dbg.cachedIsUserFilePrg = nil
+
 	if debugBP {
 		fmt.Printf("[DEBUGGER-SET-BP] ✅ Breakpoint added: id=%d, local=%d, globalCount=%d\n",
 			id, len(dbg.breakpoints[normalizedFilename]), globalBreakpoints.Count())
@@ -2104,6 +2142,8 @@ func (dbg *Debugger) ClearBreakpoint(filename string, line int) (err error) {
 
 	dbg.hasLocalBPs = len(dbg.breakpoints) > 0
 	dbg.hasGlobalBPs = globalBreakpoints.Count() > 0
+	// Invalidate isUserFile cache — breakpoint changes affect the result.
+	dbg.cachedIsUserFilePrg = nil
 	return
 }
 
@@ -2197,10 +2237,12 @@ func (dbg *Debugger) Next() error {
 
 	if gotValidState {
 		dbg.stepOverTargetDepth = targetDepth
+		dbg.stepOverOriginalTargetDepth = targetDepth // preserve authoritative value
 		dbg.stepOverStartLine = startLine
 		dbg.steppingFilename = steppingFilename
 	} else {
 		dbg.stepOverTargetDepth = dbg.lastBreakpoint.stackDepth
+		dbg.stepOverOriginalTargetDepth = dbg.stepOverTargetDepth
 		dbg.stepOverStartLine = 0
 		dbg.steppingFilename = ""
 		if debugContinue {
@@ -2246,7 +2288,8 @@ func (dbg *Debugger) ClearStepFlags() {
 	dbg.next = false
 	dbg.stepIn = false
 	dbg.stepOverStartLine = 0
-	dbg.continuing = true
+	dbg.stepOverOriginalTargetDepth = 0
+	dbg.continuing = false
 	dbg.userCommandIssued = true
 	// Invalidate per-pause snapshot — we're resuming.
 	dbg.pausedVarSnapshot = nil
@@ -2273,6 +2316,7 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 	dbg.userCommandIssued = false
 	dbg.skipPhaseEntryBreak = false
 	dbg.stepOverTargetDepth = 0
+	dbg.stepOverOriginalTargetDepth = 0
 	dbg.stepOverStartLine = 0
 	dbg.steppingFilename = ""
 
@@ -2317,6 +2361,10 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 	dbg.cachedNormFile = ""
 	dbg.cachedPC = -1
 	dbg.cachedLine = 0
+	dbg.cachedSourceLines = nil
+	dbg.cachedSourceLinesPrg = nil
+	dbg.cachedIsUserFilePrg = nil
+	dbg.cachedBaseFilePrg = nil
 
 	// VM exit state — reset for the new phase
 	dbg.vmExited = false
@@ -2327,6 +2375,11 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 	case <-dbg.activationCh:
 	default:
 	}
+	// CRITICAL: Also drain the global coordinator's activation channel.
+	// If a stale currentCh was sent to the global coordinator before the phase
+	// transition, it won't be drained by the local drain above. This prevents
+	// 0ms phantom handshakes on the first breakpoint of the new phase.
+	globalDebugCoordinator.DrainActivationChannel()
 	dbg.pendingCh = nil
 	dbg.currentCh = nil
 
@@ -2349,6 +2402,7 @@ func (dbg *Debugger) ResetForNewRun() {
 	dbg.userCommandIssued = false
 	dbg.skipPhaseEntryBreak = false
 	dbg.stepOverTargetDepth = 0
+	dbg.stepOverOriginalTargetDepth = 0
 	dbg.stepOverStartLine = 0
 	dbg.steppingFilename = ""
 
@@ -2365,6 +2419,8 @@ func (dbg *Debugger) ResetForNewRun() {
 	dbg.initPhase = false
 	dbg.initFilename = ""
 	dbg.initComplete = false
+	dbg.initBPSnapshot = nil
+	dbg.initBPSnapshotDone = false
 
 	// Conditional breakpoints
 	dbg.conditionalBPs = nil
@@ -2396,6 +2452,10 @@ func (dbg *Debugger) ResetForNewRun() {
 	dbg.cachedNormFile = ""
 	dbg.cachedPC = -1
 	dbg.cachedLine = 0
+	dbg.cachedSourceLines = nil
+	dbg.cachedSourceLinesPrg = nil
+	dbg.cachedIsUserFilePrg = nil
+	dbg.cachedBaseFilePrg = nil
 
 	// VM exit state — new run means a new VM lifecycle
 	dbg.vmExited = false
@@ -2426,6 +2486,7 @@ func (dbg *Debugger) ClearLocalStepState() {
 	dbg.stepIn = false
 	dbg.stepOverStartLine = 0
 	dbg.stepOverTargetDepth = 0
+	dbg.stepOverOriginalTargetDepth = 0
 	dbg.steppingFilename = ""
 	dbg.lifecycleTransition = false
 	dbg.pausedVarSnapshot = nil
@@ -2492,17 +2553,22 @@ func (dbg *Debugger) breakpoint() bool {
 		dbg.initComplete = globalInitTracker.HasAnyInitCompleted()
 	}
 	if dbg.initComplete {
-		globalInitTracker.mu.RLock()
-		// FIXED: use composite key — normalizedFilename is already computed above
-		hitGlobal := globalInitTracker.initBreakpointSet[initBPKey{normalizedFilename, line}]
-		var hitFile bool
-		if !hitGlobal {
-			if fs := globalInitTracker.initBreakpointsByFile[normalizedFilename]; fs != nil {
-				hitFile = fs[line]
+		// PERF: snapshot initBreakpointSet once into a local read-only map.
+		// This eliminates the RLock per instruction for the entire run after init.
+		// Gate on !dbg.initPhase so we don't snapshot too early in multi-file
+		// projects where one file's init completes while another is still running.
+		if !dbg.initBPSnapshotDone && !dbg.initPhase {
+			globalInitTracker.mu.RLock()
+			dbg.initBPSnapshot = make(map[initBPKey]bool, len(globalInitTracker.initBreakpointSet))
+			for k, v := range globalInitTracker.initBreakpointSet {
+				dbg.initBPSnapshot[k] = v
 			}
+			globalInitTracker.mu.RUnlock()
+			dbg.initBPSnapshotDone = true
 		}
-		globalInitTracker.mu.RUnlock()
-		if hitGlobal || hitFile {
+		// Zero-lock lookup from local snapshot
+		hitGlobal := dbg.initBPSnapshot[initBPKey{normalizedFilename, line}]
+		if hitGlobal {
 			if debugInit {
 				fmt.Printf("[BREAKPOINT-CHECK] Skipping init breakpoint at line %d in '%s' - already hit during init\n", line, normalizedFilename)
 			}
@@ -2545,8 +2611,7 @@ func (dbg *Debugger) breakpoint() bool {
 		skipReason := ""
 		if dbg.next {
 			startLine := dbg.stepOverStartLine
-			// PERF: inline callStackDepth — avoid function call overhead in hot path
-			currentDepth := len(dbg.vm.callStack)
+			// PERF: reuse currentDepth from line ~2551 — already computed above
 			targetDepth := dbg.stepOverTargetDepth
 			if startLine == line {
 				willStop = false
@@ -2579,8 +2644,11 @@ func (dbg *Debugger) getSourceLine(lineNum int) string {
 	if dbg.vm.prg == nil || dbg.vm.prg.src == nil {
 		return ""
 	}
-	source := dbg.vm.prg.src.Source()
-	lines := strings.Split(source, "\n")
+	if dbg.cachedSourceLinesPrg != dbg.vm.prg {
+		dbg.cachedSourceLines = strings.Split(dbg.vm.prg.src.Source(), "\n")
+		dbg.cachedSourceLinesPrg = dbg.vm.prg
+	}
+	lines := dbg.cachedSourceLines
 	if lineNum < 1 || lineNum > len(lines) {
 		return ""
 	}
@@ -2607,10 +2675,13 @@ func (dbg *Debugger) Line() int {
 	}
 	// PERF: cache line number per-PC — src.Position(sourceOffset(pc)) is expensive
 	// and Line() is called multiple times per instruction in the hot path.
-	if dbg.vm.pc == dbg.cachedPC && dbg.cachedLine != 0 {
+	// Gate on BOTH vm.pc AND vm.prg — different programs can reuse the same PC
+	// value (e.g. pc=0 at every function entry), which would serve stale data.
+	if dbg.vm.pc == dbg.cachedPC && dbg.vm.prg == dbg.cachedPrg && dbg.cachedLine != 0 {
 		return dbg.cachedLine
 	}
 	dbg.cachedPC = dbg.vm.pc
+	dbg.cachedPrg = dbg.vm.prg
 	dbg.cachedLine = dbg.vm.prg.src.Position(dbg.vm.prg.sourceOffset(dbg.vm.pc)).Line
 	return dbg.cachedLine
 }
@@ -2618,6 +2689,15 @@ func (dbg *Debugger) Line() int {
 func (dbg *Debugger) Filename() string {
 	dbg.refreshFilenameCache()
 	return dbg.cachedFilename
+}
+
+// Column returns the 1-based column number for the current PC.
+// NOT cached — only called from activate() which is off the hot path.
+func (dbg *Debugger) Column() int {
+	if dbg.vm.prg == nil || dbg.vm.prg.src == nil {
+		return 0
+	}
+	return dbg.vm.prg.src.Position(dbg.vm.prg.sourceOffset(dbg.vm.pc)).Column
 }
 
 func (dbg *Debugger) updateCurrentLine() {
@@ -2839,6 +2919,7 @@ func (dbg *Debugger) StepOut() error {
 	// the NEXT line at that depth will trigger a break.
 	dbg.next = true // use next's depth-gated break logic
 	dbg.stepOverTargetDepth = targetDepth
+	dbg.stepOverOriginalTargetDepth = targetDepth
 	dbg.stepOverStartLine = dbg.Line() // don't re-break on current line
 	dbg.steppingFilename = steppingFilename
 
@@ -2880,8 +2961,13 @@ func (dbg *Debugger) getSourceVarInfo(functionStartLine int) *sourceVarInfo {
 		declLines: make(map[string]int),
 	}
 
-	source := dbg.vm.prg.src.Source()
-	lines := strings.Split(source, "\n")
+	// PERF: cache the split lines keyed by prg pointer — source is stable per-Program.
+	// Avoids allocating a []string slice on every cache miss.
+	if dbg.cachedSourceLinesPrg != dbg.vm.prg {
+		dbg.cachedSourceLines = strings.Split(dbg.vm.prg.src.Source(), "\n")
+		dbg.cachedSourceLinesPrg = dbg.vm.prg
+	}
+	lines := dbg.cachedSourceLines
 
 	if currentLine < 0 || currentLine > len(lines) {
 		return info
@@ -3200,6 +3286,15 @@ func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
 						} else if isSimpleIdentifier(nameStr) {
 							snap[nameStr] = val
 						}
+					} else if dbg.vm.debugMode {
+						// Variable exists in stash but is nil (const/let before
+						// assignment, e.g. RHS threw). Show as undefined so
+						// hover/variables panel displays it instead of nothing.
+						if strings.TrimSpace(nameStr) == "this" {
+							// skip — uninitialized this is not useful
+						} else if isSimpleIdentifier(nameStr) {
+							snap[nameStr] = _undefined
+						}
 					}
 				}
 			}
@@ -3346,7 +3441,7 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 	}
 
 	globalObj := dbg.vm.r.globalObject
-	savedVars := make(map[string]Value)
+	savedVars := make(map[string]Value, len(varNames))
 	for i, name := range varNames {
 		nameUni := unistring.String(name)
 		if existingVal := safeGetGlobalProperty(globalObj, nameUni); existingVal != nil {
@@ -3479,6 +3574,7 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 	savedStepIn := dbg.stepIn
 	savedContinuing := dbg.continuing
 	savedStepOverTargetDepth := dbg.stepOverTargetDepth
+	savedStepOverOriginalTargetDepth := dbg.stepOverOriginalTargetDepth
 	savedStepOverStartLine := dbg.stepOverStartLine
 	savedSteppingFilename := dbg.steppingFilename
 	savedActive := dbg.active
@@ -3513,6 +3609,7 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 		dbg.stepIn = savedStepIn
 		dbg.continuing = savedContinuing
 		dbg.stepOverTargetDepth = savedStepOverTargetDepth
+		dbg.stepOverOriginalTargetDepth = savedStepOverOriginalTargetDepth
 		dbg.stepOverStartLine = savedStepOverStartLine
 		dbg.steppingFilename = savedSteppingFilename
 		dbg.active = savedActive
@@ -3683,6 +3780,14 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 				val, err := dbg.getValueFromLocation(varLoc)
 				if err == nil && val != nil && !isNullValue(val) {
 					locals[displayName] = val
+				} else if err != nil && strings.Contains(err.Error(), "uninitialized") {
+					// TDZ variable (let/const before assignment) — show as special string
+					// so the IDE displays it rather than hiding it entirely.
+					locals[displayName] = asciiString("(uninitialized)")
+				} else if err == nil && (val == nil || isNullValue(val)) {
+					// var hoisted as undefined, or let/const assigned undefined explicitly.
+					// Show as undefined so the user knows the variable exists.
+					locals[displayName] = _undefined
 				}
 			}()
 		}
@@ -3723,6 +3828,9 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 					val := dbg.vm.stash.values[actualIdx]
 					if val != nil && !isNullValue(val) {
 						locals[nameStr] = val
+					} else {
+						// Variable exists in stash but is undefined — show it
+						locals[nameStr] = _undefined
 					}
 				}
 			}
@@ -3730,6 +3838,10 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 
 		if dbg.enableDebugLogging {
 			fmt.Printf("[DEBUGGER] GetLocalVariables: collected %d function-local variables from debug symbols\n", len(locals))
+		}
+		// Expose $exception when paused on an exception — Node.js parity.
+		if dbg.exceptionBreakActive && dbg.lastException != nil {
+			locals["$exception"] = dbg.lastException
 		}
 		return locals, nil
 	}
@@ -3752,6 +3864,9 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 							val = dbg.resolveIndirectValue(val)
 						}
 						locals[nameStr] = val
+					} else {
+						// Variable exists but is undefined — show it
+						locals[nameStr] = _undefined
 					}
 				}
 			}
@@ -3760,6 +3875,11 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 
 	if dbg.enableDebugLogging {
 		fmt.Printf("[DEBUGGER] GetLocalVariables: collected %d variables (legacy mode)\n", len(locals))
+	}
+
+	// Expose $exception when paused on an exception — Node.js parity.
+	if dbg.exceptionBreakActive && dbg.lastException != nil {
+		locals["$exception"] = dbg.lastException
 	}
 
 	return locals, nil
@@ -4118,6 +4238,15 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 						}
 						return val, nil
 					}
+					// Variable exists but is nil/undefined (const/let before
+					// assignment, e.g. RHS threw). Return _undefined so hover
+					// shows the variable instead of nothing.
+					if err == nil && dbg.vm.debugMode {
+						if dbg.enableDebugLogging {
+							fmt.Printf("[DEBUGGER] getValue('%s'): Found via debug symbols but uninitialized, returning undefined\n", varName)
+						}
+						return _undefined, nil
+					}
 				}
 			}
 		}
@@ -4171,6 +4300,15 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 							}
 						}
 					}
+				}
+				// Variable name exists in stash but value is nil/undefined
+				// (const/let before assignment, e.g. RHS threw an exception).
+				// Return _undefined so hover/variables show it instead of nothing.
+				if dbg.vm.debugMode {
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] getValue('%s'): Found in stash level %d but uninitialized, returning undefined\n", varName, stashLevel)
+					}
+					return _undefined, nil
 				}
 			}
 		}
@@ -4385,6 +4523,7 @@ func (dbg *Debugger) RequestPause() {
 	dbg.stepIn = true
 	dbg.next = false
 	dbg.continuing = false
+	dbg.steppingFilename = "" // accept any file
 	dbg.mu.Unlock()
 }
 
@@ -4495,4 +4634,3 @@ func (dbg *Debugger) IsExceptionBreak() bool {
 func (dbg *Debugger) SuppressDebuggerFlag(suppress bool) {
 	dbg.suppressDebugger = suppress
 }
-

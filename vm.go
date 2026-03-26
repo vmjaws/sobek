@@ -765,6 +765,11 @@ func (vm *vm) debug() {
 
 	count := 0
 	interrupted := false
+	// lastExecPC tracks the PC of the most recently executed instruction.
+	// Unlike lastBreakpoint.pc (which is the PC where we last PAUSED), this
+	// reflects the actual previous instruction — needed to detect forward jumps
+	// from conditional/try-exit instructions that skip over catch blocks.
+	lastExecPC := -1
 	for {
 		if count == 0 {
 			if atomic.LoadInt32(&globalProfiler.enabled) == 1 && !vm.runWithProfiler() {
@@ -814,11 +819,14 @@ func (vm *vm) debug() {
 				// Use cached normalized filename (refreshed above)
 				normalizedFilename := vm.debugger.cachedNormFile
 
-				// CRITICAL: Check if ANY file's init was completed
-				// Skip ANY breakpoint that was hit during the original init - this handles both:
-				// 1. VU 0 teardown/handleSummary where initPhase is explicitly not set
-				// 2. Any other VU where module code runs before the target function
-				anyInitCompleted := GetGlobalInitTracker().HasAnyInitCompleted()
+				// PERF: Use the debugger's local monotonic initComplete flag
+				// instead of calling GetGlobalInitTracker().HasAnyInitCompleted()
+				// on every instruction (which acquires an RLock).
+				// initComplete is already maintained by breakpoint() in debugger.go.
+				if !vm.debugger.initComplete {
+					vm.debugger.initComplete = GetGlobalInitTracker().HasAnyInitCompleted()
+				}
+				anyInitCompleted := vm.debugger.initComplete
 
 				if anyInitCompleted {
 					// CRITICAL FIX: Do NOT skip breakpoints when stepIn is active
@@ -832,12 +840,28 @@ func (vm *vm) debug() {
 					// AND we're still potentially in module-level code (initPhase is true or we just started)
 					if !inStepMode {
 						currentLine := vm.debugger.Line()
-						// Check if this specific line was hit during init in ANY file
-						// This is important because during module evaluation the current file may be an import
-						// but the breakpoints were recorded for the main script
-						wasHitDuringInit := GetGlobalInitTracker().WasAnyBreakpointHitDuringInit(normalizedFilename, currentLine)
-						// The wasHitInThisFile check is now redundant (composite key covers it) — remove it:
-						// wasHitInThisFile := GetGlobalInitTracker().WasBreakpointHitDuringInit(normalizedFilename, currentLine)
+
+						// PERF: Use local initBPSnapshot instead of calling
+						// GetGlobalInitTracker().WasAnyBreakpointHitDuringInit()
+						// which acquires an RLock on every instruction.
+						// Take the snapshot once when initComplete first becomes true.
+						if !vm.debugger.initBPSnapshotDone && !vm.debugger.initPhase {
+							globalInitTracker.mu.RLock()
+							vm.debugger.initBPSnapshot = make(map[initBPKey]bool, len(globalInitTracker.initBreakpointSet))
+							for k, v := range globalInitTracker.initBreakpointSet {
+								vm.debugger.initBPSnapshot[k] = v
+							}
+							globalInitTracker.mu.RUnlock()
+							vm.debugger.initBPSnapshotDone = true
+						}
+
+						var wasHitDuringInit bool
+						if vm.debugger.initBPSnapshotDone {
+							wasHitDuringInit = vm.debugger.initBPSnapshot[initBPKey{normalizedFilename, currentLine}]
+						} else {
+							wasHitDuringInit = GetGlobalInitTracker().WasAnyBreakpointHitDuringInit(normalizedFilename, currentLine)
+						}
+
 						if wasHitDuringInit {
 							skipBreakpoints = true
 							if vmDebugEnabled {
@@ -989,13 +1013,14 @@ func (vm *vm) debug() {
 
 					// CRITICAL: Check if current file is a "user file" (has breakpoints or is the stepping source)
 					// This prevents stepping through internal k6 code like handleSummary
+					//
+					// PERF: The expensive checks (breakpoint lookups, extension checks,
+					// normalizeFilenameForMatch) are cached per vm.prg. Only the cheap
+					// stepping-filename comparison runs on every instruction.
 					isUserFile := false
 					steppingFilename := vm.debugger.steppingFilename
 
-					normalizedSteppingFilename := steppingFilename
-					if strings.HasPrefix(normalizedSteppingFilename, "file://") {
-						normalizedSteppingFilename = strings.TrimPrefix(normalizedSteppingFilename, "file://")
-					}
+					normalizedSteppingFilename := normalizeFilename(steppingFilename)
 
 					// CRITICAL FIX: Skip debugging for internal eval code (like summary wrapper)
 					// The <eval> filename indicates runtime-generated code that shouldn't be debugged
@@ -1042,8 +1067,6 @@ func (vm *vm) debug() {
 							//   This is the key fix: step-over should step OVER function calls into non-user code
 							vm.debugger.stepIn = false
 							// DON'T clear next here - let step-over continue when we return
-							// vm.debugger.next = false
-							// vm.debugger.steppingFilename = ""
 							// Skip further breakpoint processing for this instruction
 							goto executeInstruction
 						} else if vm.debugger.stepIn {
@@ -1053,49 +1076,87 @@ func (vm *vm) debug() {
 						}
 					}
 
-					// Check if current file is the stepping file OR has breakpoints OR is a user source file
-					if normalizedCurrentFilename == normalizedSteppingFilename && normalizedSteppingFilename != "" {
-						isUserFile = true
+					// PERF: Use cached isUserFile result when vm.prg hasn't changed.
+					// The cache covers breakpoint lookups (RLock), FileHasBreakpoints,
+					// extension checks, and normalizeFilenameForMatch — all expensive.
+					// Only the stepping-filename match (cheap string ==) runs uncached.
+					if vm.prg == vm.debugger.cachedIsUserFilePrg {
+						isUserFile = vm.debugger.cachedIsUserFile
+						// Cheap: also check stepping filename match (not cached since it changes per-step)
+						if !isUserFile && normalizedCurrentFilename == normalizedSteppingFilename && normalizedSteppingFilename != "" {
+							isUserFile = true
+						}
 					} else {
-						// PERF: Use FileHasBreakpoints() instead of GetAllBreakpoints()
-						if GetGlobalBreakpoints().FileHasBreakpoints(normalizedCurrentFilename) {
+						// Check if current file is the stepping file OR has breakpoints OR is a user source file
+						if normalizedCurrentFilename == normalizedSteppingFilename && normalizedSteppingFilename != "" {
 							isUserFile = true
+						} else {
+							// PERF: Use FileHasBreakpoints() instead of GetAllBreakpoints()
+							if GetGlobalBreakpoints().FileHasBreakpoints(normalizedCurrentFilename) {
+								isUserFile = true
+							}
+							vm.debugger.breakpointMutex.RLock()
+							if _, hasLocalBP := vm.debugger.breakpoints[normalizedCurrentFilename]; hasLocalBP {
+								isUserFile = true
+							}
+							vm.debugger.breakpointMutex.RUnlock()
+							// Also check if it looks like a user source file by extension and path
+							// This allows stepping into imported modules from the same project
+							if !isUserFile {
+								isUserFile = (strings.HasSuffix(normalizedCurrentFilename, ".ts") ||
+									strings.HasSuffix(normalizedCurrentFilename, ".js") ||
+									strings.HasSuffix(normalizedCurrentFilename, ".mjs")) &&
+									strings.HasPrefix(normalizedCurrentFilename, "/") &&
+									!strings.Contains(normalizedCurrentFilename, "node_modules")
+							}
 						}
-						vm.debugger.breakpointMutex.RLock()
-						if _, hasLocalBP := vm.debugger.breakpoints[normalizedCurrentFilename]; hasLocalBP {
-							isUserFile = true
+
+						// Fuzzy match for .ts -> .js transpilation
+						// PERF: Cache normalizeFilenameForMatch result per-prg
+						if vm.debugger.cachedBaseFilePrg != vm.prg {
+							vm.debugger.cachedBaseFile = normalizeFilenameForMatch(normalizedCurrentFilename)
+							vm.debugger.cachedBaseFilePrg = vm.prg
 						}
-						vm.debugger.breakpointMutex.RUnlock()
-						// Also check if it looks like a user source file by extension and path
-						// This allows stepping into imported modules from the same project
+						baseCurrentFile := vm.debugger.cachedBaseFile
+
+						if !isUserFile && normalizedSteppingFilename != "" {
+							if baseCurrentFile == normalizeFilenameForMatch(normalizedSteppingFilename) {
+								isUserFile = true
+							}
+						}
+
+						// Also check globalBPs with fuzzy match (both .ts and .js variants)
 						if !isUserFile {
-							isUserFile = (strings.HasSuffix(normalizedCurrentFilename, ".ts") ||
+							for _, ext := range []string{".ts", ".js", ".mjs", ".tsx"} {
+								if GetGlobalBreakpoints().FileHasBreakpoints(baseCurrentFile + ext) {
+									isUserFile = true
+									break
+								}
+							}
+						}
+
+						// Cache the result (without the stepping filename match).
+						// The stepping filename is checked cheaply above on cache hit.
+						cachedResult := isUserFile
+						// If isUserFile is true ONLY because of stepping filename match,
+						// cache false (the stepping match is done separately on cache hit).
+						if isUserFile && normalizedCurrentFilename == normalizedSteppingFilename && normalizedSteppingFilename != "" {
+							// Check if it would be true without the stepping match
+							hasBP := GetGlobalBreakpoints().FileHasBreakpoints(normalizedCurrentFilename)
+							vm.debugger.breakpointMutex.RLock()
+							_, hasLocal := vm.debugger.breakpoints[normalizedCurrentFilename]
+							vm.debugger.breakpointMutex.RUnlock()
+							isExtUser := (strings.HasSuffix(normalizedCurrentFilename, ".ts") ||
 								strings.HasSuffix(normalizedCurrentFilename, ".js") ||
 								strings.HasSuffix(normalizedCurrentFilename, ".mjs")) &&
 								strings.HasPrefix(normalizedCurrentFilename, "/") &&
 								!strings.Contains(normalizedCurrentFilename, "node_modules")
-						}
-					}
-
-					// Fuzzy match for .ts -> .js transpilation
-					if !isUserFile && normalizedSteppingFilename != "" {
-						if normalizeFilenameForMatch(normalizedCurrentFilename) == normalizeFilenameForMatch(normalizedSteppingFilename) {
-							isUserFile = true
-						}
-					}
-
-					// Also check globalBPs with fuzzy match (both .ts and .js variants)
-					// PERF: Use FileHasBreakpoints with both .ts/.js variants instead of
-					// iterating all breakpoints with GetAllBreakpoints().
-					if !isUserFile {
-						baseCurrentFile := normalizeFilenameForMatch(normalizedCurrentFilename)
-						// Try common extensions against the base name
-						for _, ext := range []string{".ts", ".js", ".mjs", ".tsx"} {
-							if GetGlobalBreakpoints().FileHasBreakpoints(baseCurrentFile + ext) {
-								isUserFile = true
-								break
+							if !hasBP && !hasLocal && !isExtUser {
+								cachedResult = false // only true due to stepping match
 							}
 						}
+						vm.debugger.cachedIsUserFile = cachedResult
+						vm.debugger.cachedIsUserFilePrg = vm.prg
 					}
 
 					if vm.debugger.stepIn {
@@ -1145,10 +1206,27 @@ func (vm *vm) debug() {
 
 						// Skip control-flow-only instructions (same as step-over)
 						isControlFlowOnly := false
-						if vm.debugger.active && currentPC >= 0 && currentPC < len(vm.prg.code) {
+						if currentPC >= 0 && currentPC < len(vm.prg.code) {
 							switch vm.prg.code[currentPC].(type) {
-							case jump, *leaveBlock:
+							case jump, *leaveBlock, *enterCatchBlock, leaveTry, enterFinally:
 								isControlFlowOnly = true
+							}
+						}
+						// Same forward-jump detection as step-over (see comments there).
+						// NOTE: Use lastExecPC (the actual last executed instruction's PC),
+						// NOT prevPC (which is the last BREAKPOINT PC and may be stale).
+						if !isControlFlowOnly && lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
+							switch vm.prg.code[lastExecPC].(type) {
+							case leaveTry, enterFinally:
+								isControlFlowOnly = true
+							case jump:
+								if currentPC > lastExecPC {
+									isControlFlowOnly = true
+								}
+							case jneP, jeqP, jne, jeq, jdef, jdefP:
+								if currentPC > lastExecPC+10 {
+									isControlFlowOnly = true
+								}
 							}
 						}
 
@@ -1215,15 +1293,44 @@ func (vm *vm) debug() {
 						isLifecycleFunctionEntry := currentPC == 0 && prevPC == -1
 						vmInValidState := vm.sb >= 0 || isLifecycleFunctionEntry
 
-						// Skip breaking on control-flow-only instructions (jump, leaveBlock, pop).
+						// Skip breaking on control-flow-only instructions.
 						// The source map may map these to a source line inside a catch/finally block,
 						// but the VM is just jumping over it — the code on that line does not execute.
 						// Without this check, step-over falsely stops inside non-executing catch blocks.
+						// NOTE: The gate must NOT be vm.debugger.active — active=true only when paused,
+						// so it's always false during the instruction loop. Check the PC directly.
 						isControlFlowOnly := false
-						if vm.debugger.active && currentPC >= 0 && currentPC < len(vm.prg.code) {
+						if currentPC >= 0 && currentPC < len(vm.prg.code) {
 							switch vm.prg.code[currentPC].(type) {
-							case jump, *leaveBlock:
+							case jump, *leaveBlock, *enterCatchBlock, leaveTry, enterFinally:
 								isControlFlowOnly = true
+							}
+						}
+						// Also detect large forward jumps that skip over try-catch blocks.
+						// The source map often maps the post-try cleanup PC to the catch/finally
+						// source line, causing false breaks in non-executing catch blocks.
+						//
+						// NOTE: Use lastExecPC (the actual last executed instruction's PC),
+						// NOT prevPC (which is the last BREAKPOINT PC and may be stale).
+						// Check 1: Previous instruction was leaveTry/enterFinally (explicit try exit).
+						// Check 2: Previous instruction was a forward jump (conditional or unconditional)
+						//          that crossed more than 10 instructions — this strongly suggests a
+						//          block-skip (try-catch, if-block with embedded try) rather than a
+						//          simple 2-5 instruction if/else branch.
+						if !isControlFlowOnly && lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
+							switch vm.prg.code[lastExecPC].(type) {
+							case leaveTry, enterFinally:
+								isControlFlowOnly = true
+							case jump:
+								if currentPC > lastExecPC {
+									isControlFlowOnly = true
+								}
+							case jneP, jeqP, jne, jeq, jdef, jdefP:
+								// Large forward conditional jumps (>10 PCs) indicate block-skips
+								// (try-catch, switch, etc.), not simple if/else branches.
+								if currentPC > lastExecPC+10 {
+									isControlFlowOnly = true
+								}
 							}
 						}
 
@@ -1262,36 +1369,31 @@ func (vm *vm) debug() {
 						// and continue stepping when we return to user code at the correct depth
 						// The next flag will be cleared when we actually break (in the shouldBreak block below)
 					} else {
-						// For regular breakpoint: break if location changed OR if not in continuing mode
-						// When continuing=true, we need to make sure we actually move away from the current location
-						// NOTE: For sameLocation, we check line and filename, NOT PC.
-						// PC can advance multiple times on the same source line (e.g., function calls with multiple instructions)
-						// so checking PC would require multiple Continue clicks for complex lines.
-						sameLocation := prevFilename == currentFilename &&
-							prevLine == currentLine
+						// For regular breakpoint: break if location changed from where we last paused.
+						// Use the exact PC + line + filename to detect same-location, not just the
+						// `continuing` flag which was broken (cleared on first instruction).
+						//
+						// The PC-based check correctly handles the case where Continue() is pressed
+						// and the first instruction re-evaluated is the same breakpoint — we skip it
+						// once, then on the next different-location instruction we break.
+						alreadyPausedHere := prevFilename == currentFilename &&
+							prevLine == currentLine &&
+							prevPC == currentPC
 
-						// If we're continuing and at the exact same source line, skip this break
-						// This prevents the "requires 2 clicks" issue on complex lines like function calls
-						if vm.debugger.continuing && sameLocation {
+						if alreadyPausedHere {
 							shouldBreak = false
-							breakReason = "continuing-skip-same-line"
-							// Clear the continuing flag immediately after the first check
-							// This ensures we only skip the breakpoint check once at the initial location
-							vm.debugger.continuing = false
-							if vm.debugger.enableDebugLogging {
-								fmt.Printf("[VM] Cleared continuing flag after skipping same line (PC %d->%d, line %d)\n",
-									prevPC, currentPC, currentLine)
-							}
+							breakReason = "same-location-skip"
 						} else {
-							// Different location or not continuing - break normally
 							locationChanged := prevFilename != currentFilename || prevLine != currentLine
 							shouldBreak = locationChanged
 							breakReason = "breakpoint"
-							// No need to clear continuing here since it was already cleared above
 						}
+						// Clear continuing unconditionally — it's now redundant with the PC check
+						// but we clear it for cleanliness so other code paths don't see stale state.
+						vm.debugger.continuing = false
 						if vm.debugger.enableDebugLogging {
-							fmt.Printf("[VM] breakpoint check: continuing=%v, sameLocation=%v (file:%v line:%v PC:%d->%d), shouldBreak=%v, reason=%s\n",
-								vm.debugger.continuing, sameLocation, prevFilename == currentFilename, prevLine == currentLine, prevPC, currentPC, shouldBreak, breakReason)
+							fmt.Printf("[VM] breakpoint check: alreadyPausedHere=%v (file:%v line:%v PC:%d->%d), shouldBreak=%v, reason=%s\n",
+								alreadyPausedHere, prevFilename == currentFilename, prevLine == currentLine, prevPC, currentPC, shouldBreak, breakReason)
 						}
 					}
 
@@ -1369,9 +1471,10 @@ func (vm *vm) debug() {
 				// without breakpoints (like a function call) and then returns to breakpoint-having code,
 				// we need to preserve the last known breakpoint location to detect if we're still on
 				// the same line or have moved to a new location.
-				if vm.debugger != nil {
-					vm.debugger.lastBreakpoint.stackDepth = vm.debugger.callStackDepth()
-				}
+				//
+				// PERF: lastBreakpoint.stackDepth is updated inside the shouldBreak block
+				// (along with line/filename/pc) and in activate(). No need to update it
+				// on every instruction — it only matters at pause points.
 			}
 		}
 	executeInstruction:
@@ -1382,6 +1485,8 @@ func (vm *vm) debug() {
 		if pc < 0 || pc >= len(vm.prg.code) {
 			break
 		}
+		// Track actual previous instruction PC for forward-jump detection.
+		lastExecPC = pc
 		if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
 			fmt.Printf("[VM-EXEC] PC=%d, instr=%T, next=%v, stepIn=%v, suppress=%v, depth=%d\n",
 				pc, vm.prg.code[pc], vm.debugger.next, vm.debugger.stepIn, vm.debugger.suppressDebugger, len(vm.callStack))

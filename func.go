@@ -356,16 +356,31 @@ func (f *classFuncObject) _initFields(instance *Object) {
 				vm.debugger.vmDoneCh = make(chan struct{})
 			default:
 			}
-			// If step-over/step-in was active in the inner loop, update the
-			// target depth to the CURRENT depth (after popCtx). The old target
-			// was set inside the initializer at a deeper depth. The caller
-			// (e.g. chained method calls) needs atValidDepth=true to break.
+			// If step-over/step-in was active in the inner loop, we must be careful
+			// NOT to corrupt stepOverTargetDepth when the step was initiated OUTSIDE
+			// the initializer (at a shallower depth). The original target depth is
+			// preserved in stepOverOriginalTargetDepth. Only update if the user
+			// started a NEW step operation INSIDE the initializer (which would have
+			// set stepOverOriginalTargetDepth deeper than where we are now).
 			if vm.debugger.next || vm.debugger.stepIn {
 				currentDepth := vm.debugger.callStackDepth()
-				vm.debugger.stepOverTargetDepth = currentDepth
-				if debugVM {
-					fmt.Printf("[INITFIELDS] Updated stepOverTargetDepth=%d after nested exit (next=%v, stepIn=%v, startLine=%d)\n",
-						currentDepth, vm.debugger.next, vm.debugger.stepIn, vm.debugger.stepOverStartLine)
+				origTarget := vm.debugger.stepOverOriginalTargetDepth
+				// Only update if the step was initiated inside the initializer
+				// (origTarget >= currentDepth means it was set at this depth or deeper).
+				// If origTarget < currentDepth (step was at shallower depth), preserve it.
+				if origTarget == 0 || origTarget >= currentDepth {
+					vm.debugger.stepOverTargetDepth = currentDepth
+					if debugVM {
+						fmt.Printf("[INITFIELDS] Updated stepOverTargetDepth=%d after nested exit (next=%v, stepIn=%v, startLine=%d, origTarget=%d)\n",
+							currentDepth, vm.debugger.next, vm.debugger.stepIn, vm.debugger.stepOverStartLine, origTarget)
+					}
+				} else {
+					// Step was initiated outside — restore the original target depth.
+					vm.debugger.stepOverTargetDepth = origTarget
+					if debugVM {
+						fmt.Printf("[INITFIELDS] Preserved stepOverTargetDepth=%d after nested exit (next=%v, stepIn=%v, startLine=%d, currentDepth=%d)\n",
+							origTarget, vm.debugger.next, vm.debugger.stepIn, vm.debugger.stepOverStartLine, currentDepth)
+					}
 				}
 			}
 		}
