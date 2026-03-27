@@ -834,7 +834,14 @@ func (vm *vm) debug() {
 					// In this case, we're inside a function, not executing module-level init code
 					// Breakpoints inside functions should work even if the same line number
 					// was hit during init (because it's a DIFFERENT execution context)
-					inStepMode := vm.debugger.stepIn || vm.debugger.next
+					//
+					// FIX #3: Only skip init-BP dedup when we're actually inside a lifecycle
+					// function body (vm.sb >= 0 and call depth >= 1), not just because step
+					// flags happen to be set. For VU0 reusing the same VM across phases
+					// (setup → teardown → handleSummary), stale step flags from a previous
+					// phase could incorrectly skip init-BP dedup during module-level code.
+					inLifecycleBody := vm.sb >= 0 && vm.debugger.callStackDepth() >= 1
+					inStepMode := (vm.debugger.stepIn || vm.debugger.next) && inLifecycleBody
 
 					// Only apply init breakpoint skipping if we're NOT in step mode
 					// AND we're still potentially in module-level code (initPhase is true or we just started)
@@ -903,6 +910,18 @@ func (vm *vm) debug() {
 				// This ensures MarkInitCompleted works even if SetInitPhase(true) was called
 				// before the program was loaded
 				isUserFile := hasGlobalBP || hasLocalBP || hasNormalizedLocalBP
+
+				// FIX: Also consider it a user file if ANY global breakpoints exist.
+				// In bundled TypeScript (esbuild), all code is in a single vm.prg
+				// with src.Name() pointing to the main bundle file. Breakpoints set
+				// on imported files (e.g., CcsApi.ts) won't match the bundle filename,
+				// but breakpoint() correctly checks source-mapped line numbers.
+				// Without this, skipBreakpoints=true prevents breakpoint() from ever
+				// being called, and breakpoints in imported files never fire.
+				if !isUserFile && hasAnyGlobalBP {
+					isUserFile = true
+				}
+
 				if isUserFile && vm.debugger.initFilename == "" {
 					vm.debugger.initFilename = normalizedFilename
 				}
@@ -934,47 +953,53 @@ func (vm *vm) debug() {
 			if vm.prg != nil && vm.prg.src != nil {
 				// CRITICAL: Inherit global step state if this VM doesn't have local step state
 				// This allows step-over/step-in to work across VM transitions (e.g., init -> setup)
-				// BUT: Skip inheriting step state after init has completed
-				// This prevents VU 0 (setup/teardown) from stepping through its own module init code
-				// The setup/teardown stepping is controlled by EnableStepIn() called in runPart()
+				//
+				// FIX #5: Allow inheritance when the coordinator has explicit step state
+				// regardless of init completion. Previously, the !anyInitCompleted guard
+				// blocked VU1 from inheriting step state set during VU0's setup pause.
+				// The init-skip logic below (justInheritedStepState) handles not stopping
+				// at module-level init code.
 				justInheritedStepState := false
 				if !vm.debugger.next && !vm.debugger.stepIn {
-					// CRITICAL FIX: Once init is complete globally, DON'T inherit global step state
-					// The stepping for setup/teardown/default is controlled by LOCAL EnableStepIn()
-					// This prevents stepping through module initialization code of new VUs
-					anyInitCompleted := GetGlobalInitTracker().HasAnyInitCompleted()
+					// FIX #1: Use the already-cached initComplete flag (updated ~20 lines above)
+					// instead of calling HasAnyInitCompleted() again which acquires a redundant RLock.
+					anyInitCompleted := vm.debugger.initComplete
 
-					// Only inherit global step state during the FIRST init phase (when no init has completed yet)
-					// After init completes, stepping should be controlled locally by EnableStepIn()
-					if !anyInitCompleted && GetGlobalCoordinator().HasGlobalStepState() {
-						globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := GetGlobalCoordinator().GetGlobalStepState()
-						if globalNext || globalStepIn {
-							vm.debugger.next = globalNext
-							vm.debugger.stepIn = globalStepIn
-							vm.debugger.steppingFilename = globalSteppingFile
-							vm.debugger.stepOverTargetDepth = vm.debugger.callStackDepth() // Reset to current depth for new VM
-							// For new VM entry, the target depth should be current depth (1) since we're at function entry
-							if globalTargetDepth > 0 && vm.debugger.stepOverTargetDepth == 0 {
-								vm.debugger.stepOverTargetDepth = 1
-							}
-							justInheritedStepState = true
+					// FIX #4: Read global step state once instead of two separate lock acquisitions
+					// (HasGlobalStepState then GetGlobalStepState). We need the values anyway.
+					globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := GetGlobalCoordinator().GetGlobalStepState()
+					hasGlobalStep := globalNext || globalStepIn
 
-							// CRITICAL FIX: Initialize lastBreakpoint to current position when inheriting step state
-							// This prevents the first instruction from being seen as a "line change" (from line 0 to line 1)
-							// which would cause an immediate spurious break at the module entry point
-							vm.debugger.lastBreakpoint.line = vm.debugger.Line()
-							vm.debugger.lastBreakpoint.pc = vm.pc
-							vm.debugger.lastBreakpoint.filename = vm.debugger.Filename()
-							vm.debugger.lastBreakpoint.stackDepth = vm.debugger.callStackDepth()
+					// Allow step state inheritance if:
+					// - Init hasn't completed yet (early phase — stepping through init), OR
+					// - The coordinator has explicit step state (user issued a step command
+					//   that needs to transfer across VM/VU boundaries, e.g., VU0→VU1)
+					shouldInherit := !anyInitCompleted || hasGlobalStep
 
-							if vm.debugger.enableDebugLogging {
-								fmt.Printf("[VM] Inherited global step state: next=%v, stepIn=%v, file=%s, targetDepth=%d\n",
-									globalNext, globalStepIn, globalSteppingFile, vm.debugger.stepOverTargetDepth)
-							}
-							// When inheriting step state into a new VM, clear the global state
-							// This prevents duplicate breaks across VM transitions
-							GetGlobalCoordinator().ClearGlobalStepState()
+					if shouldInherit && (globalNext || globalStepIn) {
+						vm.debugger.next = globalNext
+						vm.debugger.stepIn = globalStepIn
+						vm.debugger.steppingFilename = globalSteppingFile
+						vm.debugger.stepOverTargetDepth = vm.debugger.callStackDepth()
+						if globalTargetDepth > 0 && vm.debugger.stepOverTargetDepth == 0 {
+							vm.debugger.stepOverTargetDepth = 1
 						}
+						// FIX #2: Set stepOverOriginalTargetDepth so that activateWithStepState's
+						// "no user command" branch uses the correct depth instead of falling back
+						// to savedCallDepth (which can corrupt the target depth mid-step).
+						vm.debugger.stepOverOriginalTargetDepth = vm.debugger.stepOverTargetDepth
+						justInheritedStepState = true
+
+						vm.debugger.lastBreakpoint.line = vm.debugger.Line()
+						vm.debugger.lastBreakpoint.pc = vm.pc
+						vm.debugger.lastBreakpoint.filename = vm.debugger.Filename()
+						vm.debugger.lastBreakpoint.stackDepth = vm.debugger.callStackDepth()
+
+						if vm.debugger.enableDebugLogging {
+							fmt.Printf("[VM] Inherited global step state: next=%v, stepIn=%v, file=%s, targetDepth=%d, originalTargetDepth=%d (anyInitCompleted=%v)\n",
+								globalNext, globalStepIn, globalSteppingFile, vm.debugger.stepOverTargetDepth, vm.debugger.stepOverOriginalTargetDepth, anyInitCompleted)
+						}
+						GetGlobalCoordinator().ClearGlobalStepState()
 					}
 
 				}
@@ -987,14 +1012,18 @@ func (vm *vm) debug() {
 					hasBreakpoint = vm.debugger.breakpoint()
 				}
 
-				// Skip breaking at module entry (line 1) when we just inherited step state
-				// This prevents spurious breaks when transitioning between phases (init -> setup -> default)
-				if justInheritedStepState && vm.debugger.Line() <= 1 && !hasBreakpoint {
+				// Skip breaking at module entry point (PC=0) when we just inherited step state.
+				// This prevents spurious breaks at the very first bytecode instruction when
+				// transitioning between phases (init → setup → default).
+				// FIX #4: Use vm.pc == 0 instead of Line() <= 1. Line 1 in the bundled
+				// output can correspond to real user code (imports, first statement) that
+				// the user may want to break on. PC=0 is always the module/function entry.
+				if justInheritedStepState && vm.pc == 0 && !hasBreakpoint {
 					goto executeInstruction
 				}
 
 				if !vm.debugger.active && (hasBreakpoint || vm.debugger.next || vm.debugger.stepIn) {
-					currentFilename := vm.debugger.cachedFilename
+					currentFilename := vm.debugger.Filename() // Use source-mapped filename for consistency
 					normalizedCurrentFilename := vm.debugger.cachedNormFile
 					currentLine := vm.debugger.Line()
 					currentStackDepth := vm.debugger.callStackDepth()
@@ -1232,6 +1261,20 @@ func (vm *vm) debug() {
 
 						shouldBreak = pcAdvanced && lineChanged && vmInValidState && isUserFile && !isControlFlowOnly
 						breakReason = "stepIn"
+
+						// RETURN-LINE FIX (stepIn): Same as step-over — detect _ret on the same
+						// source line and force a break so the user sees the return statement.
+						if !shouldBreak && pcAdvanced && vmInValidState && isUserFile && !lineChanged {
+							if currentPC >= 0 && currentPC < len(vm.prg.code) {
+								if _, isRet := vm.prg.code[currentPC].(_ret); isRet {
+									if lastExecPC >= 0 && lastExecPC != prevPC {
+										shouldBreak = true
+										breakReason = "stepIn (return-from-function on same source line)"
+									}
+								}
+							}
+						}
+
 						if isLifecycleFunctionEntry && isUserFile && debugVM {
 							fmt.Printf("[VM-LIFECYCLE-ENTRY] 🎯 Lifecycle function entry detected at line %d (PC=0, prevPC=-1, sb=%d). vmInValidState forced to %v (would be %v without fix). shouldBreak=%v\n",
 								currentLine, vm.sb, vmInValidState, vm.sb >= 0, shouldBreak)
@@ -1336,6 +1379,39 @@ func (vm *vm) debug() {
 
 						shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState && isUserFile && !isControlFlowOnly
 						breakReason = "next"
+
+						// RETURN-LINE FIX: When bundlers (esbuild/TypeScript) map a `return`
+						// statement to the same source line as the preceding statement,
+						// lineChanged is never true for the return bytecodes. The user presses
+						// step-over from line N (e.g. console.log), the return is also on line N,
+						// so the debugger skips it and only breaks back in the caller.
+						//
+						// Fix: if we're about to execute _ret at the current valid depth and
+						// shouldBreak is false (because lineChanged is false), check if the
+						// previous instruction was _loadResult (the return-from-try pattern:
+						// _saveResult → leaveTry → _loadResult → _ret) or if we simply have
+						// a return on the same line. Force a break so the user sees the function
+						// is returning. Only do this when:
+						//   - We haven't broken on this line yet during this step sequence
+						//     (startLine != currentLine would mean lineChanged=true, handled above)
+						//   - Actually: startLine == currentLine means we're STILL on the start line.
+						//     But we need to distinguish "haven't moved yet" from "returned to same line".
+						//     Use lastExecPC: if we've executed several instructions past the start PC,
+						//     we've done real work on this line.
+						if !shouldBreak && pcAdvanced && atValidDepth && vmInValidState && isUserFile && !lineChanged {
+							if currentPC >= 0 && currentPC < len(vm.prg.code) {
+								if _, isRet := vm.prg.code[currentPC].(_ret); isRet {
+									// Additional guard: only force break if we've executed meaningful
+									// instructions since the step started (not just the first PC after resume).
+									// This prevents double-breaking on lines that only contain a return.
+									if lastExecPC >= 0 && lastExecPC != prevPC {
+										shouldBreak = true
+										breakReason = "next (return-from-function on same source line)"
+									}
+								}
+							}
+						}
+
 						if isLifecycleFunctionEntry && isUserFile && debugVM {
 							fmt.Printf("[VM-LIFECYCLE-ENTRY] 🎯 Lifecycle function entry (next) at line %d (PC=0, prevPC=-1, sb=%d). vmInValidState forced to %v. shouldBreak=%v\n",
 								currentLine, vm.sb, vmInValidState, shouldBreak)
@@ -1369,31 +1445,34 @@ func (vm *vm) debug() {
 						// and continue stepping when we return to user code at the correct depth
 						// The next flag will be cleared when we actually break (in the shouldBreak block below)
 					} else {
-						// For regular breakpoint: break if location changed from where we last paused.
-						// Use the exact PC + line + filename to detect same-location, not just the
-						// `continuing` flag which was broken (cleared on first instruction).
+						// For regular breakpoint: break if the SOURCE LINE changed from where we last paused.
+						// We compare ONLY the line number (not filename or PC) because:
+						// 1. breakpoint() already confirmed this is a valid breakpoint location
+						// 2. Multiple bytecodes map to the same source line — after Continue, the user
+						//    should not be stopped again on subsequent PCs that are still on the same line
+						// 3. lastBreakpoint.filename uses the source-mapped name (from Filename()/activateWithStepState)
+						//    while cachedFilename is the raw program name — they're in different formats
+						//    for bundled TypeScript (e.g., "CcsApi.ts" vs "file:///LoadTests.ts"), so
+						//    filename comparison was always false, making every breakpoint fire repeatedly
 						//
-						// The PC-based check correctly handles the case where Continue() is pressed
-						// and the first instruction re-evaluated is the same breakpoint — we skip it
-						// once, then on the next different-location instruction we break.
-						alreadyPausedHere := prevFilename == currentFilename &&
-							prevLine == currentLine &&
-							prevPC == currentPC
-
-						if alreadyPausedHere {
+						// Line-only comparison is safe because:
+						// - If we're in a different file/function, the line numbers will naturally differ
+						// - For the same file, same line = same breakpoint = already seen by the user
+						// - prevLine is 0/-1 after reset, so a valid currentLine will always differ
+						sameLine := prevLine == currentLine && prevLine > 0
+						if sameLine {
 							shouldBreak = false
-							breakReason = "same-location-skip"
+							breakReason = "same-line-skip"
 						} else {
-							locationChanged := prevFilename != currentFilename || prevLine != currentLine
-							shouldBreak = locationChanged
+							shouldBreak = true
 							breakReason = "breakpoint"
 						}
-						// Clear continuing unconditionally — it's now redundant with the PC check
+						// Clear continuing unconditionally — it's now redundant with the line check
 						// but we clear it for cleanliness so other code paths don't see stale state.
 						vm.debugger.continuing = false
 						if vm.debugger.enableDebugLogging {
-							fmt.Printf("[VM] breakpoint check: alreadyPausedHere=%v (file:%v line:%v PC:%d->%d), shouldBreak=%v, reason=%s\n",
-								alreadyPausedHere, prevFilename == currentFilename, prevLine == currentLine, prevPC, currentPC, shouldBreak, breakReason)
+							fmt.Printf("[VM] breakpoint check: sameLine=%v (line:%d->%d, file:%s->%s, PC:%d->%d), shouldBreak=%v, reason=%s\n",
+								sameLine, prevLine, currentLine, prevFilename, currentFilename, prevPC, currentPC, shouldBreak, breakReason)
 						}
 					}
 
