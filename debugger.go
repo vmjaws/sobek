@@ -626,6 +626,44 @@ func (gbr *GlobalBreakpointRegistry) FileHasBreakpoints(normalizedFilename strin
 	return len(lines) > 0
 }
 
+// HasBreakpointOnLine checks if ANY file has a breakpoint on the given line.
+func (gbr *GlobalBreakpointRegistry) HasBreakpointOnLine(line int) bool {
+	gbr.mu.RLock()
+	defer gbr.mu.RUnlock()
+	for _, lines := range gbr.breakpoints {
+		idx := sort.SearchInts(lines, line)
+		if idx < len(lines) && lines[idx] == line {
+			return true
+		}
+	}
+	return false
+}
+
+// HasBreakpointOnLineExcluding checks if any file OTHER than the excluded ones
+// has a breakpoint on the given line. Used for bundled TS where the bundle filename
+// has already been checked and we only want to match original source filenames.
+func (gbr *GlobalBreakpointRegistry) HasBreakpointOnLineExcluding(line int, excludeFiles ...string) bool {
+	gbr.mu.RLock()
+	defer gbr.mu.RUnlock()
+	for file, lines := range gbr.breakpoints {
+		excluded := false
+		for _, ef := range excludeFiles {
+			if file == ef {
+				excluded = true
+				break
+			}
+		}
+		if excluded {
+			continue
+		}
+		idx := sort.SearchInts(lines, line)
+		if idx < len(lines) && lines[idx] == line {
+			return true
+		}
+	}
+	return false
+}
+
 func GetGlobalBreakpoints() *GlobalBreakpointRegistry {
 	return globalBreakpoints
 }
@@ -695,9 +733,13 @@ type Debugger struct {
 	cachedSourceLinesPrg *Program
 
 	// PERF: cached isUserFile result — avoids 3 lock acquisitions + string ops per instruction.
-	// Invalidated when vm.prg changes, when breakpoints change, or on phase/run reset.
-	cachedIsUserFile    bool
-	cachedIsUserFilePrg *Program
+	// Two-level cache: first check the fast *Program pointer, then fall back to the
+	// filename-keyed map. The map survives function calls within the same bundled file
+	// (where *Program changes but the filename stays the same).
+	// Invalidated when breakpoints change or on phase/run reset.
+	cachedIsUserFile       bool
+	cachedIsUserFilePrg    *Program
+	cachedIsUserFileByName map[string]bool // normalized filename → isUserFile
 
 	// PERF: cached normalizeFilenameForMatch result — avoids extension stripping per instruction.
 	cachedBaseFile    string
@@ -2117,6 +2159,7 @@ func (dbg *Debugger) SetBreakpoint(filename string, line int) (id int, err error
 		}
 		dbg.breakpointIDs[bpKey{normalizedFilename, line}] = id
 	}
+
 	dbg.hasLocalBPs = len(dbg.breakpoints) > 0
 	dbg.breakpointMutex.Unlock()
 
@@ -2125,6 +2168,7 @@ func (dbg *Debugger) SetBreakpoint(filename string, line int) (id int, err error
 
 	// Invalidate isUserFile cache — breakpoint changes affect the result.
 	dbg.cachedIsUserFilePrg = nil
+	dbg.cachedIsUserFileByName = nil
 
 	if debugBP {
 		fmt.Printf("[DEBUGGER-SET-BP] ✅ Breakpoint added: id=%d, local=%d, globalCount=%d\n",
@@ -2160,6 +2204,7 @@ func (dbg *Debugger) ClearBreakpoint(filename string, line int) (err error) {
 	dbg.hasGlobalBPs = globalBreakpoints.Count() > 0
 	// Invalidate isUserFile cache — breakpoint changes affect the result.
 	dbg.cachedIsUserFilePrg = nil
+	dbg.cachedIsUserFileByName = nil
 	return
 }
 
@@ -2381,6 +2426,7 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 	dbg.cachedSourceLines = nil
 	dbg.cachedSourceLinesPrg = nil
 	dbg.cachedIsUserFilePrg = nil
+	dbg.cachedIsUserFileByName = nil
 	dbg.cachedBaseFilePrg = nil
 
 	// VM exit state — reset for the new phase
@@ -2411,6 +2457,13 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 // can be reused cleanly for a new k6 run without carrying over stale flags.
 // It preserves the VM pointer, breakpoints, connection status, and channels.
 func (dbg *Debugger) ResetForNewRun() {
+	// CRITICAL: Reset the global init tracker so that stale init breakpoint data
+	// from a previous k6 run doesn't suppress breakpoints in the new run.
+	// Without this, breakpoints that fired during init in the first run are
+	// incorrectly skipped in subsequent runs because globalInitTracker retains
+	// its data across runs (it's a package-level global).
+	globalInitTracker.Reset()
+
 	// Step / pause state
 	dbg.next = false
 	dbg.stepIn = false
@@ -2473,6 +2526,7 @@ func (dbg *Debugger) ResetForNewRun() {
 	dbg.cachedSourceLines = nil
 	dbg.cachedSourceLinesPrg = nil
 	dbg.cachedIsUserFilePrg = nil
+	dbg.cachedIsUserFileByName = nil
 	dbg.cachedBaseFilePrg = nil
 
 	// VM exit state — new run means a new VM lifecycle
@@ -2552,8 +2606,8 @@ func (dbg *Debugger) breakpoint() bool {
 		return false
 	}
 
-	// PERF: update cached filename only when prg changes (typically never mid-execution).
-	dbg.refreshFilenameCache()
+	// PERF: Use cached filename from vm.debug() — refreshFilenameCache() was already
+	// called there before breakpoint(), so we skip the redundant call here.
 	normalizedFilename := dbg.cachedNormFile
 	line := dbg.Line()
 
@@ -2571,10 +2625,11 @@ func (dbg *Debugger) breakpoint() bool {
 		dbg.initComplete = globalInitTracker.HasAnyInitCompleted()
 	}
 	if dbg.initComplete {
-		// PERF: snapshot initBreakpointSet once into a local read-only map.
-		// This eliminates the RLock per instruction for the entire run after init.
-		// Gate on !dbg.initPhase so we don't snapshot too early in multi-file
-		// projects where one file's init completes while another is still running.
+		// Apply init-BP dedup: skip breakpoints that already fired during init.
+		// Uses composite {file, line} keys so breakpoints in different files at the
+		// same line number are NOT suppressed. The inFunctionBody guard was removed
+		// because module-level init code runs inside a Go callback wrapper (bundle.go
+		// call(nil)) that pushes a call frame — callStackDepth >= 1 even at module level.
 		if !dbg.initBPSnapshotDone && !dbg.initPhase {
 			globalInitTracker.mu.RLock()
 			dbg.initBPSnapshot = make(map[initBPKey]bool, len(globalInitTracker.initBreakpointSet))
@@ -2585,11 +2640,9 @@ func (dbg *Debugger) breakpoint() bool {
 			dbg.initBPSnapshotDone = true
 		}
 		// Zero-lock lookup from local snapshot
-		hitGlobal := dbg.initBPSnapshot[initBPKey{normalizedFilename, line}]
+		key := initBPKey{normalizedFilename, line}
+		hitGlobal := dbg.initBPSnapshot[key]
 		if hitGlobal {
-			if debugInit {
-				fmt.Printf("[BREAKPOINT-CHECK] Skipping init breakpoint at line %d in '%s' - already hit during init\n", line, normalizedFilename)
-			}
 			return false
 		}
 	}
@@ -2629,10 +2682,8 @@ func (dbg *Debugger) breakpoint() bool {
 	}
 
 	// PERF: check global registry only if not found locally.
-	// HasBreakpoint now takes an already-normalized filename — no alloc inside.
 	if !found && dbg.hasGlobalBPs {
 		found = globalBreakpoints.HasBreakpoint(normalizedFilename, line)
-		// Also check source-mapped filename
 		if !found && srcMapFile != "" && srcMapFile != normalizedFilename {
 			found = globalBreakpoints.HasBreakpoint(srcMapFile, line)
 		}
@@ -3435,7 +3486,8 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 	}
 
 	if dbg.vm.prg != nil && dbg.vm.prg.debugSymbols != nil {
-		if varLocs, exists := dbg.vm.prg.debugSymbols.scopeMap[currentPC]; exists {
+		varLocs := dbg.vm.prg.debugSymbols.LookupVarsAtPC(currentPC)
+		if len(varLocs) > 0 {
 			if dbg.enableDebugLogging {
 				fmt.Printf("[DEBUGGER] Found %d debug symbols at PC=%d (line %d)\n", len(varLocs), currentPC, currentLine)
 			}
@@ -3584,12 +3636,13 @@ func (dbg *Debugger) debugVarLocations() []VarLocation {
 		}
 		return nil
 	}
-	if varLocs, exists := dbg.vm.prg.debugSymbols.scopeMap[dbg.vm.pc]; exists {
+	varLocs := dbg.vm.prg.debugSymbols.LookupVarsAtPC(dbg.vm.pc)
+	if len(varLocs) > 0 {
 		return varLocs
 	}
 	if dbg.enableDebugLogging {
-		fmt.Printf("[DEBUGGER] debugVarLocations: no symbols at PC %d for program %s (funcName=%s), scopeMap has %d entries\n",
-			dbg.vm.pc, dbg.vm.prg.src.Name(), dbg.vm.prg.funcName, len(dbg.vm.prg.debugSymbols.scopeMap))
+		fmt.Printf("[DEBUGGER] debugVarLocations: no symbols at PC %d for program %s (funcName=%s), ranges has %d entries\n",
+			dbg.vm.pc, dbg.vm.prg.src.Name(), dbg.vm.prg.funcName, len(dbg.vm.prg.debugSymbols.ranges))
 	}
 	return nil
 }
@@ -3754,24 +3807,8 @@ func (dbg *Debugger) getValueFromLocation(varLoc VarLocation) (Value, error) {
 				}
 			}
 		}
-		// Variable name not found in any named stash — either the block stash was
-		// popped OR the stash doesn't have a names map. The latter is common for
-		// class method function scopes where ' this' is stored without names.
-		// Fall back: scan for stashes WITHOUT names and try the StashIdx directly.
-		if varLoc.StashIdx >= 0 {
-			stashIdx := int(varLoc.StashIdx)
-			for s := dbg.vm.stash; s != nil; s = s.outer {
-				if s.names != nil {
-					continue // already checked by name above
-				}
-				if s.values != nil && stashIdx < len(s.values) {
-					val := s.values[stashIdx]
-					if val != nil && !isNullValue(val) {
-						return val, nil
-					}
-				}
-			}
-		}
+		// Variable name not found in any named stash — the block stash was
+		// popped or the variable is genuinely unavailable at this point.
 		return nil, fmt.Errorf("variable %s not found in stash chain", varLoc.Name)
 	}
 	// Stack-based variable
@@ -4289,30 +4326,29 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 	name := unistring.String(varName)
 
 	if dbg.vm.prg != nil && dbg.vm.prg.debugSymbols != nil {
-		if varLocs, exists := dbg.vm.prg.debugSymbols.scopeMap[dbg.vm.pc]; exists {
-			for _, varLoc := range varLocs {
-				// Match by name. For "this", also match " this" (sobek stores
-				// the class this-binding with a leading space).
-				nameMatch := varLoc.Name == varName ||
-					(varName == "this" && strings.TrimSpace(varLoc.Name) == "this")
-				if nameMatch {
-					// Use getValueFromLocation which does name-based stash lookup
-					val, err := dbg.getValueFromLocation(varLoc)
-					if err == nil && val != nil && !isNullValue(val) {
-						if dbg.enableDebugLogging {
-							fmt.Printf("[DEBUGGER] getValue('%s'): Found via getValueFromLocation (from debug symbols)\n", varName)
-						}
-						return val, nil
+		varLocs := dbg.vm.prg.debugSymbols.LookupVarsAtPC(dbg.vm.pc)
+		for _, varLoc := range varLocs {
+			// Match by name. For "this", also match " this" (sobek stores
+			// the class this-binding with a leading space).
+			nameMatch := varLoc.Name == varName ||
+				(varName == "this" && strings.TrimSpace(varLoc.Name) == "this")
+			if nameMatch {
+				// Use getValueFromLocation which does name-based stash lookup
+				val, err := dbg.getValueFromLocation(varLoc)
+				if err == nil && val != nil && !isNullValue(val) {
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] getValue('%s'): Found via getValueFromLocation (from debug symbols)\n", varName)
 					}
-					// Variable exists but is nil/undefined (const/let before
-					// assignment, e.g. RHS threw). Return _undefined so hover
-					// shows the variable instead of nothing.
-					if err == nil && dbg.vm.debugMode {
-						if dbg.enableDebugLogging {
-							fmt.Printf("[DEBUGGER] getValue('%s'): Found via debug symbols but uninitialized, returning undefined\n", varName)
-						}
-						return _undefined, nil
+					return val, nil
+				}
+				// Variable exists but is nil/undefined (const/let before
+				// assignment, e.g. RHS threw). Return _undefined so hover
+				// shows the variable instead of nothing.
+				if err == nil && dbg.vm.debugMode {
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] getValue('%s'): Found via debug symbols but uninitialized, returning undefined\n", varName)
 					}
+					return _undefined, nil
 				}
 			}
 		}

@@ -829,23 +829,12 @@ func (vm *vm) debug() {
 				anyInitCompleted := vm.debugger.initComplete
 
 				if anyInitCompleted {
-					// CRITICAL FIX: Do NOT skip breakpoints when stepIn is active
-					// stepIn is enabled when entering lifecycle functions (setup/default/teardown)
-					// In this case, we're inside a function, not executing module-level init code
-					// Breakpoints inside functions should work even if the same line number
-					// was hit during init (because it's a DIFFERENT execution context)
-					//
-					// FIX #3: Only skip init-BP dedup when we're actually inside a lifecycle
-					// function body (vm.sb >= 0 and call depth >= 1), not just because step
-					// flags happen to be set. For VU0 reusing the same VM across phases
-					// (setup → teardown → handleSummary), stale step flags from a previous
-					// phase could incorrectly skip init-BP dedup during module-level code.
-					inLifecycleBody := vm.sb >= 0 && vm.debugger.callStackDepth() >= 1
-					inStepMode := (vm.debugger.stepIn || vm.debugger.next) && inLifecycleBody
-
-					// Only apply init breakpoint skipping if we're NOT in step mode
-					// AND we're still potentially in module-level code (initPhase is true or we just started)
-					if !inStepMode {
+					// Apply init-BP dedup: skip breakpoints that already fired during init.
+					// NOTE: The inLifecycleBody guard (callStackDepth >= 1) was removed because
+					// module-level init code runs inside a Go callback wrapper (bundle.go call(nil))
+					// that pushes a call frame. The dedup uses composite {file, line} keys from the
+					// source map, so breakpoints in different files at the same line are NOT suppressed.
+					{
 						currentLine := vm.debugger.Line()
 
 						// PERF: Use local initBPSnapshot instead of calling
@@ -871,9 +860,9 @@ func (vm *vm) debug() {
 
 						if wasHitDuringInit {
 							skipBreakpoints = true
-							if vmDebugEnabled {
-								fmt.Printf("[VM-INIT-CHECK] Skipping init breakpoint at line %d for '%s'\n",
-									currentLine, normalizedFilename)
+							if vmDebugEnabled || vm.debugger.enableDebugLogging {
+								fmt.Printf("[VM-INIT-CHECK] Skipping init breakpoint at line %d for '%s' (snapshotDone=%v, snapshotSize=%d)\n",
+									currentLine, normalizedFilename, vm.debugger.initBPSnapshotDone, len(vm.debugger.initBPSnapshot))
 							}
 						}
 					}
@@ -1009,6 +998,11 @@ func (vm *vm) debug() {
 				// but we STILL process step-over and step-in
 				hasBreakpoint := false
 				if !skipBreakpoints {
+					// TRACE: log when in CcsApi to track if breakpoint() is called
+					if strings.Contains(vm.debugger.cachedNormFile, "CcsApi") {
+						fmt.Printf("[VM-CCSAPI] line=%d PC=%d skipBP=%v next=%v stepIn=%v normFile='%s'\n",
+							vm.debugger.Line(), vm.pc, skipBreakpoints, vm.debugger.next, vm.debugger.stepIn, vm.debugger.cachedNormFile)
+					}
 					hasBreakpoint = vm.debugger.breakpoint()
 				}
 
@@ -1109,13 +1103,31 @@ func (vm *vm) debug() {
 					// The cache covers breakpoint lookups (RLock), FileHasBreakpoints,
 					// extension checks, and normalizeFilenameForMatch — all expensive.
 					// Only the stepping-filename match (cheap string ==) runs uncached.
+					needCompute := false
 					if vm.prg == vm.debugger.cachedIsUserFilePrg {
 						isUserFile = vm.debugger.cachedIsUserFile
 						// Cheap: also check stepping filename match (not cached since it changes per-step)
 						if !isUserFile && normalizedCurrentFilename == normalizedSteppingFilename && normalizedSteppingFilename != "" {
 							isUserFile = true
 						}
+					} else if vm.debugger.cachedIsUserFileByName != nil {
+						// PERF: Second-level cache keyed by filename — survives function calls
+						// within the same bundled file (where *Program changes but filename stays the same).
+						if cached, found := vm.debugger.cachedIsUserFileByName[normalizedCurrentFilename]; found {
+							isUserFile = cached
+							vm.debugger.cachedIsUserFile = cached
+							vm.debugger.cachedIsUserFilePrg = vm.prg
+							// Still check stepping filename match
+							if !isUserFile && normalizedCurrentFilename == normalizedSteppingFilename && normalizedSteppingFilename != "" {
+								isUserFile = true
+							}
+						} else {
+							needCompute = true
+						}
 					} else {
+						needCompute = true
+					}
+					if needCompute {
 						// Check if current file is the stepping file OR has breakpoints OR is a user source file
 						if normalizedCurrentFilename == normalizedSteppingFilename && normalizedSteppingFilename != "" {
 							isUserFile = true
@@ -1186,6 +1198,11 @@ func (vm *vm) debug() {
 						}
 						vm.debugger.cachedIsUserFile = cachedResult
 						vm.debugger.cachedIsUserFilePrg = vm.prg
+						// Save to filename-keyed map for cross-function cache hits
+						if vm.debugger.cachedIsUserFileByName == nil {
+							vm.debugger.cachedIsUserFileByName = make(map[string]bool)
+						}
+						vm.debugger.cachedIsUserFileByName[normalizedCurrentFilename] = cachedResult
 					}
 
 					if vm.debugger.stepIn {
@@ -1445,21 +1462,20 @@ func (vm *vm) debug() {
 						// and continue stepping when we return to user code at the correct depth
 						// The next flag will be cleared when we actually break (in the shouldBreak block below)
 					} else {
-						// For regular breakpoint: break if the SOURCE LINE changed from where we last paused.
-						// We compare ONLY the line number (not filename or PC) because:
+						// For regular breakpoint: break if the SOURCE LINE or SOURCE FILE changed from where we last paused.
+						// We compare the line number AND the source-mapped filename because:
 						// 1. breakpoint() already confirmed this is a valid breakpoint location
 						// 2. Multiple bytecodes map to the same source line — after Continue, the user
 						//    should not be stopped again on subsequent PCs that are still on the same line
-						// 3. lastBreakpoint.filename uses the source-mapped name (from Filename()/activateWithStepState)
-						//    while cachedFilename is the raw program name — they're in different formats
-						//    for bundled TypeScript (e.g., "CcsApi.ts" vs "file:///LoadTests.ts"), so
-						//    filename comparison was always false, making every breakpoint fire repeatedly
-						//
-						// Line-only comparison is safe because:
-						// - If we're in a different file/function, the line numbers will naturally differ
-						// - For the same file, same line = same breakpoint = already seen by the user
-						// - prevLine is 0/-1 after reset, so a valid currentLine will always differ
-						sameLine := prevLine == currentLine && prevLine > 0
+						// 3. In bundled TypeScript, different source files (CcsApi.ts vs Stores.ts) can
+						//    have the same line number. We must compare the source-mapped filename too,
+						//    otherwise breakpoints in file B on the same line as file A are skipped.
+						sameFile := true
+						srcMapFile := vm.debugger.cachedSrcMapFile
+						if srcMapFile != "" && prevFilename != "" {
+							sameFile = srcMapFile == prevFilename || normalizeFilenameForMatch(srcMapFile) == normalizeFilenameForMatch(prevFilename)
+						}
+						sameLine := prevLine == currentLine && prevLine > 0 && sameFile
 						if sameLine {
 							shouldBreak = false
 							breakReason = "same-line-skip"

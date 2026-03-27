@@ -1433,10 +1433,10 @@ func compileAST(prg *js_ast.Program, strict, inGlobal bool, evalVm *vm, debug bo
 	p = c.p
 	if debugCompiler && p != nil && p.debugSymbols != nil {
 		symbolCount := 0
-		for _, vars := range p.debugSymbols.scopeMap {
-			symbolCount += len(vars)
+		for _, r := range p.debugSymbols.ranges {
+			symbolCount += len(r.Vars)
 		}
-		fmt.Printf("[COMPILER-DEBUG] generated %d debug symbols across %d PCs for %s\n", symbolCount, len(p.debugSymbols.scopeMap), p.src.Name())
+		fmt.Printf("[COMPILER-DEBUG] generated %d debug symbols across %d ranges for %s\n", symbolCount, len(p.debugSymbols.ranges), p.src.Name())
 	}
 	return
 }

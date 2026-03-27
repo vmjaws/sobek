@@ -81,12 +81,48 @@ type Program struct {
 }
 
 type DebugSymbols struct {
-	// Map PC range to available variables
-	// Key: PC, Value: slice of variable info available at that PC
-	scopeMap map[int][]VarLocation
+	// Range-based variable scope storage. Each entry covers a [StartPC, EndPC]
+	// range with its visible variables. Sorted by StartPC for binary search.
+	// This replaces the per-PC map which had O(N*M) memory (one entry per
+	// instruction per variable) causing OOM with 20+ bundled files.
+	ranges []PCRange
+	sorted bool // true after ranges have been sorted
 
 	// Map line number to PCs
 	lineToPCs map[int][]int
+}
+
+// PCRange maps a contiguous range of PCs to the variables visible within it.
+type PCRange struct {
+	StartPC, EndPC int
+	Vars           []VarLocation
+}
+
+// LookupVarsAtPC returns all variables visible at the given PC.
+func (ds *DebugSymbols) LookupVarsAtPC(pc int) []VarLocation {
+	if ds == nil || len(ds.ranges) == 0 {
+		return nil
+	}
+	// Sort on first access
+	if !ds.sorted {
+		sort.Slice(ds.ranges, func(i, j int) bool {
+			return ds.ranges[i].StartPC < ds.ranges[j].StartPC
+		})
+		ds.sorted = true
+	}
+	// Collect all ranges that contain this PC.
+	// Ranges can overlap (nested scopes), so we scan all matches.
+	var result []VarLocation
+	for i := range ds.ranges {
+		r := &ds.ranges[i]
+		if r.StartPC > pc {
+			break // sorted by StartPC — no more ranges can start before pc
+		}
+		if pc <= r.EndPC {
+			result = append(result, r.Vars...)
+		}
+	}
+	return result
 }
 
 type VarLocation struct {
@@ -699,7 +735,6 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 	// Initialize debug symbols ONCE before processing bindings
 	if s.c.debug && s.c.p.debugSymbols == nil {
 		s.c.p.debugSymbols = &DebugSymbols{
-			scopeMap:  make(map[int][]VarLocation),
 			lineToPCs: make(map[int][]int),
 		}
 	}
@@ -1067,13 +1102,14 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 			varLoc.StartPC = minPC
 			varLoc.EndPC = maxPC
 
-			// Add to scope map for all PCs in range
-			for pc := minPC; pc <= maxPC; pc++ {
-				s.c.p.debugSymbols.scopeMap[pc] = append(
-					s.c.p.debugSymbols.scopeMap[pc],
-					varLoc,
-				)
-			}
+			// Add as a range entry — one entry per variable instead of one per PC.
+			// This is O(variables) instead of O(instructions * variables), preventing
+			// OOM with bundled 20+ file projects.
+			s.c.p.debugSymbols.ranges = append(s.c.p.debugSymbols.ranges, PCRange{
+				StartPC: minPC,
+				EndPC:   maxPC,
+				Vars:    []VarLocation{varLoc},
+			})
 
 			if debugCompiler {
 				fmt.Printf("[COMPILER-DEBUG]   Debug symbol: %s, inStash=%v, stashIdx=%d, stackIdx=%d, stashLevel=%d, PC range=[%d-%d]\n",
