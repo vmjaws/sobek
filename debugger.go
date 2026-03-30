@@ -580,6 +580,32 @@ func (gbr *GlobalBreakpointRegistry) ClearBreakpoint(filename string, line int) 
 	return errors.New("breakpoint doesn't exist")
 }
 
+// ClearFileBreakpoints removes ALL breakpoints for a given file from the global registry.
+// This is used by the DAP setBreakpoints handler which is a replacement operation:
+// the client sends the complete list of desired breakpoints and the server must
+// remove any breakpoints that are no longer in the list.
+func (gbr *GlobalBreakpointRegistry) ClearFileBreakpoints(filename string) {
+	filename = normalizeFilename(filename)
+
+	gbr.mu.Lock()
+	defer gbr.mu.Unlock()
+
+	lines := gbr.breakpoints[filename]
+	if len(lines) == 0 {
+		return
+	}
+
+	// Remove all breakpoint IDs for this file.
+	for _, line := range lines {
+		delete(gbr.breakpointIDs, bpKey{filename, line})
+	}
+	delete(gbr.breakpoints, filename)
+
+	if debugBP {
+		fmt.Printf("[GLOBAL-BP] Cleared all breakpoints for file '%s' (was %d)\n", filename, len(lines))
+	}
+}
+
 // HasBreakpoint checks for a breakpoint. Caller must pass a normalized filename.
 // PERF: no string allocation, no normalization, just a lock + binary search.
 // No defer — manual unlock is measurably faster in tight hot paths.
@@ -2207,6 +2233,51 @@ func (dbg *Debugger) ClearBreakpoint(filename string, line int) (err error) {
 	dbg.cachedIsUserFilePrg = nil
 	dbg.cachedIsUserFileByName = nil
 	return
+}
+
+// ClearFileBreakpoints removes ALL breakpoints for a given file from both the
+// local debugger instance and the global registry. It also clears any associated
+// conditional breakpoints, logpoints, and hit-count breakpoints for that file.
+// This is used by the DAP setBreakpoints handler which uses replacement semantics:
+// the client sends the complete list of desired breakpoints and the server must
+// first remove all existing breakpoints for the file before setting the new ones.
+func (dbg *Debugger) ClearFileBreakpoints(filename string) {
+	normalizedFilename := normalizeFilename(filename)
+
+	if debugBP {
+		fmt.Printf("[DEBUGGER-CLEAR-FILE] Clearing all breakpoints for file '%s' (normalized: '%s')\n",
+			filename, normalizedFilename)
+	}
+
+	// Clear from global registry first.
+	globalBreakpoints.ClearFileBreakpoints(normalizedFilename)
+
+	// Clear from local debugger state.
+	dbg.breakpointMutex.Lock()
+
+	localLines := dbg.breakpoints[normalizedFilename]
+	// Remove all local breakpoint IDs and conditional BPs for this file.
+	for _, line := range localLines {
+		delete(dbg.breakpointIDs, bpKey{normalizedFilename, line})
+		if dbg.conditionalBPs != nil {
+			delete(dbg.conditionalBPs, bpKey{normalizedFilename, line})
+		}
+	}
+	delete(dbg.breakpoints, normalizedFilename)
+
+	dbg.hasLocalBPs = len(dbg.breakpoints) > 0
+	dbg.breakpointMutex.Unlock()
+
+	dbg.hasGlobalBPs = globalBreakpoints.Count() > 0
+
+	// Invalidate isUserFile cache — breakpoint changes affect the result.
+	dbg.cachedIsUserFilePrg = nil
+	dbg.cachedIsUserFileByName = nil
+
+	if debugBP {
+		fmt.Printf("[DEBUGGER-CLEAR-FILE] ✅ Cleared %d breakpoints for file '%s', localBPs=%v, globalCount=%d\n",
+			len(localLines), normalizedFilename, dbg.hasLocalBPs, globalBreakpoints.Count())
+	}
 }
 
 func (dbg *Debugger) Breakpoints() (map[string][]int, error) {
