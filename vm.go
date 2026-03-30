@@ -998,11 +998,6 @@ func (vm *vm) debug() {
 				// but we STILL process step-over and step-in
 				hasBreakpoint := false
 				if !skipBreakpoints {
-					// TRACE: log when in CcsApi to track if breakpoint() is called
-					if strings.Contains(vm.debugger.cachedNormFile, "CcsApi") {
-						fmt.Printf("[VM-CCSAPI] line=%d PC=%d skipBP=%v next=%v stepIn=%v normFile='%s'\n",
-							vm.debugger.Line(), vm.pc, skipBreakpoints, vm.debugger.next, vm.debugger.stepIn, vm.debugger.cachedNormFile)
-					}
 					hasBreakpoint = vm.debugger.breakpoint()
 				}
 

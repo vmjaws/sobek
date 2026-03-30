@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -2596,6 +2597,13 @@ func stringToLines(s string) (lines []string, err error) {
 // breakpoint is called by the VM on every instruction in debug mode.
 // PERF critical path — minimize allocations and lock acquisitions.
 func (dbg *Debugger) breakpoint() bool {
+	// PERF: Lazily sync hasGlobalBPs from the global registry.
+	// Breakpoints are set on VU0's debugger during DAP init, but default() runs
+	// on VU1 with a fresh debugger that never had SetBreakpoint() called.
+	// Without this sync, VU1's breakpoint() returns false immediately.
+	if !dbg.hasGlobalBPs {
+		dbg.hasGlobalBPs = globalBreakpoints.Count() > 0
+	}
 	if dbg.vm.prg == nil || (!dbg.hasLocalBPs && !dbg.hasGlobalBPs) {
 		return false
 	}
@@ -3307,10 +3315,54 @@ func isDotPropertyChain(s string) bool {
 	return true
 }
 
+// stripTypeScriptSyntax removes TypeScript-only syntax from an expression
+// so the JS runtime can evaluate it. Handles:
+//   - Type assertions: "expr as Type"  → "expr"
+//   - Parenthesized: "(expr as Type).prop" → "(expr).prop"
+//   - Angle-bracket casts: "<Type>expr" → "expr"
+//   - Non-null assertions: "expr!" → "expr"
+//   - Type annotations: "x: Type" in simple contexts
+//
+// Uses a regex-based approach that handles the common patterns seen in
+// debug evaluate/hover without needing a full TS parser.
+var tsAsTypeRegex = regexp.MustCompile(`\s+as\s+[A-Za-z_$][\w$]*(?:\[\]|\<[^>]*\>)*`)
+
+func stripTypeScriptSyntax(expr string) string {
+	// Strip "as Type" assertions (including "as Type[]", "as Map<K,V>")
+	// e.g., "(error as Error).message" → "(error).message"
+	// e.g., "arr as string[]" → "arr"
+	if strings.Contains(expr, " as ") {
+		expr = tsAsTypeRegex.ReplaceAllString(expr, "")
+	}
+
+	// Strip angle-bracket type casts: "<Error>error" → "error"
+	// Only at the start of the expression or after ( to avoid matching
+	// less-than comparisons like "a < b"
+	if strings.HasPrefix(expr, "<") {
+		if idx := strings.Index(expr, ">"); idx > 0 {
+			// Verify it looks like a type (starts with uppercase or is a known type)
+			inner := expr[1:idx]
+			if len(inner) > 0 && (inner[0] >= 'A' && inner[0] <= 'Z') {
+				expr = expr[idx+1:]
+			}
+		}
+	}
+
+	// Strip trailing non-null assertion: "expr!" → "expr"
+	// But not "!expr" (logical not) or "!=", "!=="
+	expr = strings.TrimRight(expr, "!")
+
+	return expr
+}
+
 func (dbg *Debugger) Evaluate(expr string) (Value, error) {
 	if expr == "" {
 		return nil, errors.New("nothing to evaluate")
 	}
+
+	// Strip TypeScript syntax that the JS runtime can't parse.
+	// e.g., "(error as Error).message" → "(error).message"
+	expr = stripTypeScriptSyntax(expr)
 
 	if isSimpleIdentifier(expr) {
 		val, err := dbg.getValue(expr)
@@ -3886,6 +3938,9 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 					// TDZ variable (let/const before assignment) — show as special string
 					// so the IDE displays it rather than hiding it entirely.
 					locals[displayName] = asciiString("(uninitialized)")
+				} else if err == nil && val != nil && isJSNull(val) {
+					// JavaScript null — show as null, not undefined
+					locals[displayName] = _null
 				} else if err == nil && (val == nil || isNullValue(val)) {
 					// var hoisted as undefined, or let/const assigned undefined explicitly.
 					// Show as undefined so the user knows the variable exists.
@@ -4551,13 +4606,19 @@ func isNullValue(v Value) bool {
 	if v == nil {
 		return true
 	}
-	if v == _undefined || v == _null {
+	if v == _undefined {
 		return true
 	}
-	if IsUndefined(v) || IsNull(v) {
+	if IsUndefined(v) {
 		return true
 	}
 	return false
+}
+
+// isJSNull returns true if v is JavaScript null (not undefined, not Go nil).
+// Use this when you need to specifically detect JS null for display purposes.
+func isJSNull(v Value) bool {
+	return v == _null || IsNull(v)
 }
 
 // isFunctionValue returns true if v is a callable JS function.
