@@ -837,26 +837,11 @@ func (vm *vm) debug() {
 					{
 						currentLine := vm.debugger.Line()
 
-						// PERF: Use local initBPSnapshot instead of calling
-						// GetGlobalInitTracker().WasAnyBreakpointHitDuringInit()
-						// which acquires an RLock on every instruction.
-						// Take the snapshot once when initComplete first becomes true.
-						if !vm.debugger.initBPSnapshotDone && !vm.debugger.initPhase {
-							globalInitTracker.mu.RLock()
-							vm.debugger.initBPSnapshot = make(map[initBPKey]bool, len(globalInitTracker.initBreakpointSet))
-							for k, v := range globalInitTracker.initBreakpointSet {
-								vm.debugger.initBPSnapshot[k] = v
-							}
-							globalInitTracker.mu.RUnlock()
-							vm.debugger.initBPSnapshotDone = true
-						}
+						// Use the consolidated ensureInitBPSnapshot / wasHitDuringInit methods
+						// instead of inline snapshot logic (was duplicated between vm.go and debugger.go).
+						vm.debugger.ensureInitBPSnapshot()
 
-						var wasHitDuringInit bool
-						if vm.debugger.initBPSnapshotDone {
-							wasHitDuringInit = vm.debugger.initBPSnapshot[initBPKey{normalizedFilename, currentLine}]
-						} else {
-							wasHitDuringInit = GetGlobalInitTracker().WasAnyBreakpointHitDuringInit(normalizedFilename, currentLine)
-						}
+						wasHitDuringInit := vm.debugger.wasHitDuringInit(normalizedFilename, currentLine)
 
 						if wasHitDuringInit {
 							skipBreakpoints = true
@@ -948,31 +933,39 @@ func (vm *vm) debug() {
 				// blocked VU1 from inheriting step state set during VU0's setup pause.
 				// The init-skip logic below (justInheritedStepState) handles not stopping
 				// at module-level init code.
-				justInheritedStepState := false
-				if !vm.debugger.next && !vm.debugger.stepIn {
-					// FIX #1: Use the already-cached initComplete flag (updated ~20 lines above)
-					// instead of calling HasAnyInitCompleted() again which acquires a redundant RLock.
-					anyInitCompleted := vm.debugger.initComplete
+			justInheritedStepState := false
+			if !vm.debugger.next && !vm.debugger.stepIn {
+				// FIX #1: Use the already-cached initComplete flag (updated ~20 lines above)
+				// instead of calling HasAnyInitCompleted() again which acquires a redundant RLock.
+				anyInitCompleted := vm.debugger.initComplete
 
-					// FIX #4: Read global step state once instead of two separate lock acquisitions
-					// (HasGlobalStepState then GetGlobalStepState). We need the values anyway.
-					globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := GetGlobalCoordinator().GetGlobalStepState()
-					hasGlobalStep := globalNext || globalStepIn
+				// MULTI-VU GUARD: In multi-VU debug mode, NEVER inherit global step state.
+				// Each VU's step operations are scoped to that VU only. Without this guard,
+				// VU1 pressing Next() propagates to the global coordinator, and VU2's
+				// vm.debug() loop inherits it — causing VU2 to pause unexpectedly.
+				// In single-VU mode (the default), inheritance is needed for lifecycle
+				// transitions (setup→default on different VUs).
+				if !GetGlobalCoordinator().IsMultiVUDebug() {
 
-					// Allow step state inheritance if:
-					// - Init hasn't completed yet (early phase — stepping through init), OR
-					// - The coordinator has explicit step state (user issued a step command
-					//   that needs to transfer across VM/VU boundaries, e.g., VU0→VU1)
-					shouldInherit := !anyInitCompleted || hasGlobalStep
+				// FIX #4: Read global step state once instead of two separate lock acquisitions
+				// (HasGlobalStepState then GetGlobalStepState). We need the values anyway.
+				globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := GetGlobalCoordinator().GetGlobalStepState()
+				hasGlobalStep := globalNext || globalStepIn
 
-					if shouldInherit && (globalNext || globalStepIn) {
-						vm.debugger.next = globalNext
-						vm.debugger.stepIn = globalStepIn
-						vm.debugger.steppingFilename = globalSteppingFile
-						vm.debugger.stepOverTargetDepth = vm.debugger.callStackDepth()
-						if globalTargetDepth > 0 && vm.debugger.stepOverTargetDepth == 0 {
-							vm.debugger.stepOverTargetDepth = 1
-						}
+				// Allow step state inheritance if:
+				// - Init hasn't completed yet (early phase — stepping through init), OR
+				// - The coordinator has explicit step state (user issued a step command
+				//   that needs to transfer across VM/VU boundaries, e.g., VU0→VU1)
+				shouldInherit := !anyInitCompleted || hasGlobalStep
+
+				if shouldInherit && (globalNext || globalStepIn) {
+					vm.debugger.next = globalNext
+					vm.debugger.stepIn = globalStepIn
+					vm.debugger.steppingFilename = globalSteppingFile
+					vm.debugger.stepOverTargetDepth = vm.debugger.callStackDepth()
+					if globalTargetDepth > 0 && vm.debugger.stepOverTargetDepth == 0 {
+						vm.debugger.stepOverTargetDepth = 1
+					}
 						// FIX #2: Set stepOverOriginalTargetDepth so that activateWithStepState's
 						// "no user command" branch uses the correct depth instead of falling back
 						// to savedCallDepth (which can corrupt the target depth mid-step).
@@ -988,10 +981,11 @@ func (vm *vm) debug() {
 							fmt.Printf("[VM] Inherited global step state: next=%v, stepIn=%v, file=%s, targetDepth=%d, originalTargetDepth=%d (anyInitCompleted=%v)\n",
 								globalNext, globalStepIn, globalSteppingFile, vm.debugger.stepOverTargetDepth, vm.debugger.stepOverOriginalTargetDepth, anyInitCompleted)
 						}
-						GetGlobalCoordinator().ClearGlobalStepState()
-					}
-
+					GetGlobalCoordinator().ClearGlobalStepState()
 				}
+
+				} // end: !IsMultiVUDebug() guard
+			}
 
 				// Check breakpoint FIRST before logging
 				// When skipBreakpoints is true, we treat hasBreakpoint as false to skip breakpoint activation
@@ -1071,11 +1065,7 @@ func (vm *vm) debug() {
 						isUserSourceFile := newFileHasGlobalBP || newFileHasLocalBP
 						if !isUserSourceFile {
 							// Check if it looks like a user source file by extension and path
-							isUserSourceFile = (strings.HasSuffix(normalizedCurrentFilename, ".ts") ||
-								strings.HasSuffix(normalizedCurrentFilename, ".js") ||
-								strings.HasSuffix(normalizedCurrentFilename, ".mjs")) &&
-								strings.HasPrefix(normalizedCurrentFilename, "/") &&
-								!strings.Contains(normalizedCurrentFilename, "node_modules")
+							isUserSourceFile = IsUserSourceFilePath(normalizedCurrentFilename)
 						}
 
 						if !isUserSourceFile {
@@ -1139,11 +1129,7 @@ func (vm *vm) debug() {
 							// Also check if it looks like a user source file by extension and path
 							// This allows stepping into imported modules from the same project
 							if !isUserFile {
-								isUserFile = (strings.HasSuffix(normalizedCurrentFilename, ".ts") ||
-									strings.HasSuffix(normalizedCurrentFilename, ".js") ||
-									strings.HasSuffix(normalizedCurrentFilename, ".mjs")) &&
-									strings.HasPrefix(normalizedCurrentFilename, "/") &&
-									!strings.Contains(normalizedCurrentFilename, "node_modules")
+								isUserFile = IsUserSourceFilePath(normalizedCurrentFilename)
 							}
 						}
 
@@ -1182,11 +1168,7 @@ func (vm *vm) debug() {
 							vm.debugger.breakpointMutex.RLock()
 							_, hasLocal := vm.debugger.breakpoints[normalizedCurrentFilename]
 							vm.debugger.breakpointMutex.RUnlock()
-							isExtUser := (strings.HasSuffix(normalizedCurrentFilename, ".ts") ||
-								strings.HasSuffix(normalizedCurrentFilename, ".js") ||
-								strings.HasSuffix(normalizedCurrentFilename, ".mjs")) &&
-								strings.HasPrefix(normalizedCurrentFilename, "/") &&
-								!strings.Contains(normalizedCurrentFilename, "node_modules")
+							isExtUser := IsUserSourceFilePath(normalizedCurrentFilename)
 							if !hasBP && !hasLocal && !isExtUser {
 								cachedResult = false // only true due to stepping match
 							}

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -82,6 +83,17 @@ type GlobalDebugCoordinator struct {
 	// iteration-duration metrics. Protected by mu.
 	onPause  func()
 	onResume func()
+
+	// ── Multi-VU debug support ──────────────────────────────────────────
+	// When multiVUDebug is true, each VU operates independently:
+	//  - Step operations (Next/StepIn/StepOut) are scoped to the target VU
+	//    and do NOT propagate via global step state.
+	//  - activate() does NOT inherit global step state from other VUs.
+	//  - Each debugger carries a vuID that is included in DebuggerActivation
+	//    so the DAP handler can map VUs to DAP thread IDs.
+	// Enabled by K6_DEBUG_MULTI_VU=1 in the environment.
+	multiVUDebug    bool
+	activeDebuggers map[uint64]*Debugger // vuID → debugger (all currently registered debuggers)
 }
 
 var globalDebugCoordinator = &GlobalDebugCoordinator{
@@ -101,17 +113,81 @@ func InitGlobalCoordinator() {
 	}
 
 	// Full reset — wipe ALL state so a second run starts clean.
-	globalDebugCoordinator.activationCh = make(chan chan DebuggerActivation, 1)
-	globalDebugCoordinator.isInitialized = true
-	globalDebugCoordinator.hasConnection = false
-	globalDebugCoordinator.activeDbg = nil
-	globalDebugCoordinator.globalStepNext = false
-	globalDebugCoordinator.globalStepIn = false
-	globalDebugCoordinator.globalSteppingFile = ""
-	globalDebugCoordinator.globalStepTargetDepth = 0
-	globalDebugCoordinator.pendingLifecycleStepIn = false
-	globalDebugCoordinator.waitForFunctionEntry = false
-	globalDebugCoordinator.globalActivationEpoch = 0
+	globalDebugCoordinator.resetLocked()
+}
+
+// resetLocked performs the actual coordinator reset. Must be called with mu held.
+func (gdc *GlobalDebugCoordinator) resetLocked() {
+	gdc.activationCh = make(chan chan DebuggerActivation, 1)
+	gdc.isInitialized = true
+	gdc.hasConnection = false
+	gdc.activeDbg = nil
+	gdc.globalStepNext = false
+	gdc.globalStepIn = false
+	gdc.globalSteppingFile = ""
+	gdc.globalStepTargetDepth = 0
+	gdc.pendingLifecycleStepIn = false
+	gdc.waitForFunctionEntry = false
+	gdc.globalActivationEpoch = 0
+	gdc.activeDebuggers = make(map[uint64]*Debugger)
+	// NOTE: multiVUDebug is NOT reset here — it's set once at startup from the
+	// environment variable and must survive across lifecycle phase resets.
+}
+
+// ── Multi-VU debug API ──────────────────────────────────────────────────────
+
+// SetMultiVUDebug enables or disables multi-VU debug mode.
+// When enabled, step operations are scoped per-VU and global step state is not
+// inherited across VUs. Call this once during debugger initialization.
+func (gdc *GlobalDebugCoordinator) SetMultiVUDebug(enabled bool) {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	gdc.multiVUDebug = enabled
+}
+
+// IsMultiVUDebug returns true if multi-VU debug mode is active.
+func (gdc *GlobalDebugCoordinator) IsMultiVUDebug() bool {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	return gdc.multiVUDebug
+}
+
+// RegisterDebugger adds a debugger to the active set keyed by its VU ID.
+// Called when a VU is created in debug mode. Safe to call multiple times for
+// the same vuID (idempotent — overwrites the previous entry).
+func (gdc *GlobalDebugCoordinator) RegisterDebugger(vuID uint64, dbg *Debugger) {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	if gdc.activeDebuggers == nil {
+		gdc.activeDebuggers = make(map[uint64]*Debugger)
+	}
+	gdc.activeDebuggers[vuID] = dbg
+}
+
+// UnregisterDebugger removes a debugger from the active set.
+func (gdc *GlobalDebugCoordinator) UnregisterDebugger(vuID uint64) {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	delete(gdc.activeDebuggers, vuID)
+}
+
+// GetDebuggerForVU returns the debugger for a specific VU, or nil.
+func (gdc *GlobalDebugCoordinator) GetDebuggerForVU(vuID uint64) *Debugger {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	return gdc.activeDebuggers[vuID]
+}
+
+// GetAllDebuggers returns a snapshot of all registered debugger instances.
+// The returned map is safe to iterate — it's a copy.
+func (gdc *GlobalDebugCoordinator) GetAllDebuggers() map[uint64]*Debugger {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	result := make(map[uint64]*Debugger, len(gdc.activeDebuggers))
+	for k, v := range gdc.activeDebuggers {
+		result[k] = v
+	}
+	return result
 }
 
 // MaybeInitGlobalCoordinator initializes the coordinator only if it hasn't been
@@ -123,17 +199,7 @@ func MaybeInitGlobalCoordinator() {
 	if globalDebugCoordinator.isInitialized {
 		return
 	}
-	globalDebugCoordinator.activationCh = make(chan chan DebuggerActivation, 1)
-	globalDebugCoordinator.isInitialized = true
-	globalDebugCoordinator.hasConnection = false
-	globalDebugCoordinator.activeDbg = nil
-	globalDebugCoordinator.globalStepNext = false
-	globalDebugCoordinator.globalStepIn = false
-	globalDebugCoordinator.globalSteppingFile = ""
-	globalDebugCoordinator.globalStepTargetDepth = 0
-	globalDebugCoordinator.pendingLifecycleStepIn = false
-	globalDebugCoordinator.waitForFunctionEntry = false
-	globalDebugCoordinator.globalActivationEpoch = 0
+	globalDebugCoordinator.resetLocked()
 }
 
 func GetGlobalCoordinator() *GlobalDebugCoordinator {
@@ -366,7 +432,7 @@ const (
 var (
 	globalVMRegistry   VMRegistry
 	globalVMRegistryMu sync.RWMutex
-	watchExprCounter   int
+	watchExprCounter   int64 // FIX: use atomic — AddWatch may be called from DAP goroutine
 )
 
 func SetGlobalRegistry(registry VMRegistry) {
@@ -696,7 +762,8 @@ func GetGlobalBreakpoints() *GlobalBreakpointRegistry {
 }
 
 type Debugger struct {
-	vm *vm
+	vm   *vm
+	vuID uint64 // VU identifier — maps to DAP thread ID in multi-VU debug
 
 	currentLine     int
 	lastLine        int
@@ -901,6 +968,11 @@ func newDebugger(vm *vm) *Debugger {
 		hasConnection:      inheritConnection,
 		vmDoneCh:           make(chan struct{}),
 	}
+	// FIX: Initialize lastBreakpoint.pc to -1 so that pcAdvanced (currentPC != prevPC)
+	// is true at PC=0 (the first instruction of any function). Without this, step-in
+	// at function entry evaluates 0 != 0 = false and skips the first line.
+	// ResetForPhaseTransition already does this correctly; newDebugger must match.
+	dbg.lastBreakpoint.pc = -1
 	if debugActivate {
 		if inheritConnection {
 			fmt.Printf("[DEBUGGER] New debugger inherited global connection status: %v\n", inheritConnection)
@@ -929,6 +1001,7 @@ type DebuggerActivation struct {
 	Column   int // 1-based column from source map — enables VS Code token highlighting
 	ID       int
 	Epoch    uint64
+	VUID     uint64 // VU that triggered this activation (0 = VU0/lifecycle, >0 = VU N)
 }
 
 var globalBuiltinKeys = map[string]bool{
@@ -1012,6 +1085,37 @@ func normalizeFilename(filename string) string {
 	return filename
 }
 
+// ensureInitBPSnapshot takes a one-time snapshot of the global init breakpoint set
+// into a local map on the Debugger. After this, all init-breakpoint lookups use the
+// local snapshot with zero lock acquisitions. Called from both vm.debug() and
+// breakpoint() — previously the snapshot logic was duplicated in both places.
+//
+// PERF: The snapshot is taken exactly once per Debugger lifecycle (when initComplete
+// flips true and initPhase is false). Subsequent calls are a no-op.
+func (dbg *Debugger) ensureInitBPSnapshot() {
+	if dbg.initBPSnapshotDone || dbg.initPhase {
+		return
+	}
+	globalInitTracker.mu.RLock()
+	dbg.initBPSnapshot = make(map[initBPKey]bool, len(globalInitTracker.initBreakpointSet))
+	for k, v := range globalInitTracker.initBreakpointSet {
+		dbg.initBPSnapshot[k] = v
+	}
+	globalInitTracker.mu.RUnlock()
+	dbg.initBPSnapshotDone = true
+}
+
+// wasHitDuringInit checks if a breakpoint at normalizedFilename:line was already hit
+// during the init phase. Uses the local snapshot if available, falling back to the
+// global tracker. This is the single source of truth for init-BP dedup — called from
+// both vm.debug() and breakpoint().
+func (dbg *Debugger) wasHitDuringInit(normalizedFilename string, line int) bool {
+	if dbg.initBPSnapshotDone {
+		return dbg.initBPSnapshot[initBPKey{normalizedFilename, line}]
+	}
+	return GetGlobalInitTracker().WasAnyBreakpointHitDuringInit(normalizedFilename, line)
+}
+
 // refreshFilenameCache updates the per-debugger filename caches when vm.prg changes.
 // Called at the top of breakpoint() and Filename(). Cheap when prg hasn't changed.
 func (dbg *Debugger) refreshFilenameCache() {
@@ -1028,6 +1132,20 @@ func (dbg *Debugger) refreshFilenameCache() {
 	}
 	dbg.cachedFilename = dbg.vm.prg.src.Name()
 	dbg.cachedNormFile = normalizeFilename(dbg.cachedFilename)
+}
+
+// IsUserSourceFilePath returns true if the given normalized filename looks like
+// a user source file (local path with a JS/TS extension, not in node_modules).
+// This is the single source of truth for the heuristic that decides whether
+// a file is user code vs. internal k6 code — previously duplicated in multiple
+// places within vm.debug().
+func IsUserSourceFilePath(normalizedFilename string) bool {
+	return (strings.HasSuffix(normalizedFilename, ".ts") ||
+		strings.HasSuffix(normalizedFilename, ".js") ||
+		strings.HasSuffix(normalizedFilename, ".mjs") ||
+		strings.HasSuffix(normalizedFilename, ".tsx")) &&
+		strings.HasPrefix(normalizedFilename, "/") &&
+		!strings.Contains(normalizedFilename, "node_modules")
 }
 
 func (dbg *Debugger) activate(reason ActivationReason, filename string, line int) {
@@ -1071,6 +1189,11 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 		if debugActivate {
 			fmt.Printf("[DEBUGGER-ACTIVATE] Lifecycle transition: waiting on both channels (preferring global coordinator)\n")
 		}
+		// FIX: Use time.NewTimer instead of time.After to prevent goroutine leaks.
+		// time.After creates a new timer+goroutine each iteration — if the select
+		// resolves before 5s, the goroutine leaks until the timer fires.
+		lifecycleTimer := time.NewTimer(5 * time.Second)
+		defer lifecycleTimer.Stop()
 	lifecycleWaitLoop:
 		for {
 			select {
@@ -1147,7 +1270,7 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 					globalDebugCoordinator.ClearGlobalStepState()
 				}
 				break lifecycleWaitLoop
-			case <-time.After(5 * time.Second):
+			case <-lifecycleTimer.C:
 				if debugActivate {
 					fmt.Printf("[DEBUGGER-ACTIVATE] ⚠️ Lifecycle transition: timeout waiting for Continue() (5s). Still waiting...\n")
 				}
@@ -1160,6 +1283,8 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 						fmt.Printf("[DEBUGGER-ACTIVATE] Lifecycle transition: no pending step-in, still waiting for user...\n")
 					}
 				}
+				// Reset timer for next iteration
+				lifecycleTimer.Reset(5 * time.Second)
 			}
 		}
 	} else {
@@ -1269,6 +1394,7 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 			Column:   dbg.Column(),
 			ID:       id,
 			Epoch:    epoch,
+			VUID:     dbg.vuID,
 		})
 		if sendOK {
 			break
@@ -2085,14 +2211,25 @@ func (dbg *Debugger) GetRuntime() *Runtime {
 	return dbg.vm.r
 }
 
+// SetVUID assigns a VU identifier to this debugger instance. In multi-VU debug
+// mode, this ID is included in every DebuggerActivation so the DAP handler can
+// map activations to DAP thread IDs. Call this once after creating the debugger.
+func (dbg *Debugger) SetVUID(id uint64) {
+	dbg.vuID = id
+}
+
+// GetVUID returns the VU identifier for this debugger (0 if not set).
+func (dbg *Debugger) GetVUID() uint64 {
+	return dbg.vuID
+}
+
 func (dbg *Debugger) IsActive() bool {
 	return dbg.active
 }
 
 // AddWatch registers a watch expression. Returns its ID.
 func (dbg *Debugger) AddWatch(expression string) int {
-	watchExprCounter++
-	id := watchExprCounter
+	id := int(atomic.AddInt64(&watchExprCounter, 1))
 	dbg.watchExpressions = append(dbg.watchExpressions, watchExpr{id: id, expression: expression})
 	return id
 }
@@ -2391,10 +2528,15 @@ func (dbg *Debugger) Next() error {
 		dbg.lastBreakpoint.stackDepth = targetDepth
 	}
 
-	globalDebugCoordinator.SetGlobalStepState(true, false, steppingFilename, targetDepth)
+	// In multi-VU debug mode, step operations are local to this VU only — do NOT
+	// propagate to the global coordinator. This prevents VU1's Next() from causing
+	// VU2 to inherit step state and pause unexpectedly.
+	if !globalDebugCoordinator.IsMultiVUDebug() {
+		globalDebugCoordinator.SetGlobalStepState(true, false, steppingFilename, targetDepth)
+	}
 	if debugContinue {
-		fmt.Printf("[DEBUGGER-NEXT] After SetGlobalStepState: next=%v, stepIn=%v, steppingFilename=%s, targetDepth=%d\n",
-			dbg.next, dbg.stepIn, steppingFilename, targetDepth)
+		fmt.Printf("[DEBUGGER-NEXT] After SetGlobalStepState: next=%v, stepIn=%v, steppingFilename=%s, targetDepth=%d, multiVU=%v\n",
+			dbg.next, dbg.stepIn, steppingFilename, targetDepth, globalDebugCoordinator.IsMultiVUDebug())
 	}
 
 	if dbg.pendingCh != nil {
@@ -2549,11 +2691,15 @@ func (dbg *Debugger) ResetForNewRun() {
 	dbg.steppingFilename = ""
 
 	// Breakpoint position cache
+	// FIX: pc must be -1 (not 0) so that pcAdvanced (currentPC != prevPC) is true
+	// at PC=0 (function entry). Without this, the first instruction is skipped
+	// during step-in after a new run starts.
 	dbg.lastBreakpoint.filename = ""
 	dbg.lastBreakpoint.line = 0
-	dbg.lastBreakpoint.pc = 0
+	dbg.lastBreakpoint.pc = -1
 	dbg.lastBreakpoint.stackDepth = 0
 	dbg.lastDebugLine = -1
+	dbg.lastDebugDepth = -1
 	dbg.lastLine = 0
 	dbg.currentLine = 0
 
@@ -2709,19 +2855,8 @@ func (dbg *Debugger) breakpoint() bool {
 		// same line number are NOT suppressed. The inFunctionBody guard was removed
 		// because module-level init code runs inside a Go callback wrapper (bundle.go
 		// call(nil)) that pushes a call frame — callStackDepth >= 1 even at module level.
-		if !dbg.initBPSnapshotDone && !dbg.initPhase {
-			globalInitTracker.mu.RLock()
-			dbg.initBPSnapshot = make(map[initBPKey]bool, len(globalInitTracker.initBreakpointSet))
-			for k, v := range globalInitTracker.initBreakpointSet {
-				dbg.initBPSnapshot[k] = v
-			}
-			globalInitTracker.mu.RUnlock()
-			dbg.initBPSnapshotDone = true
-		}
-		// Zero-lock lookup from local snapshot
-		key := initBPKey{normalizedFilename, line}
-		hitGlobal := dbg.initBPSnapshot[key]
-		if hitGlobal {
+		dbg.ensureInitBPSnapshot()
+		if dbg.wasHitDuringInit(normalizedFilename, line) {
 			return false
 		}
 	}
@@ -2974,10 +3109,12 @@ func (dbg *Debugger) StepIn() error {
 		}
 	}
 
-	globalDebugCoordinator.SetGlobalStepState(false, true, steppingFilename, callDepth)
+	if !globalDebugCoordinator.IsMultiVUDebug() {
+		globalDebugCoordinator.SetGlobalStepState(false, true, steppingFilename, callDepth)
+	}
 	if debugContinue {
-		fmt.Printf("[DEBUGGER-STEPIN] After SetGlobalStepState: stepIn=%v, next=%v, steppingFilename=%s, callDepth=%d\n",
-			dbg.stepIn, dbg.next, steppingFilename, callDepth)
+		fmt.Printf("[DEBUGGER-STEPIN] After SetGlobalStepState: stepIn=%v, next=%v, steppingFilename=%s, callDepth=%d, multiVU=%v\n",
+			dbg.stepIn, dbg.next, steppingFilename, callDepth, globalDebugCoordinator.IsMultiVUDebug())
 	}
 
 	if dbg.pendingCh != nil {
@@ -3103,9 +3240,11 @@ func (dbg *Debugger) StepOut() error {
 	dbg.stepOverStartLine = dbg.Line() // don't re-break on current line
 	dbg.steppingFilename = steppingFilename
 
-	globalDebugCoordinator.SetGlobalStepState(true, false, steppingFilename, targetDepth)
+	if !globalDebugCoordinator.IsMultiVUDebug() {
+		globalDebugCoordinator.SetGlobalStepState(true, false, steppingFilename, targetDepth)
+	}
 	if debugContinue {
-		fmt.Printf("[DEBUGGER-STEPOUT] targetDepth=%d, steppingFilename=%s\n", targetDepth, steppingFilename)
+		fmt.Printf("[DEBUGGER-STEPOUT] targetDepth=%d, steppingFilename=%s, multiVU=%v\n", targetDepth, steppingFilename, globalDebugCoordinator.IsMultiVUDebug())
 	}
 
 	if dbg.pendingCh != nil {
@@ -3678,8 +3817,11 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		globalObj.self.setOwnStr(nameUni, varValues[i], false)
 	}
 
-	prog, compileErr := compile("<eval>", expr, false, true, nil, dbg.vm.debugMode, dbg.vm.r.parserOptions...)
-	if compileErr != nil {
+	// FIX: Restore globals in a defer so that a panic inside RunProgram
+	// (which can happen in sobek) does not permanently corrupt the global object.
+	// Previously the restore loop was inline after RunProgram and would be skipped
+	// on panic, leaving injected debugger variables on the global object.
+	restoreGlobals := func() {
 		for _, name := range varNames {
 			nameUni := unistring.String(name)
 			if savedVal, hadValue := savedVars[name]; hadValue {
@@ -3688,6 +3830,11 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 				globalObj.self.deleteStr(nameUni, false)
 			}
 		}
+	}
+	defer restoreGlobals()
+
+	prog, compileErr := compile("<eval>", expr, false, true, nil, dbg.vm.debugMode, dbg.vm.r.parserOptions...)
+	if compileErr != nil {
 		return nil, fmt.Errorf("compilation error: %w", compileErr)
 	}
 
@@ -3701,6 +3848,14 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 	func() {
 		dbg.suppressDebugger = true
 		defer func() { dbg.suppressDebugger = false }()
+		defer func() {
+			if r := recover(); r != nil {
+				evalErr = fmt.Errorf("evaluation panicked: %v", r)
+				if dbg.enableDebugLogging {
+					fmt.Printf("[DEBUGGER] evaluateComplexExpression: RunProgram panicked: %v\n", r)
+				}
+			}
+		}()
 		result, evalErr = dbg.vm.r.RunProgram(prog)
 	}()
 	if evalErr != nil {
@@ -3709,14 +3864,7 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		}
 	}
 
-	for _, name := range varNames {
-		nameUni := unistring.String(name)
-		if savedVal, hadValue := savedVars[name]; hadValue {
-			globalObj.self.setOwnStr(nameUni, savedVal, false)
-		} else {
-			globalObj.self.deleteStr(nameUni, false)
-		}
-	}
+	// NOTE: restoreGlobals() runs via defer above — no inline restore needed.
 
 	if evalErr != nil {
 		return nil, fmt.Errorf("evaluation error: %w", evalErr)
