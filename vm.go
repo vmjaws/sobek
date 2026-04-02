@@ -939,17 +939,21 @@ func (vm *vm) debug() {
 				// instead of calling HasAnyInitCompleted() again which acquires a redundant RLock.
 				anyInitCompleted := vm.debugger.initComplete
 
-				// MULTI-VU GUARD: In multi-VU debug mode, NEVER inherit global step state.
-				// Each VU's step operations are scoped to that VU only. Without this guard,
-				// VU1 pressing Next() propagates to the global coordinator, and VU2's
-				// vm.debug() loop inherits it — causing VU2 to pause unexpectedly.
-				// In single-VU mode (the default), inheritance is needed for lifecycle
-				// transitions (setup→default on different VUs).
-				if !GetGlobalCoordinator().IsMultiVUDebug() {
+				// Read step state from the appropriate source:
+				// - In multi-VU mode: per-VU step state (scoped to this VU only)
+				// - In single-VU mode: global step state (shared across VUs for lifecycle transitions)
+				var globalNext, globalStepIn bool
+				var globalSteppingFile string
+				var globalTargetDepth int
+				isMultiVU := GetGlobalCoordinator().IsMultiVUDebug()
 
-				// FIX #4: Read global step state once instead of two separate lock acquisitions
-				// (HasGlobalStepState then GetGlobalStepState). We need the values anyway.
-				globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := GetGlobalCoordinator().GetGlobalStepState()
+				if isMultiVU {
+					// Per-VU step state: only inherit state set by this VU's own
+					// Next()/StepIn()/StepOut() call. Other VUs' step state is invisible.
+					globalNext, globalStepIn, globalSteppingFile, globalTargetDepth = GetGlobalCoordinator().GetVUStepState(vm.debugger.vuID)
+				} else {
+					globalNext, globalStepIn, globalSteppingFile, globalTargetDepth = GetGlobalCoordinator().GetGlobalStepState()
+				}
 				hasGlobalStep := globalNext || globalStepIn
 
 				// Allow step state inheritance if:
@@ -966,25 +970,27 @@ func (vm *vm) debug() {
 					if globalTargetDepth > 0 && vm.debugger.stepOverTargetDepth == 0 {
 						vm.debugger.stepOverTargetDepth = 1
 					}
-						// FIX #2: Set stepOverOriginalTargetDepth so that activateWithStepState's
-						// "no user command" branch uses the correct depth instead of falling back
-						// to savedCallDepth (which can corrupt the target depth mid-step).
-						vm.debugger.stepOverOriginalTargetDepth = vm.debugger.stepOverTargetDepth
-						justInheritedStepState = true
+					// FIX #2: Set stepOverOriginalTargetDepth so that activateWithStepState's
+					// "no user command" branch uses the correct depth instead of falling back
+					// to savedCallDepth (which can corrupt the target depth mid-step).
+					vm.debugger.stepOverOriginalTargetDepth = vm.debugger.stepOverTargetDepth
+					justInheritedStepState = true
 
-						vm.debugger.lastBreakpoint.line = vm.debugger.Line()
-						vm.debugger.lastBreakpoint.pc = vm.pc
-						vm.debugger.lastBreakpoint.filename = vm.debugger.Filename()
-						vm.debugger.lastBreakpoint.stackDepth = vm.debugger.callStackDepth()
+					vm.debugger.lastBreakpoint.line = vm.debugger.Line()
+					vm.debugger.lastBreakpoint.pc = vm.pc
+					vm.debugger.lastBreakpoint.filename = vm.debugger.Filename()
+					vm.debugger.lastBreakpoint.stackDepth = vm.debugger.callStackDepth()
 
-						if vm.debugger.enableDebugLogging {
-							fmt.Printf("[VM] Inherited global step state: next=%v, stepIn=%v, file=%s, targetDepth=%d, originalTargetDepth=%d (anyInitCompleted=%v)\n",
-								globalNext, globalStepIn, globalSteppingFile, vm.debugger.stepOverTargetDepth, vm.debugger.stepOverOriginalTargetDepth, anyInitCompleted)
-						}
-					GetGlobalCoordinator().ClearGlobalStepState()
+					if vm.debugger.enableDebugLogging {
+						fmt.Printf("[VM] Inherited step state (multiVU=%v, vuID=%d): next=%v, stepIn=%v, file=%s, targetDepth=%d, originalTargetDepth=%d (anyInitCompleted=%v)\n",
+							isMultiVU, vm.debugger.vuID, globalNext, globalStepIn, globalSteppingFile, vm.debugger.stepOverTargetDepth, vm.debugger.stepOverOriginalTargetDepth, anyInitCompleted)
+					}
+					if isMultiVU {
+						GetGlobalCoordinator().ClearVUStepState(vm.debugger.vuID)
+					} else {
+						GetGlobalCoordinator().ClearGlobalStepState()
+					}
 				}
-
-				} // end: !IsMultiVUDebug() guard
 			}
 
 				// Check breakpoint FIRST before logging
@@ -1482,6 +1488,26 @@ func (vm *vm) debug() {
 					}
 
 					if shouldBreak {
+						// SKIP-PHASE-ENTRY: When RunOnce() enabled stepIn for a lifecycle
+						// transition AND set skipPhaseEntryBreak, don't stop at the
+						// function-signature line (PC=0).  Record the position so that
+						// the very next source line triggers the break instead.
+						// This saves the user one unnecessary step-over.
+						if vm.debugger.skipPhaseEntryBreak && currentPC == 0 && prevPC == -1 {
+							if debugVM {
+								fmt.Printf("[VM-LIFECYCLE-ENTRY] Skipping phase-entry break at line %d (PC=0) — will break at first statement\n", currentLine)
+							}
+							vm.debugger.skipPhaseEntryBreak = false
+							// Record position so lineChanged becomes true on the next line
+							vm.debugger.lastBreakpoint.filename = currentFilename
+							vm.debugger.lastBreakpoint.line = currentLine
+							vm.debugger.lastBreakpoint.pc = currentPC
+							vm.debugger.lastBreakpoint.stackDepth = currentStackDepth
+							goto executeInstruction
+						}
+						// Consume the flag if it's still set (we broke for another reason)
+						vm.debugger.skipPhaseEntryBreak = false
+
 						if vm.debugger.enableDebugLogging {
 							// Clarify when we stopped due to step command but there's also a breakpoint here
 							if hasBreakpoint && (breakReason == "next" || breakReason == "stepIn") {

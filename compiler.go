@@ -1058,10 +1058,34 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 				}
 			}
 
-			// Find PC range where this variable is accessible
-			// Start with scope boundaries as the default range
+			// Find PC range where this variable is accessible.
+			//
+			// In debug mode, for block-scoped variables (let/const inside
+			// try/catch/for/if), we extend the range to cover the ENTIRE
+			// enclosing function — not just the block scope. This matches
+			// Chrome DevTools behaviour: all function-local variables are
+			// visible at every PC inside the function, regardless of which
+			// block they were declared in. Without this, a `let` inside a
+			// try block would be invisible at any breakpoint outside it,
+			// while a `const` at the function top level would be visible.
 			scopeStart := s.base
 			scopeEnd := len(s.c.p.code)
+
+			// In debug mode, widen scopeStart to the enclosing function's
+			// base so block-scoped bindings are visible everywhere in the
+			// function. This is a debugger-only change — runtime semantics
+			// are unaffected (the stash walk still determines the actual
+			// value availability at runtime).
+			if s.c.debug && !s.isFunction() {
+				for p := s.outer; p != nil; p = p.outer {
+					if p.base < scopeStart {
+						scopeStart = p.base
+					}
+					if p.isFunction() {
+						break
+					}
+				}
+			}
 
 			minPC := scopeEnd
 			maxPC := scopeStart
@@ -1079,21 +1103,14 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 				}
 			}
 
-			// CRITICAL FIX: If access points produce an invalid or narrow range,
-			// extend to cover the entire scope. This ensures variables are visible
-			// throughout the function body in the debugger.
+			// Extend to cover the full (possibly widened) scope range.
 			if minPC > maxPC || minPC >= scopeEnd {
-				// No valid access points - use full scope range
 				minPC = scopeStart
 				maxPC = scopeEnd - 1
 			} else {
-				// Extend range: all variables should be visible from their scope's
-				// start to end. This covers function parameters, block-scoped
-				// variables, and catch block parameters.
 				if scopeStart < minPC {
 					minPC = scopeStart
 				}
-				// Extend to end of scope for all variables
 				if maxPC < scopeEnd-1 {
 					maxPC = scopeEnd - 1
 				}

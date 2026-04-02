@@ -136,6 +136,13 @@ func (fl *File) SetSourceMap(m *sourcemap.Consumer) {
 	fl.sourceMap = m
 }
 
+// SourceMap returns the source map consumer, or nil if none is set.
+// This is the getter counterpart to SetSourceMap — only used by the debugger
+// (inside if-debugMode guards) to resolve bundler-renamed variables.
+func (fl *File) SourceMap() *sourcemap.Consumer {
+	return fl.sourceMap
+}
+
 func (fl *File) Position(offset int) Position {
 	var line int
 	var lineOffsets []int

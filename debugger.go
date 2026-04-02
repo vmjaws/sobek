@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/go-sourcemap/sourcemap"
 	"github.com/grafana/sobek/unistring"
 )
 
@@ -91,9 +92,31 @@ type GlobalDebugCoordinator struct {
 	//  - activate() does NOT inherit global step state from other VUs.
 	//  - Each debugger carries a vuID that is included in DebuggerActivation
 	//    so the DAP handler can map VUs to DAP thread IDs.
-	// Enabled by K6_DEBUG_MULTI_VU=1 in the environment.
+	//  - Per-VU activation channels are used instead of the single global
+	//    activationCh, eliminating the bottleneck when multiple VUs hit
+	//    breakpoints simultaneously.
+	// Enabled by default when debug mode is active. Set K6_DEBUG_MULTI_VU=0
+	// in the environment to disable and enforce single-VU debugging.
 	multiVUDebug    bool
 	activeDebuggers map[uint64]*Debugger // vuID → debugger (all currently registered debuggers)
+
+	// perVUActivationCh provides per-VU activation channels in multi-VU mode.
+	// Each VU gets its own channel so simultaneous breakpoint hits don't
+	// contend on a single global channel. Only used when multiVUDebug=true.
+	perVUActivationCh map[uint64]chan chan DebuggerActivation
+
+	// perVUStepState holds per-VU step state in multi-VU mode. In single-VU
+	// mode, the global fields (globalStepNext, etc.) are used instead.
+	perVUStepState map[uint64]*vuStepState
+}
+
+// vuStepState holds step operation state scoped to a single VU.
+// Only used in multi-VU debug mode.
+type vuStepState struct {
+	next             bool
+	stepIn           bool
+	steppingFile     string
+	targetDepth      int
 }
 
 var globalDebugCoordinator = &GlobalDebugCoordinator{
@@ -130,6 +153,8 @@ func (gdc *GlobalDebugCoordinator) resetLocked() {
 	gdc.waitForFunctionEntry = false
 	gdc.globalActivationEpoch = 0
 	gdc.activeDebuggers = make(map[uint64]*Debugger)
+	gdc.perVUActivationCh = make(map[uint64]chan chan DebuggerActivation)
+	gdc.perVUStepState = make(map[uint64]*vuStepState)
 	// NOTE: multiVUDebug is NOT reset here — it's set once at startup from the
 	// environment variable and must survive across lifecycle phase resets.
 }
@@ -188,6 +213,100 @@ func (gdc *GlobalDebugCoordinator) GetAllDebuggers() map[uint64]*Debugger {
 		result[k] = v
 	}
 	return result
+}
+
+// ── Per-VU activation channels (multi-VU mode) ─────────────────────────────
+
+// GetVUActivationChannel returns the per-VU activation channel for the given vuID.
+// In multi-VU mode, each VU has its own channel to avoid contention.
+// In single-VU mode, returns the global activationCh.
+func (gdc *GlobalDebugCoordinator) GetVUActivationChannel(vuID uint64) chan chan DebuggerActivation {
+	if !gdc.multiVUDebug {
+		return gdc.activationCh
+	}
+	gdc.mu.Lock()
+	ch, ok := gdc.perVUActivationCh[vuID]
+	if !ok {
+		ch = make(chan chan DebuggerActivation, 1)
+		gdc.perVUActivationCh[vuID] = ch
+	}
+	gdc.mu.Unlock()
+	return ch
+}
+
+// DrainVUActivationChannel removes any stale entries from a VU-specific
+// activation channel. In single-VU mode, drains the global channel.
+func (gdc *GlobalDebugCoordinator) DrainVUActivationChannel(vuID uint64) {
+	ch := gdc.GetVUActivationChannel(vuID)
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+// ── Per-VU step state (multi-VU mode) ───────────────────────────────────────
+
+// SetVUStepState sets step state for a specific VU. Only used in multi-VU mode.
+func (gdc *GlobalDebugCoordinator) SetVUStepState(vuID uint64, next, stepIn bool, filename string, targetDepth int) {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	if gdc.perVUStepState == nil {
+		gdc.perVUStepState = make(map[uint64]*vuStepState)
+	}
+	gdc.perVUStepState[vuID] = &vuStepState{
+		next:         next,
+		stepIn:       stepIn,
+		steppingFile: filename,
+		targetDepth:  targetDepth,
+	}
+	if debugGlobalStep {
+		fmt.Printf("[GLOBAL-STEP] SetVUStepState(vuID=%d): next=%v, stepIn=%v, file=%s, depth=%d\n",
+			vuID, next, stepIn, filename, targetDepth)
+	}
+}
+
+// GetVUStepState reads step state for a specific VU. Returns zero values if no
+// state is set. Only used in multi-VU mode.
+func (gdc *GlobalDebugCoordinator) GetVUStepState(vuID uint64) (next, stepIn bool, filename string, targetDepth int) {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	if gdc.perVUStepState == nil {
+		return
+	}
+	s := gdc.perVUStepState[vuID]
+	if s == nil {
+		return
+	}
+	return s.next, s.stepIn, s.steppingFile, s.targetDepth
+}
+
+// ClearVUStepState clears step state for a specific VU. Only used in multi-VU mode.
+func (gdc *GlobalDebugCoordinator) ClearVUStepState(vuID uint64) {
+	gdc.mu.Lock()
+	defer gdc.mu.Unlock()
+	if gdc.perVUStepState != nil {
+		delete(gdc.perVUStepState, vuID)
+	}
+	if debugGlobalStep {
+		fmt.Printf("[GLOBAL-STEP] ClearVUStepState(vuID=%d)\n", vuID)
+	}
+}
+
+// HasVUStepState returns true if the given VU has pending step state.
+func (gdc *GlobalDebugCoordinator) HasVUStepState(vuID uint64) bool {
+	gdc.mu.RLock()
+	defer gdc.mu.RUnlock()
+	if gdc.perVUStepState == nil {
+		return false
+	}
+	s := gdc.perVUStepState[vuID]
+	if s == nil {
+		return false
+	}
+	return s.next || s.stepIn
 }
 
 // MaybeInitGlobalCoordinator initializes the coordinator only if it hasn't been
@@ -432,7 +551,7 @@ const (
 var (
 	globalVMRegistry   VMRegistry
 	globalVMRegistryMu sync.RWMutex
-	watchExprCounter   int64 // FIX: use atomic — AddWatch may be called from DAP goroutine
+	watchExprCounter   int64 // atomic — AddWatch may be called from DAP goroutine
 )
 
 func SetGlobalRegistry(registry VMRegistry) {
@@ -861,6 +980,21 @@ type Debugger struct {
 	pausedVarSnapshot     map[string]Value
 	pausedVarSnapshotLine int
 
+	// PERF: Source map name mapping cache — maps generated variable names (from
+	// the bundler output) to original names (from the user's TypeScript source)
+	// and vice versa. Built lazily per-program when the debugger is paused.
+	// This is how Node.js / Chrome DevTools handle bundler variable renaming:
+	// the source map's "names" array encodes original→generated name mappings
+	// that the debugger uses to present original names and resolve lookups.
+	//
+	// genToOrig: generated name (stash key) → original name (user source)
+	//   e.g., "test2" → "test" (bundler renamed due to import collision)
+	// origToGen: original name (user hover/eval) → generated name (stash key)
+	//   e.g., "test" → "test2"
+	cachedNameMapPrg  *Program
+	cachedGenToOrig   map[string]string // generated name → original name
+	cachedOrigToGen   map[string]string // original name → generated name
+
 	// ---
 
 	varDeclLines     map[string]int
@@ -1288,72 +1422,69 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 			}
 		}
 	} else {
+		// In multi-VU mode, use per-VU activation channel; in single-VU, use global.
+		vuActivationCh := globalDebugCoordinator.GetVUActivationChannel(dbg.vuID)
 		if debugActivate {
-			fmt.Printf("[DEBUGGER-ACTIVATE] Non-lifecycle: waiting on both channels\n")
+			fmt.Printf("[DEBUGGER-ACTIVATE] Non-lifecycle: waiting on both channels (multiVU=%v, vuID=%d, localCh=%p, vuCh=%p, vmExited=%v)\n",
+				globalDebugCoordinator.IsMultiVUDebug(), dbg.vuID, dbg.activationCh, vuActivationCh, dbg.vmExited)
+		}
+		// readStepState reads step state from per-VU or global source as appropriate.
+		readStepState := func() (bool, bool, string, int) {
+			if globalDebugCoordinator.IsMultiVUDebug() {
+				return globalDebugCoordinator.GetVUStepState(dbg.vuID)
+			}
+			return globalDebugCoordinator.GetGlobalStepState()
+		}
+		clearStepState := func() {
+			if globalDebugCoordinator.IsMultiVUDebug() {
+				globalDebugCoordinator.ClearVUStepState(dbg.vuID)
+			} else {
+				globalDebugCoordinator.ClearGlobalStepState()
+			}
+		}
+		// applyStepState applies step state from the coordinator if available.
+		applyStepState := func(source string) {
+			if savedStepIn {
+				if debugActivate {
+					fmt.Printf("[DEBUGGER-ACTIVATE] Skipping step state check (lifecycle stepIn entry, stale state from previous phase)\n")
+				}
+				return
+			}
+			globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := readStepState()
+			if globalNext || globalStepIn {
+				if debugActivate {
+					fmt.Printf("[DEBUGGER-ACTIVATE] Non-lifecycle %s: applying step state: next=%v, stepIn=%v, file=%s, targetDepth=%d\n",
+						source, globalNext, globalStepIn, globalSteppingFile, globalTargetDepth)
+				}
+				dbg.next = globalNext
+				dbg.stepIn = globalStepIn
+				dbg.steppingFilename = globalSteppingFile
+				localDepth := savedCallDepth
+				if globalTargetDepth > 0 && globalTargetDepth < localDepth {
+					dbg.stepOverTargetDepth = globalTargetDepth
+				} else {
+					dbg.stepOverTargetDepth = localDepth
+				}
+				if debugActivate {
+					fmt.Printf("[DEBUGGER-ACTIVATE] ✅ Using depth=%d (local=%d, global=%d, line=%d)\n",
+						dbg.stepOverTargetDepth, localDepth, globalTargetDepth, line)
+				}
+				dbg.stepOverStartLine = line
+				dbg.userCommandIssued = true
+				clearStepState()
+			}
 		}
 		select {
 		case ch = <-dbg.activationCh:
 			if debugActivate {
 				fmt.Printf("[DEBUGGER-ACTIVATE] Received from local channel (non-lifecycle)\n")
 			}
-			if !savedStepIn {
-				globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := globalDebugCoordinator.GetGlobalStepState()
-				if globalNext || globalStepIn {
-					if debugActivate {
-						fmt.Printf("[DEBUGGER-ACTIVATE] Non-lifecycle local channel: applying global step state: next=%v, stepIn=%v, file=%s, targetDepth=%d\n",
-							globalNext, globalStepIn, globalSteppingFile, globalTargetDepth)
-					}
-					dbg.next = globalNext
-					dbg.stepIn = globalStepIn
-					dbg.steppingFilename = globalSteppingFile
-					localDepth := savedCallDepth
-					// For step-out, globalTargetDepth < localDepth. Use it so we
-					// break when depth drops to the caller's level.
-					if globalTargetDepth > 0 && globalTargetDepth < localDepth {
-						dbg.stepOverTargetDepth = globalTargetDepth
-					} else {
-						dbg.stepOverTargetDepth = localDepth
-					}
-					if debugActivate {
-						fmt.Printf("[DEBUGGER-ACTIVATE] ✅ Using depth=%d (local=%d, global=%d, line=%d)\n",
-							dbg.stepOverTargetDepth, localDepth, globalTargetDepth, line)
-					}
-					dbg.stepOverStartLine = line
-					dbg.userCommandIssued = true
-					globalDebugCoordinator.ClearGlobalStepState()
-				}
-			} else if debugActivate {
-				fmt.Printf("[DEBUGGER-ACTIVATE] Skipping global step state check (lifecycle stepIn entry, stale state from previous phase)\n")
-			}
-		case ch = <-globalDebugCoordinator.ActivationChannel():
+			applyStepState("local")
+		case ch = <-vuActivationCh:
 			if debugActivate {
-				fmt.Printf("[DEBUGGER-ACTIVATE] Received from global coordinator (non-lifecycle)\n")
+				fmt.Printf("[DEBUGGER-ACTIVATE] Received from coordinator (non-lifecycle, multiVU=%v, vuID=%d)\n", globalDebugCoordinator.IsMultiVUDebug(), dbg.vuID)
 			}
-			if !savedStepIn {
-				globalNext, globalStepIn, globalSteppingFile, globalTargetDepth := globalDebugCoordinator.GetGlobalStepState()
-				if globalNext || globalStepIn {
-					dbg.next = globalNext
-					dbg.stepIn = globalStepIn
-					dbg.steppingFilename = globalSteppingFile
-					localDepth := savedCallDepth
-					// For step-out, globalTargetDepth < localDepth. Use it so we
-					// break when depth drops to the caller's level.
-					if globalTargetDepth > 0 && globalTargetDepth < localDepth {
-						dbg.stepOverTargetDepth = globalTargetDepth
-					} else {
-						dbg.stepOverTargetDepth = localDepth
-					}
-					dbg.stepOverStartLine = line
-					dbg.userCommandIssued = true
-					if debugActivate {
-						fmt.Printf("[DEBUGGER-ACTIVATE] Applied user command from global state: next=%v, stepIn=%v, file=%s, globalDepth=%d, localDepth=%d, appliedDepth=%d, startLine=%d\n",
-							globalNext, globalStepIn, globalSteppingFile, globalTargetDepth, localDepth, dbg.stepOverTargetDepth, line)
-					}
-					globalDebugCoordinator.ClearGlobalStepState()
-				}
-			} else if debugActivate {
-				fmt.Printf("[DEBUGGER-ACTIVATE] Skipping global step state check (lifecycle stepIn entry, stale state from previous phase)\n")
-			}
+			applyStepState("coordinator")
 		}
 	}
 
@@ -1386,6 +1517,12 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 	// closed by a concurrent Continue()/Next()/StepIn() call on another
 	// goroutine. If the channel is stale (closed), go back and wait for a
 	// fresh channel instead of skipping the pause.
+	//
+	// FIX: Use time.NewTimer instead of time.After to prevent goroutine leaks.
+	// time.After creates a timer+goroutine that is never collected if the select
+	// resolves before the timeout fires.
+	retryTimer := time.NewTimer(5 * time.Second)
+	defer retryTimer.Stop()
 	for retries := 0; retries < 5; retries++ {
 		sendOK := safeSendActivation(ch, DebuggerActivation{
 			Reason:   reason,
@@ -1404,6 +1541,13 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 				filename, line, retries+1)
 		}
 		// Wait for a fresh channel from Continue()
+		if !retryTimer.Stop() {
+			select {
+			case <-retryTimer.C:
+			default:
+			}
+		}
+		retryTimer.Reset(5 * time.Second)
 		select {
 		case ch = <-dbg.activationCh:
 			if debugActivate {
@@ -1415,7 +1559,7 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 				fmt.Printf("[DEBUGGER-ACTIVATE] Got fresh channel from global (retry)\n")
 			}
 			dbg.pendingCh = ch
-		case <-time.After(5 * time.Second):
+		case <-retryTimer.C:
 			if debugActivate {
 				fmt.Printf("[DEBUGGER-ACTIVATE] ⚠️ Timeout waiting for fresh channel at %s:%d — resuming VM\n",
 					filename, line)
@@ -1821,25 +1965,58 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 	}
 
 	localTimedOut := localDead
+	isMultiVU := globalDebugCoordinator.IsMultiVUDebug()
+	// In multi-VU mode, use per-VU activation channel instead of the global one.
+	vuActivationCh := globalDebugCoordinator.GetVUActivationChannel(dbg.vuID)
+
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-CONTINUE] Loop init: localTimedOut=%v, isMultiVU=%v, vuID=%d, currentCh=%p, vuCh=%p, vmExited=%v\n",
+			localTimedOut, isMultiVU, dbg.vuID, dbg.currentCh, vuActivationCh, dbg.vmExited)
+	}
+
 	for {
 		// FIX #5: Re-read global step state at the top of each iteration.
 		// Without this, hasGlobalStepState stays stale if Next()/StepIn()
 		// is called by the DAP handler on another goroutine mid-loop,
 		// causing the routing logic (global vs local channel) to be wrong.
-		globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+		if isMultiVU {
+			// In multi-VU mode, check per-VU step state instead of global.
+			globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
+		} else {
+			globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+		}
 		hasGlobalStepState = globalNext || globalStepIn
 
 		if localTimedOut {
-			select {
-			case <-globalDebugCoordinator.ActivationChannel():
+			// Guard: if currentCh became nil (e.g. ResetForPhaseTransition ran
+			// on another goroutine while this Continue() was in-flight), we
+			// cannot send a nil channel to vuActivationCh — activate() would
+			// block forever trying to send on nil.  Re-create it.
+			if dbg.currentCh == nil {
+				dbg.currentCh = make(chan DebuggerActivation)
 				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Drained stale entry from global coordinator channel\n")
+					fmt.Printf("[DEBUGGER-CONTINUE] currentCh was nil (phase transition?), recreated %p\n", dbg.currentCh)
+				}
+			}
+			// Drain any stale entry first, then do a blocking send so
+			// activate() always gets a fresh, valid currentCh.
+			select {
+			case <-vuActivationCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Drained stale entry from coordinator channel (multiVU=%v, vuID=%d)\n", isMultiVU, dbg.vuID)
 				}
 			default:
 			}
-			globalDebugCoordinator.ActivationChannel() <- dbg.currentCh
-			if debugContinue {
-				fmt.Printf("[DEBUGGER-CONTINUE] Sent to global coordinator (local VM exited), waiting for activation\n")
+			select {
+			case vuActivationCh <- dbg.currentCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Sent to coordinator (local VM exited, multiVU=%v, vuID=%d, ch=%p, vuCh=%p), waiting for activation\n", isMultiVU, dbg.vuID, dbg.currentCh, vuActivationCh)
+				}
+			default:
+				// Should not happen after drain, but be safe.
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Coordinator channel full after drain (multiVU=%v, vuID=%d), waiting for activate() to consume\n", isMultiVU, dbg.vuID)
+				}
 			}
 			if activation, ok, _ := waitForActivation("global", true); ok {
 				return activation
@@ -1849,17 +2026,21 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 			stopTimer(outerTimer)
 			outerTimer.Reset(2 * time.Second)
 			select {
-			case globalDebugCoordinator.ActivationChannel() <- dbg.currentCh:
+			case vuActivationCh <- dbg.currentCh:
 				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Sent to global coordinator (preferred due to global step state), waiting for activation\n")
+					fmt.Printf("[DEBUGGER-CONTINUE] Sent to coordinator (preferred due to step state, multiVU=%v, vuID=%d), waiting for activation\n", isMultiVU, dbg.vuID)
 				}
 				if activation, ok, vmExited := waitForActivation("global", false); ok {
 					return activation
 				} else if vmExited {
 					localTimedOut = true
 				}
-				// re-read global state only after a transition
-				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				// re-read step state only after a transition
+				if isMultiVU {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
+				} else {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				}
 				hasGlobalStepState = globalNext || globalStepIn
 			case dbg.activationCh <- dbg.currentCh:
 				if debugContinue {
@@ -1870,14 +2051,22 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 				} else if vmExited {
 					localTimedOut = true
 				}
-				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				if isMultiVU {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
+				} else {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				}
 				hasGlobalStepState = globalNext || globalStepIn
 			case <-dbg.vmDoneCh:
 				if debugContinue {
 					fmt.Printf("[DEBUGGER-CONTINUE] VM exited (vmDoneCh) while waiting for receiver, switching to global-only\n")
 				}
 				localTimedOut = true
-				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				if isMultiVU {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
+				} else {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				}
 				hasGlobalStepState = globalNext || globalStepIn
 			case <-outerTimer.C:
 				if debugContinue {
@@ -1888,7 +2077,11 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 					localTimedOut = true
 				default:
 				}
-				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				if isMultiVU {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
+				} else {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				}
 				hasGlobalStepState = globalNext || globalStepIn
 			}
 		} else {
@@ -1907,34 +2100,55 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 						fmt.Printf("[DEBUGGER-CONTINUE] Local VM exited, switching to global-only mode (hasGlobalStepState=%v)\n", hasGlobalStepState)
 					}
 				}
-				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				if isMultiVU {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
+				} else {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				}
 				hasGlobalStepState = globalNext || globalStepIn
-			case globalDebugCoordinator.ActivationChannel() <- dbg.currentCh:
+			case vuActivationCh <- dbg.currentCh:
 				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Sent to global coordinator, waiting for activation\n")
+					fmt.Printf("[DEBUGGER-CONTINUE] Sent to coordinator (multiVU=%v, vuID=%d), waiting for activation\n", isMultiVU, dbg.vuID)
 				}
-				if activation, ok, _ := waitForActivation("global", false); ok {
+				if activation, ok, vmExited := waitForActivation("global", false); ok {
 					return activation
+				} else if vmExited {
+					localTimedOut = true
+					if debugContinue {
+						fmt.Printf("[DEBUGGER-CONTINUE] VM exited after coordinator send, switching to global-only mode (hasGlobalStepState=%v)\n", hasGlobalStepState)
+					}
 				}
-				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				if isMultiVU {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
+				} else {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				}
 				hasGlobalStepState = globalNext || globalStepIn
 			case <-dbg.vmDoneCh:
 				if debugContinue {
 					fmt.Printf("[DEBUGGER-CONTINUE] VM exited (vmDoneCh) while waiting for receiver, switching to global-only\n")
 				}
 				localTimedOut = true
-				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				if isMultiVU {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
+				} else {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				}
 				hasGlobalStepState = globalNext || globalStepIn
 			case <-outerTimer.C:
 				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] ⚠️ Timeout waiting for receiver (hasGlobalStepState=%v), checking global state...\n", hasGlobalStepState)
+					fmt.Printf("[DEBUGGER-CONTINUE] ⚠️ Timeout waiting for receiver (hasGlobalStepState=%v), checking state...\n", hasGlobalStepState)
 				}
 				select {
 				case <-dbg.vmDoneCh:
 					localTimedOut = true
 				default:
 				}
-				globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				if isMultiVU {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
+				} else {
+					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+				}
 				hasGlobalStepState = globalNext || globalStepIn
 			}
 		}
@@ -2531,12 +2745,15 @@ func (dbg *Debugger) Next() error {
 	// In multi-VU debug mode, step operations are local to this VU only — do NOT
 	// propagate to the global coordinator. This prevents VU1's Next() from causing
 	// VU2 to inherit step state and pause unexpectedly.
+	// Instead, use per-VU step state so the correct VU receives the step command.
 	if !globalDebugCoordinator.IsMultiVUDebug() {
 		globalDebugCoordinator.SetGlobalStepState(true, false, steppingFilename, targetDepth)
+	} else {
+		globalDebugCoordinator.SetVUStepState(dbg.vuID, true, false, steppingFilename, targetDepth)
 	}
 	if debugContinue {
-		fmt.Printf("[DEBUGGER-NEXT] After SetGlobalStepState: next=%v, stepIn=%v, steppingFilename=%s, targetDepth=%d, multiVU=%v\n",
-			dbg.next, dbg.stepIn, steppingFilename, targetDepth, globalDebugCoordinator.IsMultiVUDebug())
+		fmt.Printf("[DEBUGGER-NEXT] After SetGlobalStepState: next=%v, stepIn=%v, steppingFilename=%s, targetDepth=%d, multiVU=%v, vuID=%d\n",
+			dbg.next, dbg.stepIn, steppingFilename, targetDepth, globalDebugCoordinator.IsMultiVUDebug(), dbg.vuID)
 	}
 
 	if dbg.pendingCh != nil {
@@ -2652,11 +2869,16 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 	case <-dbg.activationCh:
 	default:
 	}
-	// CRITICAL: Also drain the global coordinator's activation channel.
-	// If a stale currentCh was sent to the global coordinator before the phase
+	// CRITICAL: Also drain the coordinator's activation channel.
+	// If a stale currentCh was sent to the coordinator before the phase
 	// transition, it won't be drained by the local drain above. This prevents
 	// 0ms phantom handshakes on the first breakpoint of the new phase.
 	globalDebugCoordinator.DrainActivationChannel()
+	// In multi-VU mode, also drain the per-VU activation channel.
+	if globalDebugCoordinator.IsMultiVUDebug() {
+		globalDebugCoordinator.DrainVUActivationChannel(dbg.vuID)
+		globalDebugCoordinator.ClearVUStepState(dbg.vuID)
+	}
 	dbg.pendingCh = nil
 	dbg.currentCh = nil
 
@@ -2781,6 +3003,9 @@ func (dbg *Debugger) ClearLocalStepState() {
 	dbg.lifecycleTransition = false
 	dbg.pausedVarSnapshot = nil
 	globalDebugCoordinator.ClearGlobalStepState()
+	if globalDebugCoordinator.IsMultiVUDebug() {
+		globalDebugCoordinator.ClearVUStepState(dbg.vuID)
+	}
 }
 
 func (dbg *Debugger) Exec(expr string) (Value, error) {
@@ -3111,10 +3336,12 @@ func (dbg *Debugger) StepIn() error {
 
 	if !globalDebugCoordinator.IsMultiVUDebug() {
 		globalDebugCoordinator.SetGlobalStepState(false, true, steppingFilename, callDepth)
+	} else {
+		globalDebugCoordinator.SetVUStepState(dbg.vuID, false, true, steppingFilename, callDepth)
 	}
 	if debugContinue {
-		fmt.Printf("[DEBUGGER-STEPIN] After SetGlobalStepState: stepIn=%v, next=%v, steppingFilename=%s, callDepth=%d, multiVU=%v\n",
-			dbg.stepIn, dbg.next, steppingFilename, callDepth, globalDebugCoordinator.IsMultiVUDebug())
+		fmt.Printf("[DEBUGGER-STEPIN] After SetGlobalStepState: stepIn=%v, next=%v, steppingFilename=%s, callDepth=%d, multiVU=%v, vuID=%d\n",
+			dbg.stepIn, dbg.next, steppingFilename, callDepth, globalDebugCoordinator.IsMultiVUDebug(), dbg.vuID)
 	}
 
 	if dbg.pendingCh != nil {
@@ -3154,6 +3381,14 @@ func (dbg *Debugger) SetStepIn(v bool) {
 		fmt.Printf("[DEBUGGER] SetStepIn: %v (was: %v)\n", v, dbg.stepIn)
 	}
 	dbg.stepIn = v
+}
+
+// SetSkipPhaseEntryBreak tells the debug loop to skip the very first break
+// at a lifecycle function entry (the function-signature line) and instead
+// continue to the first executable statement.  This eliminates the extra
+// step-over the user would otherwise need to reach real code.
+func (dbg *Debugger) SetSkipPhaseEntryBreak(v bool) {
+	dbg.skipPhaseEntryBreak = v
 }
 
 func (dbg *Debugger) GetStepIn() bool {
@@ -3242,9 +3477,12 @@ func (dbg *Debugger) StepOut() error {
 
 	if !globalDebugCoordinator.IsMultiVUDebug() {
 		globalDebugCoordinator.SetGlobalStepState(true, false, steppingFilename, targetDepth)
+	} else {
+		globalDebugCoordinator.SetVUStepState(dbg.vuID, true, false, steppingFilename, targetDepth)
 	}
 	if debugContinue {
-		fmt.Printf("[DEBUGGER-STEPOUT] targetDepth=%d, steppingFilename=%s, multiVU=%v\n", targetDepth, steppingFilename, globalDebugCoordinator.IsMultiVUDebug())
+		fmt.Printf("[DEBUGGER-STEPOUT] targetDepth=%d, steppingFilename=%s, multiVU=%v, vuID=%d\n",
+			targetDepth, steppingFilename, globalDebugCoordinator.IsMultiVUDebug(), dbg.vuID)
 	}
 
 	if dbg.pendingCh != nil {
@@ -3525,6 +3763,253 @@ func isDotPropertyChain(s string) bool {
 	return true
 }
 
+// ── Source Map Name Mapping (Node.js / Chrome DevTools parity) ───────────────
+//
+// When TypeScript is bundled, the bundler may rename variables to avoid
+// collisions (e.g., "import {test} from 'k6/execution'" plus "let test = ..."
+// causes the bundler to rename the local to "test2"). The source map's "names"
+// array encodes the original identifier name at each generated position.
+//
+// buildSourceMapNameMapping walks all VarLocation entries from debug symbols,
+// queries the source map at each variable's access-point PCs, and builds two
+// maps:
+//   - genToOrig: generated stash name → original source name  (display)
+//   - origToGen: original source name → generated stash name  (lookup)
+//
+// Cached per *Program — the mapping is stable for the lifetime of a compiled
+// function. Only built when debugMode is enabled and a source map exists.
+
+// buildSourceMapNameMapping builds (or returns cached) bidirectional name
+// mappings between generated variable names and original source names using
+// the source map. Returns (genToOrig, origToGen). Both maps may be nil when
+// no source map is available or no renames were detected.
+// Only runs in debug mode — all source map access is confined here.
+// Wrapped in recover so a panic can never crash the calling goroutine.
+func (dbg *Debugger) buildSourceMapNameMapping() (genToOrig, origToGen map[string]string) {
+	if !dbg.vm.debugMode {
+		return nil, nil
+	}
+
+	// Recover from any panic — this is a best-effort debugger enhancement.
+	// A failure here must never affect stepping/continue/activation flow.
+	defer func() {
+		if r := recover(); r != nil {
+			if dbg.enableDebugLogging {
+				fmt.Printf("[DEBUGGER] buildSourceMapNameMapping: recovered from panic: %v\n", r)
+			}
+			genToOrig = nil
+			origToGen = nil
+			dbg.cachedNameMapPrg = nil // invalidate cache on error
+		}
+	}()
+
+	prg := dbg.vm.prg
+	if prg == nil || prg.src == nil || prg.src.SourceMap() == nil {
+		return nil, nil
+	}
+
+	// Return cached mapping if still valid for this program.
+	if dbg.cachedNameMapPrg == prg {
+		return dbg.cachedGenToOrig, dbg.cachedOrigToGen
+	}
+
+	sm := prg.src.SourceMap()
+	genSrc := prg.src.Source()
+	genToOrig = make(map[string]string)
+	origToGen = make(map[string]string)
+
+	// Strategy: walk all debug-symbol VarLocations. For each variable, probe
+	// the source map at a few PCs within its range to find a name mapping.
+	// The source map entry at a given generated position returns the original
+	// identifier name — we pair that with the VarLocation.Name (the generated
+	// name) to build the bidirectional map.
+	if prg.debugSymbols != nil {
+		allVarLocs := prg.debugSymbols.LookupVarsAtPC(dbg.vm.pc)
+
+		for _, varLoc := range allVarLocs {
+			genName := varLoc.Name
+			if !isSimpleIdentifier(genName) || strings.TrimSpace(genName) == "this" {
+				continue
+			}
+
+			// Probe the source map at the VarLocation's StartPC and the
+			// current PC. The source map name entry is only set at positions
+			// that correspond to identifier tokens, so we may need to check
+			// multiple PCs.
+			probePCs := []int{varLoc.StartPC}
+			if dbg.vm.pc != varLoc.StartPC {
+				probePCs = append(probePCs, dbg.vm.pc)
+			}
+
+			for _, probePC := range probePCs {
+				if probePC < 0 || probePC >= len(prg.code) {
+					continue
+				}
+				srcOffset := prg.sourceOffset(probePC)
+				originalName := debugSourceMapNameAtOffset(sm, genSrc, srcOffset)
+				if originalName != "" && originalName != genName && isSimpleIdentifier(originalName) {
+					genToOrig[genName] = originalName
+					origToGen[originalName] = genName
+					break
+				}
+			}
+		}
+
+		// If the direct approach didn't find mappings, try a bounded scan
+		// of srcMap entries. Cap at 500 entries to prevent slowness on large
+		// bundles — this is a best-effort fallback.
+		if len(genToOrig) == 0 && len(prg.srcMap) > 0 {
+			limit := len(prg.srcMap)
+			if limit > 500 {
+				limit = 500
+			}
+			for i := 0; i < limit; i++ {
+				item := prg.srcMap[i]
+				originalName := debugSourceMapNameAtOffset(sm, genSrc, item.srcPos)
+				if originalName == "" || !isSimpleIdentifier(originalName) {
+					continue
+				}
+				genToken := extractIdentifierAt(genSrc, item.srcPos)
+				if genToken != "" && genToken != originalName {
+					if _, exists := genToOrig[genToken]; !exists {
+						genToOrig[genToken] = originalName
+					}
+					if _, exists := origToGen[originalName]; !exists {
+						origToGen[originalName] = genToken
+					}
+				}
+			}
+		}
+	}
+
+	// Cache for this program.
+	dbg.cachedNameMapPrg = prg
+	dbg.cachedGenToOrig = genToOrig
+	dbg.cachedOrigToGen = origToGen
+
+	if debugCompiler && len(genToOrig) > 0 {
+		fmt.Printf("[DEBUGGER] Source map name mapping built: %d entries\n", len(genToOrig))
+		for gen, orig := range genToOrig {
+			fmt.Printf("[DEBUGGER]   %s → %s (original)\n", gen, orig)
+		}
+	}
+
+	return genToOrig, origToGen
+}
+
+// debugSourceMapNameAtOffset queries the source map for the original identifier
+// name at the given source offset in the generated JS code. Returns "" if no
+// name mapping exists. This duplicates the line/col computation from
+// file.Position() so the debugger can query the source map without modifying
+// any runtime code — all calls are gated by if-debugMode.
+func debugSourceMapNameAtOffset(sm *sourcemap.Consumer, genSrc string, offset int) string {
+	if sm == nil || offset < 0 || offset >= len(genSrc) {
+		return ""
+	}
+
+	// Compute generated line/col from the source offset.
+	// This mirrors the logic in file.File.Position() exactly.
+	line := 0
+	lastLineStart := 0
+	for i := 0; i < offset && i < len(genSrc); i++ {
+		if genSrc[i] == '\n' {
+			line++
+			lastLineStart = i + 1
+		} else if genSrc[i] == '\r' {
+			line++
+			if i+1 < len(genSrc) && genSrc[i+1] == '\n' {
+				i++ // skip \r\n as one newline
+			}
+			lastLineStart = i + 1
+		}
+	}
+
+	// file.Position uses 1-based (row = line+2, col = offset-lineStart+1)
+	// because lineOffsets stores positions after newlines and starts scanning
+	// from 0. Our simpler scan counts actual newlines, so:
+	row := line + 1 // 1-based line number in generated code
+	col := offset - lastLineStart + 1
+
+	_, name, _, _, ok := sm.Source(row, col)
+	if ok {
+		return name
+	}
+	return ""
+}
+
+// extractIdentifierAt extracts the JavaScript identifier token starting at or
+// near the given offset in the source string. Returns "" if no identifier is
+// found. This reads the generated JS code to figure out what identifier the
+// bundler placed at a given source map position.
+func extractIdentifierAt(src string, offset int) string {
+	if offset < 0 || offset >= len(src) {
+		return ""
+	}
+
+	// The source map offset might point to the start of the identifier or
+	// slightly before/after. Scan forward to find the start of an identifier.
+	start := offset
+	// If we're not at an identifier start, scan forward a little.
+	if start < len(src) && !isIdentStart(rune(src[start])) {
+		// Try a few positions forward (whitespace, operator, etc.)
+		for i := start; i < start+5 && i < len(src); i++ {
+			if isIdentStart(rune(src[i])) {
+				start = i
+				break
+			}
+		}
+	}
+	if start >= len(src) || !isIdentStart(rune(src[start])) {
+		return ""
+	}
+
+	// Collect the identifier.
+	end := start + 1
+	for end < len(src) && isIdentPart(rune(src[end])) {
+		end++
+	}
+	token := src[start:end]
+	if isSimpleIdentifier(token) {
+		return token
+	}
+	return ""
+}
+
+func isIdentStart(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || r == '$'
+}
+
+func isIdentPart(r rune) bool {
+	return isIdentStart(r) || (r >= '0' && r <= '9')
+}
+
+// resolveOriginalName translates an original source name to its generated
+// (bundler-renamed) counterpart using the source map name mapping.
+// Returns "" if no mapping exists. Only works in debug mode.
+func (dbg *Debugger) resolveOriginalName(originalName string) string {
+	if !dbg.vm.debugMode {
+		return ""
+	}
+	_, origToGen := dbg.buildSourceMapNameMapping()
+	if origToGen == nil {
+		return ""
+	}
+	return origToGen[originalName]
+}
+
+// resolveGeneratedName translates a generated (bundler) name back to the
+// original source name. Returns "" if no mapping exists. Only works in debug mode.
+func (dbg *Debugger) resolveGeneratedName(generatedName string) string {
+	if !dbg.vm.debugMode {
+		return ""
+	}
+	genToOrig, _ := dbg.buildSourceMapNameMapping()
+	if genToOrig == nil {
+		return ""
+	}
+	return genToOrig[generatedName]
+}
+
 // stripTypeScriptSyntax removes TypeScript-only syntax from an expression
 // so the JS runtime can evaluate it. Handles:
 //   - Type assertions: "expr as Type"  → "expr"
@@ -3690,6 +4175,38 @@ func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
 				}
 			}
 		}
+	}
+
+	// ── Source map name remapping (debug mode only) ──────────────────────
+	// When the bundler renames variables (e.g., "test" → "test2"), the stash
+	// stores them under the generated name. Remap to original names so the
+	// variables panel shows what the user wrote in their TypeScript source.
+	// This mirrors how Chrome DevTools / Node.js present renamed variables.
+	// Wrapped in func+recover so it can never affect stepping/continue flow.
+	if dbg.vm.debugMode {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] buildPausedVarSnapshot: name remapping panicked: %v\n", r)
+					}
+				}
+			}()
+			genToOrig, _ := dbg.buildSourceMapNameMapping()
+			if len(genToOrig) > 0 {
+				for genName, origName := range genToOrig {
+					if genName == origName {
+						continue
+					}
+					if val, hasGen := snap[genName]; hasGen {
+						if _, hasOrig := snap[origName]; !hasOrig {
+							snap[origName] = val
+							delete(snap, genName) // hide bundler-renamed variable
+						}
+					}
+				}
+			}
+		}()
 	}
 
 	dbg.pausedVarSnapshot = snap
@@ -4164,50 +4681,87 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 					// var hoisted as undefined, or let/const assigned undefined explicitly.
 					// Show as undefined so the user knows the variable exists.
 					locals[displayName] = _undefined
+				} else if err != nil {
+					// Variable has a debug symbol but could not be resolved from the
+					// stash chain (e.g., block scope was popped, stash level mismatch,
+					// or let binding in a nested scope). Record it as undefined so
+					// the stash-chain fallback below can still find and fix its value.
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] GetLocalVariables: getValueFromLocation error for '%s': %v — recording as undefined\n", varLoc.Name, err)
+					}
+					locals[displayName] = _undefined
 				}
 			}()
 		}
 
-		// Catch-block fallback: the catch parameter (e.g., `error`) may have a
-		// debug symbol PC range that starts AFTER the current PC because the
-		// exception handler jumps before the enterBlock instruction.
-		// getValueFromLocation already does name-based lookup, so if the catch
-		// stash is active at runtime, the variable will be found above.
-		// But if the debug symbols excluded it (PC out of range), the varLocs
-		// loop above won't even try it. Scan the innermost stash for any named
-		// variables that are NOT in the debug symbols but ARE in the stash.
-		if dbg.vm.stash != nil && dbg.vm.stash.names != nil {
-			for name, idx := range dbg.vm.stash.names {
-				nameStr := name.String()
-				if !isIdentifierLike(nameStr) {
+		// Stash-chain fallback: debug symbols may miss variables when:
+		//  - A catch parameter's PC range starts after the current PC.
+		//  - let/const bindings in the function scope are shadowed by an
+		//    inner block scope stash pushed at runtime (try/catch/for in
+		//    debug mode). The debug-symbols loop above only checks
+		//    debugVarLocations (keyed by PC in the current program), and
+		//    getValueFromLocation walks the stash by name — but if the
+		//    inner stash is the innermost and the variable lives in the
+		//    function-scope stash (one level out), the old single-level
+		//    scan missed it entirely.
+		//
+		// Fix: walk ALL stash levels inside the current function (up to
+		// the module/global stash) and collect any named variable not
+		// already in locals. The "isModuleLevel" heuristic is replaced
+		// by a depth-bounded walk: we stop at the stash whose funcType
+		// is set (the function stash) or after a reasonable depth.
+		{
+			const maxFuncStashDepth = 8 // safety bound
+			depth := 0
+			for s := dbg.vm.stash; s != nil && depth < maxFuncStashDepth; s = s.outer {
+				depth++
+				if s.names == nil {
+					// Stop at the function-scope boundary even if names is nil,
+					// because the next outer stash belongs to the enclosing scope
+					// (module/global). funcType != 0 means this is a function stash.
+					if s.funcType != 0 {
+						break
+					}
 					continue
 				}
-				if _, exists := locals[nameStr]; exists {
-					continue
-				}
-				// Only add if this is a user variable (not this, not module-level)
-				// Check: the name must not exist in the outer stash chain (module scope)
-				isModuleLevel := false
-				if dbg.vm.stash.outer != nil && dbg.vm.stash.outer.names != nil {
-					for outerName := range dbg.vm.stash.outer.names {
-						if outerName.String() == nameStr {
-							isModuleLevel = true
-							break
+				for name, idx := range s.names {
+					nameStr := name.String()
+					if !isIdentifierLike(nameStr) || strings.TrimSpace(nameStr) == "this" {
+						continue
+					}
+					// Skip if we already have a REAL value (not undefined).
+					// If the debug-symbols path set it to _undefined (e.g., because
+					// the stash lookup failed), we want the fallback to overwrite it
+					// with the actual value if the stash has it at this level.
+					if existing, exists := locals[nameStr]; exists && existing != nil && !isNullValue(existing) {
+						continue
+					}
+					if globalBuiltinKeys[nameStr] || globalUnsafeKeys[nameStr] {
+						continue
+					}
+					if lifecycleFunctionKeys[nameStr] {
+						continue
+					}
+					actualIdx := int(idx & uint32(maskIndex))
+					isIndirect := (idx & maskIndirect) != 0
+					if s.values != nil && actualIdx < len(s.values) {
+						val := s.values[actualIdx]
+						if isIndirect && val != nil {
+							val = dbg.resolveIndirectValue(val)
+						}
+						if val != nil && !isNullValue(val) {
+							locals[nameStr] = val
+						} else if val == nil {
+							// TDZ or not-yet-initialized — show as undefined
+							// so the IDE displays the variable exists.
+							locals[nameStr] = _undefined
 						}
 					}
 				}
-				if isModuleLevel {
-					continue
-				}
-				actualIdx := int(idx & uint32(maskIndex))
-				if dbg.vm.stash.values != nil && actualIdx < len(dbg.vm.stash.values) {
-					val := dbg.vm.stash.values[actualIdx]
-					if val != nil && !isNullValue(val) {
-						locals[nameStr] = val
-					} else {
-						// Variable exists in stash but is undefined — show it
-						locals[nameStr] = _undefined
-					}
+				// If this stash belongs to a function scope, stop here;
+				// anything further out is the enclosing module/global scope.
+				if s.funcType != 0 {
+					break
 				}
 			}
 		}
@@ -4215,6 +4769,35 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 		if dbg.enableDebugLogging {
 			fmt.Printf("[DEBUGGER] GetLocalVariables: collected %d function-local variables from debug symbols\n", len(locals))
 		}
+
+		// ── Source map name remapping ────────────────────────────────────
+		// Remap generated names → original names so the IDE variables panel
+		// shows what the user wrote in their TypeScript source.
+		// Already inside if debugMode. Wrapped in recover for safety.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] GetLocalVariables: name remapping panicked: %v\n", r)
+					}
+				}
+			}()
+			genToOrig, _ := dbg.buildSourceMapNameMapping()
+			if len(genToOrig) > 0 {
+				for genName, origName := range genToOrig {
+					if genName == origName {
+						continue
+					}
+					if val, hasGen := locals[genName]; hasGen {
+						if _, hasOrig := locals[origName]; !hasOrig {
+							locals[origName] = val
+							delete(locals, genName) // hide bundler-renamed variable
+						}
+					}
+				}
+			}
+		}()
+
 		// Expose $exception when paused on an exception — Node.js parity.
 		if dbg.exceptionBreakActive && dbg.lastException != nil {
 			locals["$exception"] = dbg.lastException
@@ -4814,6 +5397,68 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 		}()
 		if err == nil && val != nil {
 			return val, nil
+		}
+	}
+
+	// ── Source map name resolution (Node.js / Chrome DevTools parity) ──
+	// If the variable wasn't found under its original name, the bundler may
+	// have renamed it (e.g., "test" → "test2" due to import collision).
+	// Use the source map to find the generated name and retry the lookup.
+	// Only in debug mode — no runtime impact.
+	if dbg.vm.debugMode {
+		if genName := dbg.resolveOriginalName(varName); genName != "" {
+			if dbg.enableDebugLogging {
+				fmt.Printf("[DEBUGGER] getValue('%s'): Source map rename detected → trying generated name '%s'\n", varName, genName)
+			}
+			// Try the paused var snapshot with the generated name.
+			if snap := dbg.buildPausedVarSnapshot(); snap != nil {
+				if snapVal, found := snap[genName]; found {
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] getValue('%s'): Found via source map rename '%s' in snapshot\n", varName, genName)
+					}
+					return snapVal, nil
+				}
+			}
+			// Try debug symbols with the generated name.
+			if dbg.vm.prg != nil && dbg.vm.prg.debugSymbols != nil {
+				genNameUni := unistring.String(genName)
+				varLocs := dbg.vm.prg.debugSymbols.LookupVarsAtPC(dbg.vm.pc)
+				for _, varLoc := range varLocs {
+					if varLoc.Name == genName {
+						v, e := dbg.getValueFromLocation(varLoc)
+						if e == nil && v != nil && !isNullValue(v) {
+							if dbg.enableDebugLogging {
+								fmt.Printf("[DEBUGGER] getValue('%s'): Found via source map rename '%s' in debug symbols\n", varName, genName)
+							}
+							return v, nil
+						}
+					}
+					_ = genNameUni // suppress unused warning
+				}
+			}
+			// Try direct stash lookup with the generated name.
+			genUni := unistring.String(genName)
+			for s := dbg.vm.stash; s != nil; s = s.outer {
+				if s.names == nil {
+					continue
+				}
+				if idx, exists := s.names[genUni]; exists {
+					actualIdx := idx & uint32(maskIndex)
+					isIndirect := (idx & maskIndirect) != 0
+					if int(actualIdx) < len(s.values) {
+						v := s.values[actualIdx]
+						if v != nil && !isNullValue(v) {
+							if isIndirect && !lifecycleFunctionKeys[genName] {
+								v = dbg.resolveIndirectValue(v)
+							}
+							if dbg.enableDebugLogging {
+								fmt.Printf("[DEBUGGER] getValue('%s'): Found via source map rename '%s' in stash\n", varName, genName)
+							}
+							return v, nil
+						}
+					}
+				}
+			}
 		}
 	}
 
