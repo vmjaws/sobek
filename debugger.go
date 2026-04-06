@@ -908,6 +908,7 @@ type Debugger struct {
 	stepOverTargetDepth         int
 	stepOverOriginalTargetDepth int // the depth at which Next() was originally called — never overwritten by re-activation
 	stepOverStartLine           int
+	stepOverMissCount           int // safety counter: instructions with startLine=0 and no valid currentLine
 	steppingFilename            string
 	enableDebugLogging          bool
 	skipPhaseEntryBreak         bool
@@ -1474,17 +1475,28 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 				clearStepState()
 			}
 		}
-		select {
-		case ch = <-dbg.activationCh:
-			if debugActivate {
-				fmt.Printf("[DEBUGGER-ACTIVATE] Received from local channel (non-lifecycle)\n")
+		for {
+			select {
+			case ch = <-dbg.activationCh:
+				if debugActivate {
+					fmt.Printf("[DEBUGGER-ACTIVATE] Received from local channel (non-lifecycle, ch=%p)\n", ch)
+				}
+				applyStepState("local")
+			case ch = <-vuActivationCh:
+				if debugActivate {
+					fmt.Printf("[DEBUGGER-ACTIVATE] Received from coordinator (non-lifecycle, multiVU=%v, vuID=%d, ch=%p)\n", globalDebugCoordinator.IsMultiVUDebug(), dbg.vuID, ch)
+				}
+				applyStepState("coordinator")
 			}
-			applyStepState("local")
-		case ch = <-vuActivationCh:
-			if debugActivate {
-				fmt.Printf("[DEBUGGER-ACTIVATE] Received from coordinator (non-lifecycle, multiVU=%v, vuID=%d)\n", globalDebugCoordinator.IsMultiVUDebug(), dbg.vuID)
+			// Guard: if ch is nil (a stale Continue() sent dbg.currentCh after
+			// ResetForPhaseTransition nil'd it), retry — sending on a nil channel
+			// blocks forever and is unrecoverable.
+			if ch != nil {
+				break
 			}
-			applyStepState("coordinator")
+			if debugActivate {
+				fmt.Printf("[DEBUGGER-ACTIVATE] ⚠️ Received nil channel — retrying select\n")
+			}
 		}
 	}
 
@@ -1863,7 +1875,14 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 	// then to 5s after 15 retries. This keeps the debugger responsive for fast
 	// operations while reducing CPU/log overhead during long native Go calls
 	// (e.g., HTTP requests that can take 10-30s).
+	//
+	// PERF: When the VM has just exited (lifecycle transition), start with a
+	// shorter 50ms interval. The new VM starts within a few ms so 200ms adds
+	// unnecessary perceived latency to the step-over from setup→default.
 	retryInterval := 200 * time.Millisecond
+	if localDead {
+		retryInterval = 50 * time.Millisecond
+	}
 	retryCount := 0
 	retryTimer := time.NewTimer(retryInterval)
 	outerTimer := time.NewTimer(2 * time.Second)
@@ -1911,7 +1930,8 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 				} else if retryCount > 5 && retryInterval < 1*time.Second {
 					retryInterval = 1 * time.Second
 				}
-				if debugContinue {
+				// Log first 3 retries, then every 10th to avoid flooding
+				if debugContinue && (retryCount <= 3 || retryCount%10 == 0) {
 					fmt.Printf("[DEBUGGER-CONTINUE] Retry timeout waiting for activation from %s (%dms, total=%dms, retries=%d)\n",
 						source, retryInterval.Milliseconds(), time.Since(continueStart).Milliseconds(), retryCount)
 				}
@@ -1949,17 +1969,15 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 			} else if retryCount > 5 && retryInterval < 1*time.Second {
 				retryInterval = 1 * time.Second
 			}
-			if debugContinue {
+			// Log first 3 retries, then every 10th to avoid flooding
+			if debugContinue && (retryCount <= 3 || retryCount%10 == 0) {
 				fmt.Printf("[DEBUGGER-CONTINUE] Retry timeout waiting for activation from %s (%dms, total=%dms, retries=%d)\n",
 					source, retryInterval.Milliseconds(), time.Since(continueStart).Milliseconds(), retryCount)
 			}
-			select {
-			case <-dbg.activationCh:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Drained stale currentCh from local activation channel\n")
-				}
-			default:
-			}
+			// NOTE: Do NOT drain dbg.activationCh here — a fresh activation
+			// from activate() may have just arrived between the timer firing
+			// and this code running. The outer Continue() loop drains stale
+			// entries before each send, so stale entries are handled there.
 			return DebuggerActivation{}, false, false
 		}
 	}
@@ -1975,6 +1993,22 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 	}
 
 	for {
+		// CRITICAL: If a phase transition (ResetForPhaseTransition) ran on
+		// another goroutine while this Continue() is in-flight, it will have
+		// set dbg.currentCh = nil.  We MUST recreate it before any branch
+		// tries to send it into a channel — otherwise activate() receives
+		// a nil channel and deadlocks.
+		if dbg.currentCh == nil {
+			dbg.currentCh = make(chan DebuggerActivation)
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] currentCh was nil (phase transition?), recreated %p\n", dbg.currentCh)
+			}
+		}
+
+		// Re-read vuActivationCh each iteration: ResetForPhaseTransition may
+		// have drained it, and in localTimedOut mode we drain-before-send anyway.
+		vuActivationCh = globalDebugCoordinator.GetVUActivationChannel(dbg.vuID)
+
 		// FIX #5: Re-read global step state at the top of each iteration.
 		// Without this, hasGlobalStepState stays stale if Next()/StepIn()
 		// is called by the DAP handler on another goroutine mid-loop,
@@ -1988,34 +2022,76 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 		hasGlobalStepState = globalNext || globalStepIn
 
 		if localTimedOut {
-			// Guard: if currentCh became nil (e.g. ResetForPhaseTransition ran
-			// on another goroutine while this Continue() was in-flight), we
-			// cannot send a nil channel to vuActivationCh — activate() would
-			// block forever trying to send on nil.  Re-create it.
-			if dbg.currentCh == nil {
-				dbg.currentCh = make(chan DebuggerActivation)
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] currentCh was nil (phase transition?), recreated %p\n", dbg.currentCh)
+			// ── FIX: cross-VU channel resolution for multi-VU mode ───────────
+			// When the local VM has exited (phase transition), the per-VU channel
+			// that was captured at Continue() entry may belong to a DIFFERENT VU
+			// than the one now in activate(). For example, Continue() was started
+			// on VU 0's debugger during setup, but now VU 1 entered default() and
+			// its debugger is in activate() on VU 1's per-VU channel.
+			//
+			// To break the deadlock, we try THREE targets in order:
+			//   1. The active debugger's local activationCh (direct, fastest)
+			//   2. The active debugger's per-VU channel (coordinator path)
+			//   3. Our own per-VU channel (fallback, original behavior)
+			// This ensures Continue() finds the debugger that is actually waiting,
+			// regardless of which VU it belongs to.
+			sent := false
+			if isMultiVU {
+				activeDbg := globalDebugCoordinator.GetActiveDebugger()
+				if activeDbg != nil && activeDbg != dbg && activeDbg.IsActive() {
+					targetVUID := activeDbg.GetVUID()
+					targetActivationCh := activeDbg.ActivationCh()
+					targetVUCh := globalDebugCoordinator.GetVUActivationChannel(targetVUID)
+					if debugContinue {
+						fmt.Printf("[DEBUGGER-CONTINUE] Cross-VU resolution: our vuID=%d, active vuID=%d, trying active debugger's channels (localCh=%p, vuCh=%p)\n",
+							dbg.vuID, targetVUID, targetActivationCh, targetVUCh)
+					}
+					// Try 1: send directly to active debugger's local activationCh
+					select {
+					case targetActivationCh <- dbg.currentCh:
+						if debugContinue {
+							fmt.Printf("[DEBUGGER-CONTINUE] ✅ Sent to active debugger's local channel (vuID=%d→%d, ch=%p)\n",
+								dbg.vuID, targetVUID, dbg.currentCh)
+						}
+						sent = true
+					default:
+					}
+					// Try 2: send to active debugger's per-VU coordinator channel
+					if !sent {
+						select {
+						case <-targetVUCh:
+						default:
+						}
+						select {
+						case targetVUCh <- dbg.currentCh:
+							if debugContinue {
+								fmt.Printf("[DEBUGGER-CONTINUE] ✅ Sent to active debugger's per-VU channel (vuID=%d→%d, ch=%p, vuCh=%p)\n",
+									dbg.vuID, targetVUID, dbg.currentCh, targetVUCh)
+							}
+							sent = true
+						default:
+						}
+					}
 				}
 			}
-			// Drain any stale entry first, then do a blocking send so
-			// activate() always gets a fresh, valid currentCh.
-			select {
-			case <-vuActivationCh:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Drained stale entry from coordinator channel (multiVU=%v, vuID=%d)\n", isMultiVU, dbg.vuID)
+			// Try 3: original behavior — send to our own per-VU channel (fallback)
+			if !sent {
+				select {
+				case <-vuActivationCh:
+					// if debugContinue {
+					// 	fmt.Printf("[DEBUGGER-CONTINUE] Drained stale entry from coordinator channel (multiVU=%v, vuID=%d)\n", isMultiVU, dbg.vuID)
+					// }
+				default:
 				}
-			default:
-			}
-			select {
-			case vuActivationCh <- dbg.currentCh:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Sent to coordinator (local VM exited, multiVU=%v, vuID=%d, ch=%p, vuCh=%p), waiting for activation\n", isMultiVU, dbg.vuID, dbg.currentCh, vuActivationCh)
-				}
-			default:
-				// Should not happen after drain, but be safe.
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Coordinator channel full after drain (multiVU=%v, vuID=%d), waiting for activate() to consume\n", isMultiVU, dbg.vuID)
+				select {
+				case vuActivationCh <- dbg.currentCh:
+					if debugContinue {
+						fmt.Printf("[DEBUGGER-CONTINUE] Sent to own coordinator channel (local VM exited, multiVU=%v, vuID=%d, ch=%p, vuCh=%p)\n", isMultiVU, dbg.vuID, dbg.currentCh, vuActivationCh)
+					}
+				default:
+					if debugContinue {
+						fmt.Printf("[DEBUGGER-CONTINUE] Coordinator channel full after drain (multiVU=%v, vuID=%d)\n", isMultiVU, dbg.vuID)
+					}
 				}
 			}
 			if activation, ok, _ := waitForActivation("global", true); ok {
@@ -2723,11 +2799,13 @@ func (dbg *Debugger) Next() error {
 		dbg.stepOverTargetDepth = targetDepth
 		dbg.stepOverOriginalTargetDepth = targetDepth // preserve authoritative value
 		dbg.stepOverStartLine = startLine
+		dbg.stepOverMissCount = 0
 		dbg.steppingFilename = steppingFilename
 	} else {
 		dbg.stepOverTargetDepth = dbg.lastBreakpoint.stackDepth
 		dbg.stepOverOriginalTargetDepth = dbg.stepOverTargetDepth
 		dbg.stepOverStartLine = 0
+		dbg.stepOverMissCount = 0
 		dbg.steppingFilename = ""
 		if debugContinue {
 			fmt.Printf("[DEBUGGER-NEXT] ⚠️ No valid state, using safe defaults: targetDepth=%d, startLine=0\n",
@@ -4112,10 +4190,26 @@ func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
 	snap := make(map[string]Value, 64)
 
 	// Walk stash chain.
+	thisKey := unistring.String(thisBindingName)
 	stashLevel := 0
 	for s := dbg.vm.stash; s != nil; s = s.outer {
 		if s.names != nil {
 			for name, idx := range s.names {
+				// PERF: Handle " this" using direct constant comparison
+				// instead of String()+TrimSpace() for every name.
+				if name == thisKey {
+					actualIdx := idx & uint32(maskIndex)
+					if int(actualIdx) < len(s.values) {
+						val := s.values[actualIdx]
+						if val != nil && !isNullValue(val) {
+							if snap["this"] == nil {
+								snap["this"] = val
+							}
+						}
+						// skip — uninitialized this is not useful
+					}
+					continue
+				}
 				nameStr := name.String()
 				if snap[nameStr] != nil || globalBuiltinKeys[nameStr] {
 					continue
@@ -4128,19 +4222,14 @@ func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
 						if isIndirect && !lifecycleFunctionKeys[nameStr] {
 							val = dbg.resolveIndirectValue(val)
 						}
-						// Handle " this" → "this" (sobek stores class this-binding with leading space)
-						if strings.TrimSpace(nameStr) == "this" {
-							snap["this"] = val
-						} else if isSimpleIdentifier(nameStr) {
+						if isSimpleIdentifier(nameStr) {
 							snap[nameStr] = val
 						}
 					} else if dbg.vm.debugMode {
 						// Variable exists in stash but is nil (const/let before
 						// assignment, e.g. RHS threw). Show as undefined so
 						// hover/variables panel displays it instead of nothing.
-						if strings.TrimSpace(nameStr) == "this" {
-							// skip — uninitialized this is not useful
-						} else if isSimpleIdentifier(nameStr) {
+						if isSimpleIdentifier(nameStr) {
 							snap[nameStr] = _undefined
 						}
 					}
@@ -4560,40 +4649,47 @@ func (dbg *Debugger) getValueFromLocation(varLoc VarLocation) (Value, error) {
 		//
 		// By scanning the chain for the matching name, we always find the correct
 		// value regardless of which stashes are currently alive.
+		//
+		// PERF: Convert varLoc.Name to unistring.String once, then compare using
+		// the unistring key directly. This avoids calling n.String() (which allocates)
+		// for every name in every stash level — O(N*M) allocations become O(1).
+		targetName := unistring.String(varLoc.Name)
+		isThis := strings.TrimSpace(varLoc.Name) == "this"
 		for s := dbg.vm.stash; s != nil; s = s.outer {
 			if s.names == nil {
 				continue
 			}
-			for n, idx := range s.names {
-				if n.String() == varLoc.Name {
-					actualIdx := int(idx & uint32(maskIndex))
-					if s.values != nil && actualIdx < len(s.values) {
-						val := s.values[actualIdx]
-						if val != nil && !isNullValue(val) {
-							if (idx&maskIndirect) != 0 && !lifecycleFunctionKeys[varLoc.Name] {
-								val = dbg.resolveIndirectValue(val)
-							}
-							// Handle " this" → "this" (sobek stores class this-binding with leading space)
-							if strings.TrimSpace(varLoc.Name) == "this" {
-								return val, nil
-							} else if isSimpleIdentifier(varLoc.Name) {
-								return val, nil
-							}
-						} else if dbg.vm.debugMode {
-							// Variable exists in stash but is nil (const/let before
-							// assignment, e.g. RHS threw). Show as undefined so
-							// hover/variables panel displays it instead of nothing.
-							if strings.TrimSpace(varLoc.Name) == "this" {
-								// skip — uninitialized this is not useful
-							} else if isSimpleIdentifier(varLoc.Name) {
-								return _undefined, nil
-							}
-						}
-					}
-					// Found the name but value is nil/undefined — variable exists but uninitialized
-					return nil, fmt.Errorf("variable %s found but uninitialized", varLoc.Name)
+			idx, found := s.names[targetName]
+			if !found {
+				// Also try " this" (leading space) when looking for "this"
+				if isThis && varLoc.Name == "this" {
+					idx, found = s.names[" this"]
+				}
+				if !found {
+					continue
 				}
 			}
+			actualIdx := int(idx & uint32(maskIndex))
+			if s.values != nil && actualIdx < len(s.values) {
+				val := s.values[actualIdx]
+				if val != nil && !isNullValue(val) {
+					if (idx&maskIndirect) != 0 && !lifecycleFunctionKeys[varLoc.Name] {
+						val = dbg.resolveIndirectValue(val)
+					}
+					return val, nil
+				} else if dbg.vm.debugMode {
+					// Variable exists in stash but is nil (const/let before
+					// assignment, e.g. RHS threw). Show as undefined so
+					// hover/variables panel displays it instead of nothing.
+					if isThis {
+						// skip — uninitialized this is not useful
+					} else if isSimpleIdentifier(varLoc.Name) {
+						return _undefined, nil
+					}
+				}
+			}
+			// Found the name but value is nil/undefined — variable exists but uninitialized
+			return nil, fmt.Errorf("variable %s found but uninitialized", varLoc.Name)
 		}
 		// Variable name not found in any named stash — the block stash was
 		// popped or the variable is genuinely unavailable at this point.
@@ -4616,7 +4712,7 @@ func (dbg *Debugger) getValueFromLocation(varLoc VarLocation) (Value, error) {
 }
 
 func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
-	locals := make(map[string]Value)
+	locals := make(map[string]Value, 16) // PERF: pre-allocate; will grow if needed
 
 	if !dbg.active || dbg.vm.prg == nil {
 		return locals, nil
@@ -4657,6 +4753,11 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 			} else if !isIdentifierLike(varLoc.Name) {
 				continue
 			}
+			// PERF: Skip if we already resolved this variable with a real value.
+			// Overlapping PC ranges can include the same variable multiple times.
+			if existing, exists := locals[displayName]; exists && existing != nil && existing != _undefined {
+				continue
+			}
 			// Wrap in recovery — getValueFromLocation calls resolveIndirectValue
 			// which executes getter functions that can panic/throw.
 			func() {
@@ -4680,17 +4781,32 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 				} else if err == nil && (val == nil || isNullValue(val)) {
 					// var hoisted as undefined, or let/const assigned undefined explicitly.
 					// Show as undefined so the user knows the variable exists.
-					locals[displayName] = _undefined
-				} else if err != nil {
-					// Variable has a debug symbol but could not be resolved from the
-					// stash chain (e.g., block scope was popped, stash level mismatch,
-					// or let binding in a nested scope). Record it as undefined so
-					// the stash-chain fallback below can still find and fix its value.
-					if dbg.enableDebugLogging {
-						fmt.Printf("[DEBUGGER] GetLocalVariables: getValueFromLocation error for '%s': %v — recording as undefined\n", varLoc.Name, err)
+					// EXCEPT "this": in ESM modules (strict mode), `this` at the
+					// top-level default function is always undefined — showing it
+					// is pure noise. Mouse hover still resolves it via Evaluate.
+					if displayName == "this" {
+						return // skip — don't add undefined this to locals
 					}
 					locals[displayName] = _undefined
+			} else if err != nil {
+				// Variable has a debug symbol but could not be resolved from the
+				// stash chain (e.g., block scope was popped, stash level mismatch,
+				// or let binding in a nested scope). Record it as undefined so
+				// the stash-chain fallback below can still find and fix its value.
+				// EXCEPT "this": when the stash lookup fails, `this` is always
+				// noise (ESM strict mode, top-level default, class constructor
+				// before super()). Mouse hover still resolves it via Evaluate.
+				if displayName == "this" {
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] GetLocalVariables: skipping unresolvable 'this' (err: %v)\n", err)
+					}
+					return // skip — don't add unresolvable this to locals
 				}
+				if dbg.enableDebugLogging {
+					fmt.Printf("[DEBUGGER] GetLocalVariables: getValueFromLocation error for '%s': %v — recording as undefined\n", varLoc.Name, err)
+				}
+				locals[displayName] = _undefined
+			}
 			}()
 		}
 
@@ -4725,8 +4841,13 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 					continue
 				}
 				for name, idx := range s.names {
+					// PERF: Check for " this" using the constant directly, avoiding
+					// both String() allocation and TrimSpace call.
+					if name == unistring.String(thisBindingName) {
+						continue
+					}
 					nameStr := name.String()
-					if !isIdentifierLike(nameStr) || strings.TrimSpace(nameStr) == "this" {
+					if !isIdentifierLike(nameStr) {
 						continue
 					}
 					// Skip if we already have a REAL value (not undefined).
@@ -4999,9 +5120,11 @@ func (dbg *Debugger) GetAllStashVariables() map[string]Value {
 					val := dbg.safeCallGetter(getter)
 					if val != nil && !isNullValue(val) {
 						vars[name] = val
-						if dbg.enableDebugLogging {
-							fmt.Printf("[DEBUGGER] GetAllStashVariables: captured %s from module (getter)\n", name)
-						}
+						// Per-variable capture logging commented out to reduce noise.
+						// Produces hundreds of lines per pause for large modules.
+						// if dbg.enableDebugLogging {
+						// 	fmt.Printf("[DEBUGGER] GetAllStashVariables: captured %s from module (getter)\n", name)
+						// }
 					}
 				}
 				moduleCount++
@@ -5043,18 +5166,15 @@ func (dbg *Debugger) extractStashVars(s *stash, vars map[string]Value, level int
 	if s == nil {
 		return
 	}
-	namesCount := 0
-	if s.names != nil {
-		namesCount = len(s.names)
-	}
-	valuesCount := 0
-	if s.values != nil {
-		valuesCount = len(s.values)
-	}
-	if dbg.enableDebugLogging {
-		fmt.Printf("[DEBUGGER] GetAllStashVariables: %s level %d - names=%d, values=%d, hasObj=%v\n",
-			source, level, namesCount, valuesCount, s.obj != nil)
-	}
+	// namesCount/valuesCount only used by commented-out per-stash logging below.
+	// if dbg.enableDebugLogging {
+	// 	namesCount := 0
+	// 	if s.names != nil { namesCount = len(s.names) }
+	// 	valuesCount := 0
+	// 	if s.values != nil { valuesCount = len(s.values) }
+	// 	fmt.Printf("[DEBUGGER] GetAllStashVariables: %s level %d - names=%d, values=%d, hasObj=%v\n",
+	// 		source, level, namesCount, valuesCount, s.obj != nil)
+	// }
 
 	if s.names != nil {
 		for name, idx := range s.names {
@@ -5076,10 +5196,11 @@ func (dbg *Debugger) extractStashVars(s *stash, vars map[string]Value, level int
 						val = dbg.resolveIndirectValue(val)
 					}
 					vars[nameStr] = val
-					if dbg.enableDebugLogging {
-						fmt.Printf("[DEBUGGER] GetAllStashVariables: captured %s from %s (idx=%d)\n",
-							nameStr, source, actualIdx)
-					}
+					// Per-variable stash capture logging commented out.
+					// if dbg.enableDebugLogging {
+					// 	fmt.Printf("[DEBUGGER] GetAllStashVariables: captured %s from %s (idx=%d)\n",
+					// 		nameStr, source, actualIdx)
+					// }
 				}
 			}
 		}
@@ -5123,18 +5244,19 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 	// than stack[sb] because it works for arrow functions (lexical this
 	// captured from enclosing scope) and avoids stale stack values.
 	if varName == "this" {
+		// PERF: Direct map lookup using the known key " this" (thisBindingName)
+		// instead of iterating all names and calling n.String() + TrimSpace().
+		thisKey := unistring.String(thisBindingName)
 		for s := dbg.vm.stash; s != nil; s = s.outer {
 			if s.names == nil {
 				continue
 			}
-			for n, idx := range s.names {
-				if strings.TrimSpace(n.String()) == "this" {
-					actualIdx := int(idx & uint32(maskIndex))
-					if s.values != nil && actualIdx < len(s.values) {
-						v := s.values[actualIdx]
-						if v != nil && !isNullValue(v) {
-							return v, nil
-						}
+			if idx, found := s.names[thisKey]; found {
+				actualIdx := int(idx & uint32(maskIndex))
+				if s.values != nil && actualIdx < len(s.values) {
+					v := s.values[actualIdx]
+					if v != nil && !isNullValue(v) {
+						return v, nil
 					}
 				}
 			}
@@ -5586,9 +5708,12 @@ func (dbg *Debugger) GetLastException() (message string, stack string) {
 func (dbg *Debugger) SetExceptionBreakpoints(caught, uncaught bool) {
 	dbg.mu.Lock()
 	defer dbg.mu.Unlock()
+	// Only log when values actually change — this is called on every DAP request
+	// via getActiveDebugger(), so logging every call produces thousands of lines.
+	changed := dbg.breakOnCaughtExceptions != caught || dbg.breakOnUncaughtExceptions != uncaught
 	dbg.breakOnCaughtExceptions = caught
 	dbg.breakOnUncaughtExceptions = uncaught
-	if dbg.enableDebugLogging {
+	if changed && dbg.enableDebugLogging {
 		fmt.Printf("[DEBUGGER] SetExceptionBreakpoints: caught=%v, uncaught=%v\n", caught, uncaught)
 	}
 }

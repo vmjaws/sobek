@@ -747,6 +747,18 @@ func (c *compiler) compileIfStatement(v *ast.IfStatement, needResult bool) {
 		c.p.code[jmp] = jneP(len(c.p.code) - jmp)
 		c.compileIfBody(v.Alternate, needResult)
 		c.p.code[jmp1] = jump(len(c.p.code) - jmp1)
+		// DEBUGGER FIX: Add source map entry for the end of the if/else construct.
+		// Without this, instructions emitted after the if/else (like the implicit
+		// return at the end of a function: _loadUndef + _ret) inherit the source
+		// position of the last statement in the else body. When the user steps over
+		// the last line of the if-body, the unconditional jump skips the else body
+		// and lands on these instructions — but the debugger reports the else body's
+		// source line (e.g., console.warn in the else block), confusing the user.
+		// By adding a source map entry at the closing brace position, subsequent
+		// instructions map to the end of the if/else rather than its else content.
+		if c.debug {
+			c.p.addSrcMap(int(v.Idx1()) - 1)
+		}
 	} else {
 		if needResult {
 			c.emit(jump(2))

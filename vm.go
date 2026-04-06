@@ -1018,7 +1018,8 @@ func (vm *vm) debug() {
 					currentStackDepth := vm.debugger.callStackDepth()
 					currentPC := vm.pc
 
-					prevStackDepth := vm.debugger.lastBreakpoint.stackDepth
+					// prevStackDepth only used by commented-out per-instruction logging.
+					// prevStackDepth := vm.debugger.lastBreakpoint.stackDepth
 					prevLine := vm.debugger.lastBreakpoint.line
 					prevPC := vm.debugger.lastBreakpoint.pc
 					prevFilename := vm.debugger.lastBreakpoint.filename
@@ -1239,6 +1240,22 @@ func (vm *vm) debug() {
 							switch vm.prg.code[currentPC].(type) {
 							case jump, *leaveBlock, *enterCatchBlock, leaveTry, enterFinally:
 								isControlFlowOnly = true
+							case _loadUndef:
+								// Detect implicit return pattern: _loadUndef followed by _ret.
+								// See step-over path for full explanation.
+								nextPC := currentPC + 1
+								if nextPC < len(vm.prg.code) {
+									if _, isRet := vm.prg.code[nextPC].(_ret); isRet {
+										isControlFlowOnly = true
+									}
+								}
+							case _ret:
+								// Also skip _ret after _loadUndef (implicit return pattern).
+								if currentPC > 0 {
+									if _, isLU := vm.prg.code[currentPC-1].(_loadUndef); isLU {
+										isControlFlowOnly = true
+									}
+								}
 							}
 						}
 						// Same forward-jump detection as step-over (see comments there).
@@ -1249,13 +1266,26 @@ func (vm *vm) debug() {
 							case leaveTry, enterFinally:
 								isControlFlowOnly = true
 							case jump:
+								// Only mark as control-flow-only if this jump is a try-catch exit:
+								// the instruction immediately after the jump is enterCatchBlock or
+								// enterFinally. Regular if/else forward jumps (skipping the else body)
+								// must NOT be suppressed — otherwise the debugger skips lines after
+								// if/else blocks and in else branches.
 								if currentPC > lastExecPC {
-									isControlFlowOnly = true
+									nextPC := lastExecPC + 1
+									if nextPC < len(vm.prg.code) {
+										switch vm.prg.code[nextPC].(type) {
+										case *enterCatchBlock, enterFinally:
+											isControlFlowOnly = true
+										}
+									}
 								}
-							case jneP, jeqP, jne, jeq, jdef, jdefP:
-								if currentPC > lastExecPC+10 {
-									isControlFlowOnly = true
-								}
+							// NOTE: Conditional jumps (jneP, jeqP, jne, jeq, jdef, jdefP) are
+							// NO LONGER marked as control-flow-only. The previous heuristic
+							// (>10 PCs = block-skip) incorrectly suppressed breaks at the first
+							// line of else blocks when the if-body had more than ~10 bytecodes.
+							// Try-catch patterns are already handled by the leaveTry/enterFinally
+							// cases above and the current-instruction check.
 							}
 						}
 
@@ -1268,8 +1298,19 @@ func (vm *vm) debug() {
 							if currentPC >= 0 && currentPC < len(vm.prg.code) {
 								if _, isRet := vm.prg.code[currentPC].(_ret); isRet {
 									if lastExecPC >= 0 && lastExecPC != prevPC {
-										shouldBreak = true
-										breakReason = "stepIn (return-from-function on same source line)"
+										// IMPLICIT-RETURN FIX: Same as step-over — skip
+										// implicit returns (loadUndef + _ret) to avoid
+										// double-stopping on the last line of a function.
+										isImplicitReturn := false
+										if lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
+											if _, isLU := vm.prg.code[lastExecPC].(_loadUndef); isLU {
+												isImplicitReturn = true
+											}
+										}
+										if !isImplicitReturn {
+											shouldBreak = true
+											breakReason = "stepIn (return-from-function on same source line)"
+										}
 									}
 								}
 							}
@@ -1279,10 +1320,12 @@ func (vm *vm) debug() {
 							fmt.Printf("[VM-LIFECYCLE-ENTRY] 🎯 Lifecycle function entry detected at line %d (PC=0, prevPC=-1, sb=%d). vmInValidState forced to %v (would be %v without fix). shouldBreak=%v\n",
 								currentLine, vm.sb, vmInValidState, vm.sb >= 0, shouldBreak)
 						}
-						if vm.debugger.enableDebugLogging && isUserFile {
-							fmt.Printf("[VM] stepIn=true, PC=%d (prev=%d), line=%d (prev=%d), depth=%d (prev=%d), pcAdvanced=%v, lineChanged=%v, vmInValidState=%v (sb=%d, lifecycleEntry=%v), isUserFile=%v, shouldBreak=%v\n",
-								currentPC, prevPC, currentLine, prevLine, currentStackDepth, prevStackDepth, pcAdvanced, lineChanged, vmInValidState, vm.sb, isLifecycleFunctionEntry, isUserFile, shouldBreak)
-						}
+						// Per-instruction step-in state logging commented out to reduce noise.
+						// Uncomment for low-level step-in tracing.
+						// if vm.debugger.enableDebugLogging && isUserFile {
+						// 	fmt.Printf("[VM] stepIn=true, PC=%d (prev=%d), line=%d (prev=%d), depth=%d (prev=%d), pcAdvanced=%v, lineChanged=%v, vmInValidState=%v (sb=%d, lifecycleEntry=%v), isUserFile=%v, shouldBreak=%v\n",
+						// 		currentPC, prevPC, currentLine, prevLine, currentStackDepth, prevStackDepth, pcAdvanced, lineChanged, vmInValidState, vm.sb, isLifecycleFunctionEntry, isUserFile, shouldBreak)
+						// }
 						// If we're not in user file during stepIn, clear stepIn flag to stop stepping through internal code
 						// BUT preserve next flag so step-over continues to work when we return to user code
 						// CRITICAL FIX: Don't clear stepIn if this is a lifecycle transition
@@ -1319,14 +1362,39 @@ func (vm *vm) debug() {
 						lineChanged := false
 						if startLine > 0 {
 							lineChanged = startLine != currentLine
+						} else if currentLine > 0 {
+							// SELF-HEAL: stepOverStartLine is invalid but we found a valid
+							// source line. Capture it as the new start line so the NEXT
+							// instruction on a different line triggers the break immediately.
+							// Without this, the debugger loops through thousands of instructions
+							// (3000+) looking for a valid state, causing hangs during error handling.
+							vm.debugger.stepOverStartLine = currentLine
+							startLine = currentLine
+							// Don't set lineChanged yet — we just established the baseline.
+							// The very next instruction on a different line will trigger the break.
+						} else {
+							// Both startLine and currentLine are invalid (no source map entries).
+							// Increment a safety counter to prevent infinite looping during error
+							// handling where the VM never reaches code with source maps.
+							vm.debugger.stepOverMissCount++
+							if vm.debugger.stepOverMissCount > 500 {
+								// Safety valve: clear step flags after 500 instructions with no
+								// valid source lines. This prevents the debugger from hanging
+								// when errors occur during init/module loading.
+								if debugVM {
+									fmt.Printf("[VM] next=true, SAFETY: clearing step flags after %d instructions with no valid source line\n", vm.debugger.stepOverMissCount)
+								}
+								vm.debugger.next = false
+								vm.debugger.stepIn = false
+								vm.debugger.stepOverStartLine = 0
+								vm.debugger.stepOverMissCount = 0
+								goto executeInstruction
+							}
 						}
-						// NOTE: We deliberately do NOT fall back to prevLine comparison anymore.
-						// The stepOverStartLine should ALWAYS be set by Next() before we get here.
-						// If it's <= 0, we skip breaking to avoid spurious stops.
 
-						// Log if we're skipping due to invalid startLine
-						if startLine <= 0 && vm.debugger.enableDebugLogging && isUserFile {
-							fmt.Printf("[VM] next=true, SKIPPING: invalid startLine=%d (waiting for valid state)\n", startLine)
+						// Log if we're skipping due to invalid startLine (only first few to avoid log spam)
+						if startLine <= 0 && vm.debugger.enableDebugLogging && isUserFile && vm.debugger.stepOverMissCount <= 5 {
+							fmt.Printf("[VM] next=true, SKIPPING: invalid startLine=%d (waiting for valid state, miss=%d)\n", startLine, vm.debugger.stepOverMissCount)
 						}
 
 						atValidDepth := currentStackDepth <= vm.debugger.stepOverTargetDepth
@@ -1347,33 +1415,66 @@ func (vm *vm) debug() {
 							switch vm.prg.code[currentPC].(type) {
 							case jump, *leaveBlock, *enterCatchBlock, leaveTry, enterFinally:
 								isControlFlowOnly = true
+							case _loadUndef:
+								// Detect implicit return pattern: _loadUndef followed by _ret.
+								// The compiler emits this at the end of functions without an explicit
+								// return. These instructions inherit the source position of the last
+								// compiled statement, which may be in the ELSE branch of an if/else.
+								// When stepping past the if-body (via jump), the debugger would
+								// incorrectly break at the else body's source line. Marking the
+								// implicit return as control-flow-only prevents this false stop.
+								nextPC := currentPC + 1
+								if nextPC < len(vm.prg.code) {
+									if _, isRet := vm.prg.code[nextPC].(_ret); isRet {
+										isControlFlowOnly = true
+									}
+								}
+							case _ret:
+								// Also skip the _ret that follows _loadUndef in the implicit return
+								// pattern. After _loadUndef is skipped (above), _ret would still
+								// trigger a break because it inherits the same wrong source position.
+								if currentPC > 0 {
+									if _, isLU := vm.prg.code[currentPC-1].(_loadUndef); isLU {
+										isControlFlowOnly = true
+									}
+								}
 							}
 						}
-						// Also detect large forward jumps that skip over try-catch blocks.
+						// Also detect forward jumps that skip over try-catch blocks.
 						// The source map often maps the post-try cleanup PC to the catch/finally
 						// source line, causing false breaks in non-executing catch blocks.
 						//
 						// NOTE: Use lastExecPC (the actual last executed instruction's PC),
 						// NOT prevPC (which is the last BREAKPOINT PC and may be stale).
 						// Check 1: Previous instruction was leaveTry/enterFinally (explicit try exit).
-						// Check 2: Previous instruction was a forward jump (conditional or unconditional)
-						//          that crossed more than 10 instructions — this strongly suggests a
-						//          block-skip (try-catch, if-block with embedded try) rather than a
-						//          simple 2-5 instruction if/else branch.
+						// Check 2: Previous instruction was an unconditional jump whose next bytecode
+						//          is enterCatchBlock/enterFinally — i.e., a try-catch exit jump.
+						//          Regular if/else forward jumps are NOT suppressed.
 						if !isControlFlowOnly && lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
 							switch vm.prg.code[lastExecPC].(type) {
 							case leaveTry, enterFinally:
 								isControlFlowOnly = true
 							case jump:
+								// Only mark as control-flow-only if this jump is a try-catch exit:
+								// the instruction immediately after the jump is enterCatchBlock or
+								// enterFinally. Regular if/else forward jumps (skipping the else body)
+								// must NOT be suppressed — otherwise the debugger skips lines after
+								// if/else blocks and in else branches.
 								if currentPC > lastExecPC {
-									isControlFlowOnly = true
+									nextPC := lastExecPC + 1
+									if nextPC < len(vm.prg.code) {
+										switch vm.prg.code[nextPC].(type) {
+										case *enterCatchBlock, enterFinally:
+											isControlFlowOnly = true
+										}
+									}
 								}
-							case jneP, jeqP, jne, jeq, jdef, jdefP:
-								// Large forward conditional jumps (>10 PCs) indicate block-skips
-								// (try-catch, switch, etc.), not simple if/else branches.
-								if currentPC > lastExecPC+10 {
-									isControlFlowOnly = true
-								}
+							// NOTE: Conditional jumps (jneP, jeqP, jne, jeq, jdef, jdefP) are
+							// NO LONGER marked as control-flow-only. The previous heuristic
+							// (>10 PCs = block-skip) incorrectly suppressed breaks at the first
+							// line of else blocks when the if-body had more than ~10 bytecodes.
+							// Try-catch patterns are already handled by the leaveTry/enterFinally
+							// cases above and the current-instruction check.
 							}
 						}
 
@@ -1405,8 +1506,23 @@ func (vm *vm) debug() {
 									// instructions since the step started (not just the first PC after resume).
 									// This prevents double-breaking on lines that only contain a return.
 									if lastExecPC >= 0 && lastExecPC != prevPC {
-										shouldBreak = true
-										breakReason = "next (return-from-function on same source line)"
+										// IMPLICIT-RETURN FIX: Don't force a break when the _ret
+										// is preceded by _loadUndef — that's the compiler-generated
+										// implicit return at the end of a function body, NOT an
+										// explicit `return` statement written by the user.
+										// Without this, stepping over the LAST statement of
+										// setup/default/teardown stops TWICE on the same line:
+										// once for the statement, once for the implicit return.
+										isImplicitReturn := false
+										if lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
+											if _, isLU := vm.prg.code[lastExecPC].(_loadUndef); isLU {
+												isImplicitReturn = true
+											}
+										}
+										if !isImplicitReturn {
+											shouldBreak = true
+											breakReason = "next (return-from-function on same source line)"
+										}
 									}
 								}
 							}
@@ -1416,10 +1532,12 @@ func (vm *vm) debug() {
 							fmt.Printf("[VM-LIFECYCLE-ENTRY] 🎯 Lifecycle function entry (next) at line %d (PC=0, prevPC=-1, sb=%d). vmInValidState forced to %v. shouldBreak=%v\n",
 								currentLine, vm.sb, vmInValidState, shouldBreak)
 						}
-						if vm.debugger.enableDebugLogging && isUserFile {
-							fmt.Printf("[VM] next=true, PC=%d (prev=%d), line=%d (start=%d, prev=%d), depth=%d (target=%d, prev=%d), pcAdvanced=%v, lineChanged=%v, atValidDepth=%v, vmInValidState=%v (sb=%d, lifecycleEntry=%v), isUserFile=%v, shouldBreak=%v\n",
-								currentPC, prevPC, currentLine, startLine, prevLine, currentStackDepth, vm.debugger.stepOverTargetDepth, prevStackDepth, pcAdvanced, lineChanged, atValidDepth, vmInValidState, vm.sb, isLifecycleFunctionEntry, isUserFile, shouldBreak)
-						}
+						// Per-instruction step-over state logging commented out to reduce noise.
+						// Uncomment for low-level step-over tracing.
+						// if vm.debugger.enableDebugLogging && isUserFile {
+						// 	fmt.Printf("[VM] next=true, PC=%d (prev=%d), line=%d (start=%d, prev=%d), depth=%d (target=%d, prev=%d), pcAdvanced=%v, lineChanged=%v, atValidDepth=%v, vmInValidState=%v (sb=%d, lifecycleEntry=%v), isUserFile=%v, shouldBreak=%v\n",
+						// 		currentPC, prevPC, currentLine, startLine, prevLine, currentStackDepth, vm.debugger.stepOverTargetDepth, prevStackDepth, pcAdvanced, lineChanged, atValidDepth, vmInValidState, vm.sb, isLifecycleFunctionEntry, isUserFile, shouldBreak)
+						// }
 						// IMPORTANT: Log when step-over overrides a breakpoint to avoid confusion
 						// The BREAKPOINT-CHECK log may have said "breakpoint detected" but step-over takes precedence
 						if !shouldBreak && hasBreakpoint && debugVM {
@@ -1585,17 +1703,20 @@ func (vm *vm) debug() {
 		}
 		// Track actual previous instruction PC for forward-jump detection.
 		lastExecPC = pc
-		if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
-			fmt.Printf("[VM-EXEC] PC=%d, instr=%T, next=%v, stepIn=%v, suppress=%v, depth=%d\n",
-				pc, vm.prg.code[pc], vm.debugger.next, vm.debugger.stepIn, vm.debugger.suppressDebugger, len(vm.callStack))
-		}
+		// [VM-EXEC] and [VM-POST] per-instruction logging commented out to reduce noise.
+		// These produce ~10 lines per bytecode instruction and dominate the log.
+		// Uncomment for low-level instruction tracing when debugging step logic.
+		// if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
+		// 	fmt.Printf("[VM-EXEC] PC=%d, instr=%T, next=%v, stepIn=%v, suppress=%v, depth=%d\n",
+		// 		pc, vm.prg.code[pc], vm.debugger.next, vm.debugger.stepIn, vm.debugger.suppressDebugger, len(vm.callStack))
+		// }
 		vm.prg.code[pc].exec(vm)
-		if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
-			newPC := vm.pc
-			halted := vm.prg == nil || newPC < 0 || newPC >= len(vm.prg.code)
-			fmt.Printf("[VM-POST] PC=%d->%d, halted=%v, next=%v, suppress=%v, depth=%d\n",
-				pc, newPC, halted, vm.debugger.next, vm.debugger.suppressDebugger, len(vm.callStack))
-		}
+		// if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
+		// 	newPC := vm.pc
+		// 	halted := vm.prg == nil || newPC < 0 || newPC >= len(vm.prg.code)
+		// 	fmt.Printf("[VM-POST] PC=%d->%d, halted=%v, next=%v, suppress=%v, depth=%d\n",
+		// 		pc, newPC, halted, vm.debugger.next, vm.debugger.suppressDebugger, len(vm.callStack))
+		// }
 	}
 
 	// When a VM finishes executing with a step operation active, we need to decide
@@ -1952,6 +2073,32 @@ func (vm *vm) runTryInner() (ex *Exception) {
 	defer func() {
 		if x := recover(); x != nil {
 			ex = vm.handleThrow(x)
+			// FIX: When the VM panics with an uncaught exception (ex != nil) during
+			// a step operation, debug()'s post-loop VM-EXIT cleanup code is bypassed
+			// because the panic unwinds past it. We must close vmDoneCh here so that
+			// Continue() (which is waiting on vmDoneCh) doesn't get stuck forever.
+			if ex != nil && vm.debugMode && vm.debugger != nil &&
+				(vm.debugger.next || vm.debugger.stepIn) {
+				if debugVM {
+					fmt.Printf("[VM-EXIT] 🔧 Uncaught exception during step — closing vmDoneCh (next=%v, stepIn=%v, depth=%d)\n",
+						vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth())
+				}
+				vm.debugger.vmExited = true
+				if vm.debugger.vmDoneCh != nil {
+					select {
+					case <-vm.debugger.vmDoneCh:
+						// Already closed
+					default:
+						close(vm.debugger.vmDoneCh)
+					}
+				}
+				vm.debugger.next = false
+				vm.debugger.stepIn = false
+				GetGlobalCoordinator().ClearGlobalStepState()
+				if GetGlobalCoordinator().IsMultiVUDebug() {
+					GetGlobalCoordinator().ClearVUStepState(vm.debugger.vuID)
+				}
+			}
 		}
 	}()
 
