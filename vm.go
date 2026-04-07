@@ -1292,7 +1292,23 @@ func (vm *vm) debug() {
 						shouldBreak = pcAdvanced && lineChanged && vmInValidState && isUserFile && !isControlFlowOnly
 						breakReason = "stepIn"
 
-						// RETURN-LINE FIX (stepIn): Same as step-over — detect _ret on the same
+						// FIX: Skip sub-expressions in multi-line call expressions.
+						// When stepping in, we want to enter the function — not stop at
+						// each argument. At the same call depth, use lastPCForLine to
+						// find the end of the current expression and skip until we either
+						// pass it (next statement) or depth increases (entered function).
+						if shouldBreak {
+							startDepth := vm.debugger.lastBreakpoint.stackDepth
+							if currentStackDepth <= startDepth {
+								startPC := vm.debugger.lastBreakpoint.pc
+								startLine := vm.debugger.lastBreakpoint.line
+								lastPC := vm.prg.lastPCForLine(startLine, startPC)
+								if lastPC >= 0 && currentPC <= lastPC {
+									shouldBreak = false
+									breakReason = "stepIn-skip-subexpr"
+								}
+							}
+						}
 						// source line and force a break so the user sees the return statement.
 						if !shouldBreak && pcAdvanced && vmInValidState && isUserFile && !lineChanged {
 							if currentPC >= 0 && currentPC < len(vm.prg.code) {
@@ -1480,6 +1496,21 @@ func (vm *vm) debug() {
 
 						shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState && isUserFile && !isControlFlowOnly
 						breakReason = "next"
+
+						// FIX: Skip sub-expressions in multi-line call expressions.
+						// When stepping over from line N, the compiler may emit bytecodes
+						// for argument evaluation on different source lines (e.g., object
+						// properties), but the call instruction itself maps BACK to line N.
+						// stepOverLastPC is the last PC mapping to the start line — don't
+						// break until we've passed it. This matches Node.js/V8 behaviour.
+						if shouldBreak && vm.debugger.stepOverLastPC >= 0 && currentPC <= vm.debugger.stepOverLastPC {
+							shouldBreak = false
+							breakReason = "next-skip-subexpr"
+							if debugVM {
+								fmt.Printf("[VM-STEP-OVER] Skipping sub-expression at line %d (PC=%d <= lastPC=%d for start line %d)\n",
+									currentLine, currentPC, vm.debugger.stepOverLastPC, startLine)
+							}
+						}
 
 						// RETURN-LINE FIX: When bundlers (esbuild/TypeScript) map a `return`
 						// statement to the same source line as the preceding statement,

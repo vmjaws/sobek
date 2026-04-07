@@ -10,6 +10,12 @@ import (
 )
 
 func (c *compiler) compileStatement(v ast.Statement, needResult bool) {
+	// In debug mode, record the current PC as a statement-start boundary.
+	// The debugger uses this to distinguish statements from sub-expressions
+	// so step-in/step-over skip argument evaluation in multi-line calls.
+	if c.debug {
+		c.p.addStmtPC()
+	}
 	switch v := v.(type) {
 	case *ast.BlockStatement:
 		c.compileBlockStatement(v, needResult)

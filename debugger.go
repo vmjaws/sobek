@@ -908,6 +908,7 @@ type Debugger struct {
 	stepOverTargetDepth         int
 	stepOverOriginalTargetDepth int // the depth at which Next() was originally called — never overwritten by re-activation
 	stepOverStartLine           int
+	stepOverLastPC              int // last PC whose source-mapped line == stepOverStartLine; step-over won't break until currentPC > this
 	stepOverMissCount           int // safety counter: instructions with startLine=0 and no valid currentLine
 	steppingFilename            string
 	enableDebugLogging          bool
@@ -1487,6 +1488,16 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 					fmt.Printf("[DEBUGGER-ACTIVATE] Received from coordinator (non-lifecycle, multiVU=%v, vuID=%d, ch=%p)\n", globalDebugCoordinator.IsMultiVUDebug(), dbg.vuID, ch)
 				}
 				applyStepState("coordinator")
+			case ch = <-globalDebugCoordinator.ActivationChannel():
+				// CROSS-VU FIX: After a lifecycle transition (init→default),
+				// Continue() runs on the old VU's debugger and can't reach the
+				// new VU's per-VU channel. It falls back to the global channel.
+				// By listening here, ANY VU's activate() can pick it up and
+				// respond, breaking the deadlock.
+				if debugActivate {
+					fmt.Printf("[DEBUGGER-ACTIVATE] Received from global channel (cross-VU lifecycle transition, vuID=%d, ch=%p)\n", dbg.vuID, ch)
+				}
+				applyStepState("global-crossVU")
 			}
 			// Guard: if ch is nil (a stale Continue() sent dbg.currentCh after
 			// ResetForPhaseTransition nil'd it), retry — sending on a nil channel
@@ -2074,7 +2085,28 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 					}
 				}
 			}
-			// Try 3: original behavior — send to our own per-VU channel (fallback)
+			// Try 3: global activation channel (cross-VU lifecycle fallback)
+			// After a lifecycle transition (init→default), no active debugger
+			// may exist yet (no VU has hit a breakpoint). The global channel
+			// is listened on by ALL VUs' activate(), so the first one to hit
+			// a breakpoint will pick this up.
+			if !sent && isMultiVU {
+				globalCh := globalDebugCoordinator.ActivationChannel()
+				// Drain any stale entry first (buffered 1 channel)
+				select {
+				case <-globalCh:
+				default:
+				}
+				select {
+				case globalCh <- dbg.currentCh:
+					if debugContinue {
+						fmt.Printf("[DEBUGGER-CONTINUE] Sent to global activation channel (cross-VU fallback, vuID=%d, ch=%p)\n", dbg.vuID, dbg.currentCh)
+					}
+					sent = true
+				default:
+				}
+			}
+			// Try 4: original behavior — send to our own per-VU channel (last resort)
 			if !sent {
 				select {
 				case <-vuActivationCh:
@@ -2801,10 +2833,21 @@ func (dbg *Debugger) Next() error {
 		dbg.stepOverStartLine = startLine
 		dbg.stepOverMissCount = 0
 		dbg.steppingFilename = steppingFilename
+		// Compute the last PC whose source-mapped line == startLine.
+		// Step-over won't break until currentPC > this value, which skips
+		// sub-expressions in multi-line call expressions (e.g., object literal
+		// properties that map to different source lines but are part of the
+		// same expression — the call instruction at the end maps back to startLine).
+		if dbg.vm != nil && dbg.vm.prg != nil {
+			dbg.stepOverLastPC = dbg.vm.prg.lastPCForLine(startLine, dbg.vm.pc)
+		} else {
+			dbg.stepOverLastPC = -1
+		}
 	} else {
 		dbg.stepOverTargetDepth = dbg.lastBreakpoint.stackDepth
 		dbg.stepOverOriginalTargetDepth = dbg.stepOverTargetDepth
 		dbg.stepOverStartLine = 0
+		dbg.stepOverLastPC = -1
 		dbg.stepOverMissCount = 0
 		dbg.steppingFilename = ""
 		if debugContinue {
@@ -3344,6 +3387,7 @@ func (dbg *Debugger) safeToRun() bool {
 	}
 	return dbg.vm.pc < len(dbg.vm.prg.code)
 }
+
 
 func (dbg *Debugger) StepIn() error {
 	if debugContinue {

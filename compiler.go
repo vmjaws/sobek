@@ -78,6 +78,13 @@ type Program struct {
 
 	//  only populated when compiling with debug flag
 	debugSymbols *DebugSymbols
+
+	// stmtPCs records PCs where new statements begin (sorted).
+	// Only populated in debug mode. Used by the debugger to distinguish
+	// statement boundaries from sub-expression positions so that step-in
+	// and step-over skip argument evaluation in multi-line call expressions
+	// (matching Node.js/V8 debugger behaviour).
+	stmtPCs []int
 }
 
 type DebugSymbols struct {
@@ -557,6 +564,53 @@ func (p *Program) addSrcMap(srcPos int) {
 		return
 	}
 	p.srcMap = append(p.srcMap, srcMapItem{pc: len(p.code), srcPos: srcPos})
+}
+
+// addStmtPC records the current code length as a statement-start PC.
+// Only called in debug mode from compiler_stmt.go.
+func (p *Program) addStmtPC() {
+	pc := len(p.code)
+	if len(p.stmtPCs) > 0 && p.stmtPCs[len(p.stmtPCs)-1] == pc {
+		return
+	}
+	p.stmtPCs = append(p.stmtPCs, pc)
+}
+
+// isStatementStart returns true if pc corresponds to the beginning of a
+// statement (as opposed to a sub-expression like an argument evaluation).
+// Used by the debugger during step-in/step-over to skip argument evaluation
+// in multi-line call expressions. Returns true when stmtPCs is empty
+// (non-debug mode or very old programs) to preserve backward compatibility.
+func (p *Program) isStatementStart(pc int) bool {
+	if len(p.stmtPCs) == 0 {
+		return true // no data — treat every PC as a potential break point
+	}
+	idx := sort.SearchInts(p.stmtPCs, pc)
+	return idx < len(p.stmtPCs) && p.stmtPCs[idx] == pc
+}
+
+// lastPCForLine scans the program's srcMap and returns the LAST PC whose
+// source-mapped line equals the given line. Used by step-over to determine
+// the end of a multi-line expression: step-over from line N should not break
+// until currentPC > lastPCForLine(N). Returns -1 if no match is found.
+func (p *Program) lastPCForLine(line int, startPC int) int {
+	if p.src == nil || len(p.srcMap) == 0 {
+		return -1
+	}
+	lastPC := -1
+	for i := len(p.srcMap) - 1; i >= 0; i-- {
+		entry := p.srcMap[i]
+		if entry.pc < startPC {
+			break // no need to scan before start
+		}
+		pos := p.src.Position(entry.srcPos)
+		if pos.Line == line {
+			if entry.pc > lastPC {
+				lastPC = entry.pc
+			}
+		}
+	}
+	return lastPC
 }
 
 func (s *scope) lookupName(name unistring.String) (binding *binding, noDynamics bool) {
