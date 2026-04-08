@@ -40,6 +40,10 @@ var (
 	debugAll = os.Getenv("SOBEK_DEBUG_ALL") == "1" || os.Getenv("SOBEK_DEBUG_ALL") == "true"
 )
 
+// thisKeywordRegex matches the JS keyword 'this' at word boundaries,
+// avoiding false positives on identifiers like "synthesis" or "thistle".
+var thisKeywordRegex = regexp.MustCompile(`\bthis\b`)
+
 func init() {
 	if debugAll {
 		debugActivate = true
@@ -909,6 +913,9 @@ type Debugger struct {
 	stepOverOriginalTargetDepth int // the depth at which Next() was originally called — never overwritten by re-activation
 	stepOverStartLine           int
 	stepOverLastPC              int // last PC whose source-mapped line == stepOverStartLine; step-over won't break until currentPC > this
+	stepInLastPC                int // last PC whose source-mapped line == stepInStartLine; stepIn skips sub-expressions across depth changes
+	stepInLastPCPrg             *Program // the program stepInLastPC was computed for; guard is invalid in any other program
+	stepInStartLine             int // the line where the current stepIn operation began
 	stepOverMissCount           int // safety counter: instructions with startLine=0 and no valid currentLine
 	steppingFilename            string
 	enableDebugLogging          bool
@@ -2839,7 +2846,7 @@ func (dbg *Debugger) Next() error {
 		// properties that map to different source lines but are part of the
 		// same expression — the call instruction at the end maps back to startLine).
 		if dbg.vm != nil && dbg.vm.prg != nil {
-			dbg.stepOverLastPC = dbg.vm.prg.lastPCForLine(startLine, dbg.vm.pc)
+			dbg.stepOverLastPC = dbg.vm.prg.lastPCForLine(startLine, dbg.vm.pc, steppingFilename)
 		} else {
 			dbg.stepOverLastPC = -1
 		}
@@ -2902,6 +2909,8 @@ func (dbg *Debugger) ClearStepFlags() {
 	dbg.stepIn = false
 	dbg.stepOverStartLine = 0
 	dbg.stepOverOriginalTargetDepth = 0
+	dbg.stepInLastPC = -1
+	dbg.stepInStartLine = 0
 	dbg.continuing = false
 	dbg.userCommandIssued = true
 	// Invalidate per-pause snapshot — we're resuming.
@@ -2932,6 +2941,8 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 	dbg.stepOverOriginalTargetDepth = 0
 	dbg.stepOverStartLine = 0
 	dbg.steppingFilename = ""
+	dbg.stepInLastPC = -1
+	dbg.stepInStartLine = 0
 
 	// Position tracking — reset so the first line of the new function is seen as "new"
 	// pc must be -1 (not 0) so that pcAdvanced is true at PC=0 (first instruction)
@@ -3032,6 +3043,8 @@ func (dbg *Debugger) ResetForNewRun() {
 	dbg.stepOverOriginalTargetDepth = 0
 	dbg.stepOverStartLine = 0
 	dbg.steppingFilename = ""
+	dbg.stepInLastPC = -1
+	dbg.stepInStartLine = 0
 
 	// Breakpoint position cache
 	// FIX: pc must be -1 (not 0) so that pcAdvanced (currentPC != prevPC) is true
@@ -3449,8 +3462,23 @@ func (dbg *Debugger) StepIn() error {
 
 	if gotValidState {
 		dbg.steppingFilename = steppingFilename
+		// Compute lastPC for the start line so sub-expressions are skipped
+		// even across temporary depth changes (e.g., method call arguments).
+		if dbg.vm != nil && dbg.vm.prg != nil {
+			startLine := dbg.Line()
+			dbg.stepInStartLine = startLine
+			dbg.stepInLastPC = dbg.vm.prg.lastPCForLine(startLine, dbg.vm.pc, steppingFilename)
+			dbg.stepInLastPCPrg = dbg.vm.prg
+		} else {
+			dbg.stepInStartLine = 0
+			dbg.stepInLastPC = -1
+			dbg.stepInLastPCPrg = nil
+		}
 	} else {
 		dbg.steppingFilename = ""
+		dbg.stepInStartLine = 0
+		dbg.stepInLastPC = -1
+		dbg.stepInLastPCPrg = nil
 		if debugContinue {
 			fmt.Printf("[DEBUGGER-STEPIN] ⚠️ No valid state, using empty steppingFilename\n")
 		}
@@ -4144,6 +4172,14 @@ func (dbg *Debugger) resolveGeneratedName(generatedName string) string {
 // debug evaluate/hover without needing a full TS parser.
 var tsAsTypeRegex = regexp.MustCompile(`\s+as\s+[A-Za-z_$][\w$]*(?:\[\]|\<[^>]*\>)*`)
 
+// tsNonNullRegex matches TypeScript's non-null assertion operator (!)
+// in all positions. It captures the char before ! ($1) and the char/end
+// after ! ($2), stripping only the !. It requires ! to be preceded by a
+// word char, ), or ], and followed by ., [, ,, ), ;, whitespace, or EOL.
+// This avoids stripping logical-not (!expr) and != / !==.
+// Examples: allStores!.length → allStores.length, arr![0] → arr[0]
+var tsNonNullRegex = regexp.MustCompile(`([\w)\]])!([.\[,);\s])`)
+
 func stripTypeScriptSyntax(expr string) string {
 	// Strip "as Type" assertions (including "as Type[]", "as Map<K,V>")
 	// e.g., "(error as Error).message" → "(error).message"
@@ -4165,9 +4201,20 @@ func stripTypeScriptSyntax(expr string) string {
 		}
 	}
 
-	// Strip trailing non-null assertion: "expr!" → "expr"
-	// But not "!expr" (logical not) or "!=", "!=="
-	expr = strings.TrimRight(expr, "!")
+	// Strip TypeScript non-null assertion operator (!) in all positions.
+	// Handles: obj!.prop, arr![0], fn(arg!), getValue()!, expr!
+	// Does NOT strip: !expr (logical not), !== , !=
+	if strings.Contains(expr, "!") {
+		expr = tsNonNullRegex.ReplaceAllString(expr, "${1}${2}")
+		// Also strip trailing ! (e.g., "getValue()!" → "getValue()")
+		if len(expr) > 1 && expr[len(expr)-1] == '!' {
+			before := expr[len(expr)-2]
+			if before == ')' || before == ']' || (before >= 'a' && before <= 'z') ||
+				(before >= 'A' && before <= 'Z') || (before >= '0' && before <= '9') || before == '_' || before == '$' {
+				expr = expr[:len(expr)-1]
+			}
+		}
+	}
 
 	return expr
 }
@@ -4488,6 +4535,21 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		return nil, fmt.Errorf("compilation error: %w", compileErr)
 	}
 
+	// Check if the expression references 'this' — if so, wrap it in a function
+	// and .call() it with the current frame's 'this'. The keyword 'this' cannot
+	// be injected as a global property; it must be resolved via the call context.
+	needsThisBinding := thisKeywordRegex.MatchString(expr)
+	var thisBindProg *Program
+	if needsThisBinding {
+		wrappedExpr := "(function(){\nreturn (\n" + expr + "\n);\n})"
+		var wrapErr error
+		thisBindProg, wrapErr = compile("<eval>", wrappedExpr, false, true, nil, dbg.vm.debugMode, dbg.vm.r.parserOptions...)
+		if wrapErr != nil {
+			// Fallback: if wrapping fails, use the raw program
+			thisBindProg = nil
+		}
+	}
+
 	var result Value
 	var evalErr error
 	// Suppress the debugger during eval execution. Exceptions from the eval
@@ -4506,7 +4568,23 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 				}
 			}
 		}()
-		result, evalErr = dbg.vm.r.RunProgram(prog)
+
+		if thisBindProg != nil {
+			// Run the wrapper to get the function, then call it with 'this'
+			rawResult, runErr := dbg.vm.r.RunProgram(thisBindProg)
+			if runErr != nil {
+				evalErr = runErr
+				return
+			}
+			if fn, ok := AssertFunction(rawResult); ok {
+				thisVal := dbg.getCurrentThis()
+				result, evalErr = fn(thisVal)
+			} else {
+				result = rawResult
+			}
+		} else {
+			result, evalErr = dbg.vm.r.RunProgram(prog)
+		}
 	}()
 	if evalErr != nil {
 		if exc, ok := evalErr.(*Exception); ok {
@@ -4520,6 +4598,44 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		return nil, fmt.Errorf("evaluation error: %w", evalErr)
 	}
 	return result, nil
+}
+
+// getCurrentThis returns the 'this' value for the current stack frame.
+// Used by evaluateComplexExpression to bind 'this' correctly in eval.
+// 'this' is a keyword in JS and cannot be injected as a global property,
+// so we resolve it from the stash chain (for class methods, arrow functions
+// with lexical this) or the stack base (for regular functions).
+func (dbg *Debugger) getCurrentThis() Value {
+	if dbg.vm == nil {
+		return _undefined
+	}
+	// Try stash chain for " this" (thisBindingName) first — works for
+	// class methods, arrow functions with lexical this, etc.
+	thisKey := unistring.String(thisBindingName)
+	for s := dbg.vm.stash; s != nil; s = s.outer {
+		if s.names == nil {
+			continue
+		}
+		if idx, found := s.names[thisKey]; found {
+			actualIdx := int(idx & uint32(maskIndex))
+			if s.values != nil && actualIdx < len(s.values) {
+				v := s.values[actualIdx]
+				if v != nil && !isNullValue(v) {
+					return v
+				}
+			}
+		}
+	}
+	// Fallback: stack base (vm.sb) holds 'this' for regular functions
+	if dbg.vm.sb >= 0 && dbg.vm.sb < len(dbg.vm.stack) {
+		v := dbg.vm.stack[dbg.vm.sb]
+		if v != nil && !isNullValue(v) {
+			if _, isUnresolved := v.(valueUnresolved); !isUnresolved {
+				return v
+			}
+		}
+	}
+	return _undefined
 }
 
 func (dbg *Debugger) captureReturnValue(varName string, value Value) {
@@ -4603,6 +4719,8 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 	savedStepOverTargetDepth := dbg.stepOverTargetDepth
 	savedStepOverOriginalTargetDepth := dbg.stepOverOriginalTargetDepth
 	savedStepOverStartLine := dbg.stepOverStartLine
+	savedStepInLastPC := dbg.stepInLastPC
+	savedStepInStartLine := dbg.stepInStartLine
 	savedSteppingFilename := dbg.steppingFilename
 	savedActive := dbg.active
 	savedLastBreakpoint := dbg.lastBreakpoint
@@ -4638,6 +4756,8 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 		dbg.stepOverTargetDepth = savedStepOverTargetDepth
 		dbg.stepOverOriginalTargetDepth = savedStepOverOriginalTargetDepth
 		dbg.stepOverStartLine = savedStepOverStartLine
+		dbg.stepInLastPC = savedStepInLastPC
+		dbg.stepInStartLine = savedStepInStartLine
 		dbg.steppingFilename = savedSteppingFilename
 		dbg.active = savedActive
 		dbg.lastBreakpoint = savedLastBreakpoint

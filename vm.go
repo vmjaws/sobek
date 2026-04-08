@@ -1208,31 +1208,6 @@ func (vm *vm) debug() {
 						isLifecycleFunctionEntry := currentPC == 0 && prevPC == -1
 						vmInValidState := vm.sb >= 0 || isLifecycleFunctionEntry
 
-						// LAST-LINE FIX: Detect when the current instruction is ret/cret.
-						// When stepping and the current instruction is a function return, check
-						// if we're about to leave the function without ever breaking on this line.
-						// This handles the case where the function's last statement and the
-						// implicit return (loadUndef + ret) share the same source line, so
-						// lineChanged is never true for the return bytecodes.
-						//
-						// The fix in compiler_stmt.go (addSrcMap for return keyword) handles
-						// EXPLICIT return statements. This check handles the IMPLICIT return
-						// case where no return statement exists in the source.
-						isRetInstruction := false
-						if !lineChanged && pcAdvanced && vmInValidState && isUserFile && currentPC >= 0 && currentPC < len(vm.prg.code) {
-							switch vm.prg.code[currentPC].(type) {
-							case _ret, cret:
-								isRetInstruction = true
-							}
-						}
-						// For implicit returns: if we're about to execute ret and we've never
-						// broken on this line (prevLine == currentLine because the last statement
-						// and ret share a source line), check if the NEXT instruction after ret
-						// would be at a different depth. This means we're leaving the function.
-						// In this case, we should have already broken on this line (when we first
-						// arrived from a different line). So don't force a double-break.
-						// The source map fix in compiler_stmt.go is the primary fix.
-						_ = isRetInstruction
 
 						// Skip control-flow-only instructions (same as step-over)
 						isControlFlowOnly := false
@@ -1266,11 +1241,6 @@ func (vm *vm) debug() {
 							case leaveTry, enterFinally:
 								isControlFlowOnly = true
 							case jump:
-								// Only mark as control-flow-only if this jump is a try-catch exit:
-								// the instruction immediately after the jump is enterCatchBlock or
-								// enterFinally. Regular if/else forward jumps (skipping the else body)
-								// must NOT be suppressed — otherwise the debugger skips lines after
-								// if/else blocks and in else branches.
 								if currentPC > lastExecPC {
 									nextPC := lastExecPC + 1
 									if nextPC < len(vm.prg.code) {
@@ -1280,57 +1250,78 @@ func (vm *vm) debug() {
 										}
 									}
 								}
-							// NOTE: Conditional jumps (jneP, jeqP, jne, jeq, jdef, jdefP) are
-							// NO LONGER marked as control-flow-only. The previous heuristic
-							// (>10 PCs = block-skip) incorrectly suppressed breaks at the first
-							// line of else blocks when the if-body had more than ~10 bytecodes.
-							// Try-catch patterns are already handled by the leaveTry/enterFinally
-							// cases above and the current-instruction check.
+							case jneP, jeqP, jne, jeq:
+								// Same as step-over: conditional jumps skipping over try blocks.
+								if currentPC > lastExecPC {
+									nextPC := lastExecPC + 1
+									if nextPC < len(vm.prg.code) {
+										switch vm.prg.code[nextPC].(type) {
+										case try, *enterCatchBlock, enterFinally:
+											isControlFlowOnly = true
+										}
+									}
+								}
 							}
 						}
 
 						shouldBreak = pcAdvanced && lineChanged && vmInValidState && isUserFile && !isControlFlowOnly
 						breakReason = "stepIn"
 
-						// FIX: Skip sub-expressions in multi-line call expressions.
-						// When stepping in, we want to enter the function — not stop at
-						// each argument. At the same call depth, use lastPCForLine to
-						// find the end of the current expression and skip until we either
-						// pass it (next statement) or depth increases (entered function).
+						// FIX: Skip sub-expressions in multi-line call expressions (stepIn).
+						// Two-level guard:
+						// Guard 1: Same-depth — use lastPCForLine from lastBreakpoint (existing logic).
+						// Guard 2: stepInLastPC — skip until we pass the last PC of the line where
+						//   stepIn was initiated, even across depth changes caused by short-lived
+						//   call frames (e.g., this.isCacheValid() argument evaluation pushing and
+						//   popping a call frame before we reach the next source line).
+						//
+						// CRITICAL: Only skip when currentPC > lastExecPC (moving forward).
+						// If the VM jumped backward, we're in a new loop iteration.
 						if shouldBreak {
+							// Guard 1: same-depth sub-expression skip
 							startDepth := vm.debugger.lastBreakpoint.stackDepth
 							if currentStackDepth <= startDepth {
-								startPC := vm.debugger.lastBreakpoint.pc
-								startLine := vm.debugger.lastBreakpoint.line
-								lastPC := vm.prg.lastPCForLine(startLine, startPC)
-								if lastPC >= 0 && currentPC <= lastPC {
+							startPC := vm.debugger.lastBreakpoint.pc
+							startLine := vm.debugger.lastBreakpoint.line
+							lastPC := vm.prg.lastPCForLine(startLine, startPC, vm.debugger.lastBreakpoint.filename)
+								if lastPC >= 0 && currentPC <= lastPC && currentPC > lastExecPC {
 									shouldBreak = false
 									breakReason = "stepIn-skip-subexpr"
 								}
 							}
-						}
-						// source line and force a break so the user sees the return statement.
-						if !shouldBreak && pcAdvanced && vmInValidState && isUserFile && !lineChanged {
-							if currentPC >= 0 && currentPC < len(vm.prg.code) {
-								if _, isRet := vm.prg.code[currentPC].(_ret); isRet {
-									if lastExecPC >= 0 && lastExecPC != prevPC {
-										// IMPLICIT-RETURN FIX: Same as step-over — skip
-										// implicit returns (loadUndef + _ret) to avoid
-										// double-stopping on the last line of a function.
-										isImplicitReturn := false
-										if lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
-											if _, isLU := vm.prg.code[lastExecPC].(_loadUndef); isLU {
-												isImplicitReturn = true
-											}
-										}
-										if !isImplicitReturn {
-											shouldBreak = true
-											breakReason = "stepIn (return-from-function on same source line)"
-										}
-									}
+							// Guard 2: stepInLastPC — skip until we pass the initiation line's
+							// last bytecode. This handles the case where argument evaluation
+							// temporarily increases depth (e.g., this.isCacheValid() call frame
+							// is pushed and popped before we reach the next source line).
+							//
+							// CRITICAL: Only apply when we're in the SAME program that
+							// stepInLastPC was computed for. When a function is entered via
+							// __call (e.g., class constructor, instance_members_initializer),
+							// vm.prg changes OUTSIDE the debug loop, so the in-loop
+							// program-change reset doesn't fire. A stale stepInLastPC from
+							// the caller's program would suppress all breaks in the callee.
+							if shouldBreak && vm.debugger.stepInLastPC >= 0 && vm.debugger.stepInLastPCPrg == vm.prg {
+								if currentPC <= vm.debugger.stepInLastPC && currentPC > lastExecPC {
+									shouldBreak = false
+									breakReason = "stepIn-skip-initline"
+								} else if currentPC > vm.debugger.stepInLastPC {
+									// We've passed the initiation line — clear the guard
+									vm.debugger.stepInLastPC = -1
+									vm.debugger.stepInLastPCPrg = nil
 								}
+							} else if vm.debugger.stepInLastPC >= 0 && vm.debugger.stepInLastPCPrg != vm.prg {
+								// Different program — guard is invalid, clear it
+								vm.debugger.stepInLastPC = -1
+								vm.debugger.stepInLastPCPrg = nil
 							}
 						}
+						// RETURN-LINE FIX removed: forcing a break when a _ret instruction
+						// shares the same source line as the step-start line caused a
+						// double-break on the last line of every function with an explicit
+						// return (the user had to press step-in twice to leave the function).
+						// Standard debugger semantics: stepping from line N must always
+						// advance to a DIFFERENT line. The _ret on the same line is simply
+						// part of executing that line and should not pause again.
 
 						if isLifecycleFunctionEntry && isUserFile && debugVM {
 							fmt.Printf("[VM-LIFECYCLE-ENTRY] 🎯 Lifecycle function entry detected at line %d (PC=0, prevPC=-1, sb=%d). vmInValidState forced to %v (would be %v without fix). shouldBreak=%v\n",
@@ -1485,17 +1476,50 @@ func (vm *vm) debug() {
 										}
 									}
 								}
-							// NOTE: Conditional jumps (jneP, jeqP, jne, jeq, jdef, jdefP) are
-							// NO LONGER marked as control-flow-only. The previous heuristic
-							// (>10 PCs = block-skip) incorrectly suppressed breaks at the first
-							// line of else blocks when the if-body had more than ~10 bytecodes.
-							// Try-catch patterns are already handled by the leaveTry/enterFinally
-							// cases above and the current-instruction check.
+							case jneP, jeqP, jne, jeq:
+								// Conditional jumps that skip over a try block.
+								// When an if-condition (e.g., `if (cond) { try { ... } catch { ... } }`)
+								// is false, the conditional jump skips the entire if-body. If the
+								// if-body starts with a `try` instruction, the jump lands PAST the
+								// try-catch, at a PC whose source map points to the catch-block line.
+								// Detect this by checking if the instruction right after the conditional
+								// jump is `try` — meaning we jumped over a try-catch block.
+								// This does NOT affect regular if/else: else bodies don't start with `try`.
+								if currentPC > lastExecPC {
+									nextPC := lastExecPC + 1
+									if nextPC < len(vm.prg.code) {
+										switch vm.prg.code[nextPC].(type) {
+										case try, *enterCatchBlock, enterFinally:
+											isControlFlowOnly = true
+										}
+									}
+								}
 							}
 						}
 
 						shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState && isUserFile && !isControlFlowOnly
 						breakReason = "next"
+
+						// DIAGNOSTIC: Log every instruction where lineChanged is true during step-over
+						// to trace exactly why the false break at catch-block lines happens.
+						if lineChanged && pcAdvanced && isUserFile && debugVM {
+							lastExecInstrType := "N/A"
+							if lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
+								lastExecInstrType = fmt.Sprintf("%T", vm.prg.code[lastExecPC])
+							}
+							currentInstrType := "N/A"
+							if currentPC >= 0 && currentPC < len(vm.prg.code) {
+								currentInstrType = fmt.Sprintf("%T", vm.prg.code[currentPC])
+							}
+							nextAfterLastExec := "N/A"
+							if lastExecPC >= 0 && lastExecPC+1 < len(vm.prg.code) {
+								nextAfterLastExec = fmt.Sprintf("%T", vm.prg.code[lastExecPC+1])
+							}
+							fmt.Printf("[VM-STEPOVER-DIAG] PC=%d(line %d) lastExecPC=%d, curInstr=%s, lastExecInstr=%s, lastExec+1=%s, isControlFlow=%v, atDepth=%v(%d<=%d), vmValid=%v, stepOverLastPC=%d, shouldBreak=%v\n",
+								currentPC, currentLine, lastExecPC, currentInstrType, lastExecInstrType, nextAfterLastExec,
+								isControlFlowOnly, atValidDepth, currentStackDepth, vm.debugger.stepOverTargetDepth, vmInValidState,
+								vm.debugger.stepOverLastPC, shouldBreak)
+						}
 
 						// FIX: Skip sub-expressions in multi-line call expressions.
 						// When stepping over from line N, the compiler may emit bytecodes
@@ -1503,7 +1527,13 @@ func (vm *vm) debug() {
 						// properties), but the call instruction itself maps BACK to line N.
 						// stepOverLastPC is the last PC mapping to the start line — don't
 						// break until we've passed it. This matches Node.js/V8 behaviour.
-						if shouldBreak && vm.debugger.stepOverLastPC >= 0 && currentPC <= vm.debugger.stepOverLastPC {
+						//
+						// CRITICAL: Only skip when currentPC > lastExecPC (moving forward).
+						// If the VM jumped backward (currentPC < lastExecPC), we're in a
+						// new loop iteration — NOT a sub-expression. lastExecPC tracks the
+						// actual last executed instruction, so it catches backward jumps
+						// from any point in the loop (header, body, or continuation check).
+						if shouldBreak && vm.debugger.stepOverLastPC >= 0 && currentPC <= vm.debugger.stepOverLastPC && currentPC > lastExecPC {
 							shouldBreak = false
 							breakReason = "next-skip-subexpr"
 							if debugVM {
@@ -1512,52 +1542,15 @@ func (vm *vm) debug() {
 							}
 						}
 
-						// RETURN-LINE FIX: When bundlers (esbuild/TypeScript) map a `return`
-						// statement to the same source line as the preceding statement,
-						// lineChanged is never true for the return bytecodes. The user presses
-						// step-over from line N (e.g. console.log), the return is also on line N,
-						// so the debugger skips it and only breaks back in the caller.
-						//
-						// Fix: if we're about to execute _ret at the current valid depth and
-						// shouldBreak is false (because lineChanged is false), check if the
-						// previous instruction was _loadResult (the return-from-try pattern:
-						// _saveResult → leaveTry → _loadResult → _ret) or if we simply have
-						// a return on the same line. Force a break so the user sees the function
-						// is returning. Only do this when:
-						//   - We haven't broken on this line yet during this step sequence
-						//     (startLine != currentLine would mean lineChanged=true, handled above)
-						//   - Actually: startLine == currentLine means we're STILL on the start line.
-						//     But we need to distinguish "haven't moved yet" from "returned to same line".
-						//     Use lastExecPC: if we've executed several instructions past the start PC,
-						//     we've done real work on this line.
-						if !shouldBreak && pcAdvanced && atValidDepth && vmInValidState && isUserFile && !lineChanged {
-							if currentPC >= 0 && currentPC < len(vm.prg.code) {
-								if _, isRet := vm.prg.code[currentPC].(_ret); isRet {
-									// Additional guard: only force break if we've executed meaningful
-									// instructions since the step started (not just the first PC after resume).
-									// This prevents double-breaking on lines that only contain a return.
-									if lastExecPC >= 0 && lastExecPC != prevPC {
-										// IMPLICIT-RETURN FIX: Don't force a break when the _ret
-										// is preceded by _loadUndef — that's the compiler-generated
-										// implicit return at the end of a function body, NOT an
-										// explicit `return` statement written by the user.
-										// Without this, stepping over the LAST statement of
-										// setup/default/teardown stops TWICE on the same line:
-										// once for the statement, once for the implicit return.
-										isImplicitReturn := false
-										if lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
-											if _, isLU := vm.prg.code[lastExecPC].(_loadUndef); isLU {
-												isImplicitReturn = true
-											}
-										}
-										if !isImplicitReturn {
-											shouldBreak = true
-											breakReason = "next (return-from-function on same source line)"
-										}
-									}
-								}
-							}
-						}
+						// RETURN-LINE FIX removed: forcing a break when a _ret instruction
+						// shares the same source line as the step-over start line caused a
+						// double-break on the last line of every imported function with an
+						// explicit return (the user had to press Next twice to leave the
+						// function). Standard debugger semantics: step-over from line N must
+						// always advance to a DIFFERENT line. The _ret on the same line is
+						// simply part of executing that line and should not pause again.
+						// The implicit return case (_loadUndef + _ret) was already handled
+						// by the isControlFlowOnly detection earlier in this code path.
 
 						if isLifecycleFunctionEntry && isUserFile && debugVM {
 							fmt.Printf("[VM-LIFECYCLE-ENTRY] 🎯 Lifecycle function entry (next) at line %d (PC=0, prevPC=-1, sb=%d). vmInValidState forced to %v. shouldBreak=%v\n",
@@ -1685,6 +1678,9 @@ func (vm *vm) debug() {
 						vm.debugger.next = false
 
 						vm.debugger.stepOverStartLine = 0 // Clear start line for next step operation
+						vm.debugger.stepInLastPC = -1     // Clear stepIn sub-expression guard
+						vm.debugger.stepInLastPCPrg = nil // Clear stepIn program reference
+						vm.debugger.stepInStartLine = 0   // Clear stepIn start line
 						vm.debugger.continuing = false    // Clear continuing flag when we break
 						// NOTE: Do NOT clear global step state here! The activate() function reads and
 						// clears it after applying it. Clearing here would race with activate() and
@@ -1734,6 +1730,14 @@ func (vm *vm) debug() {
 		}
 		// Track actual previous instruction PC for forward-jump detection.
 		lastExecPC = pc
+		// Track vm.prg BEFORE exec — if it changes (function call pushes a new
+		// program, or return pops back to a previous one), we must reset lastExecPC
+		// to prevent cross-program PC contamination. Without this, the sub-expression
+		// skip compares PCs from different programs, which is invalid and can cause
+		// incorrect skip decisions (e.g., suppressing a break at a line that should
+		// pause because lastExecPC from the callee happens to be < currentPC in the
+		// caller).
+		prevPrg := vm.prg
 		// [VM-EXEC] and [VM-POST] per-instruction logging commented out to reduce noise.
 		// These produce ~10 lines per bytecode instruction and dominate the log.
 		// Uncomment for low-level instruction tracing when debugging step logic.
@@ -1742,6 +1746,33 @@ func (vm *vm) debug() {
 		// 		pc, vm.prg.code[pc], vm.debugger.next, vm.debugger.stepIn, vm.debugger.suppressDebugger, len(vm.callStack))
 		// }
 		vm.prg.code[pc].exec(vm)
+		// Reset lastExecPC when program changes (call/return) to prevent
+		// cross-program PC contamination in the sub-expression skip.
+		if vm.prg != prevPrg {
+			lastExecPC = -1
+			// CRITICAL FIX: Invalidate stepInLastPC when the program changes.
+			// stepInLastPC is computed by lastPCForLine() for the program where
+			// step-in was initiated. After a function call, vm.prg points to a
+			// completely different program whose PCs are an independent address
+			// space. Comparing the new program's PCs against a value from the old
+			// program causes Guard 2 to suppress breaks incorrectly — e.g.,
+			// stepping into getAllStores would skip the first ~N instructions
+			// (where N is the old stepInLastPC) and land on the catch block
+			// instead of the first line.
+			//
+			// NOTE: stepOverLastPC is intentionally NOT cleared here. During
+			// step-over, function calls don't trigger breaks (the depth check
+			// prevents it). When the function returns, vm.prg reverts to the
+			// original caller's program — so stepOverLastPC (computed for the
+			// caller's PC space) is still valid and needed to skip sub-expressions
+			// on the same line. Clearing it would remove the guard that prevents
+			// false breaks at try-catch exit points whose source maps map to the
+			// catch block's line.
+			if vm.debugger != nil {
+				vm.debugger.stepInLastPC = -1
+				vm.debugger.stepInLastPCPrg = nil
+			}
+		}
 		// if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
 		// 	newPC := vm.pc
 		// 	halted := vm.prg == nil || newPC < 0 || newPC >= len(vm.prg.code)

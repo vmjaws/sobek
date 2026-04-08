@@ -590,12 +590,25 @@ func (p *Program) isStatementStart(pc int) bool {
 }
 
 // lastPCForLine scans the program's srcMap and returns the LAST PC whose
-// source-mapped line equals the given line. Used by step-over to determine
-// the end of a multi-line expression: step-over from line N should not break
-// until currentPC > lastPCForLine(N). Returns -1 if no match is found.
-func (p *Program) lastPCForLine(line int, startPC int) int {
+// source-mapped line equals the given line, with pc >= startPC.
+// When filename is non-empty, only PCs whose source-mapped filename matches
+// are considered. This prevents cross-file line-number collisions in bundled
+// TypeScript (where a single *Program contains bytecodes from multiple
+// original .ts files via source maps) from inflating the PC range.
+// Used by the sub-expression skip in step-over/step-in to find the end of
+// a multi-line expression (e.g., a function call whose arguments span
+// multiple source lines). The caller must combine this with a backward-jump
+// check (currentPC > lastExecPC) to avoid skipping loop bodies that sit
+// between two occurrences of the same source line.
+// Returns -1 if no match is found.
+func (p *Program) lastPCForLine(line int, startPC int, filename string) int {
 	if p.src == nil || len(p.srcMap) == 0 {
 		return -1
+	}
+	// Normalize the filter filename once so comparisons are consistent.
+	filterByFile := filename != ""
+	if filterByFile {
+		filename = normalizeFilename(filename)
 	}
 	lastPC := -1
 	for i := len(p.srcMap) - 1; i >= 0; i-- {
@@ -605,6 +618,12 @@ func (p *Program) lastPCForLine(line int, startPC int) int {
 		}
 		pos := p.src.Position(entry.srcPos)
 		if pos.Line == line {
+			// When a filename filter is active, skip entries from other files.
+			if filterByFile && pos.Filename != "" {
+				if normalizeFilename(pos.Filename) != filename {
+					continue
+				}
+			}
 			if entry.pc > lastPC {
 				lastPC = entry.pc
 			}
