@@ -5911,19 +5911,13 @@ func (dbg *Debugger) BreakOnException(exceptionVal Value, caught bool) bool {
 	filename := dbg.Filename()
 	line := dbg.Line()
 
-	// Only break in user files
-	if filename == "" {
+	// Only skip truly internal/native files — NOT user source files.
+	// Exception breakpoints must work in ANY user file, regardless of whether
+	// regular breakpoints are set in that file. This matches Node.js behavior
+	// where "break on uncaught exceptions" stops at ANY user code that throws.
+	if filename == "" || filename == "<native>" || filename == "<eval>" || filename == "<anonymous>" {
 		dbg.exceptionBreakActive = false
 		return false
-	}
-	normFile := normalizeFilename(filename)
-	if !globalBreakpoints.FileHasBreakpoints(normFile) {
-		if dbg.steppingFilename == "" || normalizeFilename(dbg.steppingFilename) != normFile {
-			if dbg.cachedNormFile != normFile {
-				dbg.exceptionBreakActive = false
-				return false
-			}
-		}
 	}
 
 	if dbg.enableDebugLogging {
