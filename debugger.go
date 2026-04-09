@@ -441,6 +441,17 @@ func (gdc *GlobalDebugCoordinator) HasGlobalStepState() bool {
 	return gdc.globalStepNext || gdc.globalStepIn
 }
 
+// SetPendingLifecycleStepIn marks that a lifecycle transition is pending and the
+// VM should break at the first line of the new lifecycle function (setup, default,
+// teardown, handleSummary).
+//
+// WARNING: This should ONLY be used for real lifecycle transitions (phase changes
+// where a new exported function is entered). Do NOT use this for sub-step
+// callbacks within the same phase (e.g., gherkin step functions within default()).
+// Setting pendingLifecycleStepIn + SetGlobalStepState(stepIn=true) for sub-step
+// callbacks causes the VM to break at every callback entry — even when the user
+// pressed Continue (not Step Into). For sub-step callbacks, just unsuppress
+// breakpoints and let them fire naturally.
 func (gdc *GlobalDebugCoordinator) SetPendingLifecycleStepIn(pending bool) {
 	gdc.mu.Lock()
 	defer gdc.mu.Unlock()
@@ -3019,6 +3030,84 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 	//   - breakpoints / breakpointIDs / hasLocalBPs / hasGlobalBPs
 	//   - hasConnection
 	//   - initRuntime / setupData (may still be needed)
+}
+
+// PrepareForCallback resets only position-tracking state so that breakpoints
+// can fire in a new callback without disrupting the Continue() <-> activate()
+// channel handshake.  Unlike ResetForPhaseTransition this does NOT:
+//   - drain activation channels (avoids 200ms Continue() retry per step)
+//   - recreate vmDoneCh (the VM is still alive inside the same phase)
+//   - clear step/pause flags (caller decides whether to set stepIn)
+//
+// Use this for sub-step transitions within the SAME lifecycle phase — for
+// example, gherkin step/hook callbacks within the default() function.
+// Use ResetForPhaseTransition for real lifecycle transitions (setup → default
+// → teardown → handleSummary).
+func (dbg *Debugger) PrepareForCallback() {
+	if debugActivate {
+		fmt.Printf("[DEBUGGER] PrepareForCallback: resetting position tracking (stepIn=%v, next=%v)\n",
+			dbg.stepIn, dbg.next)
+	}
+
+	// Position tracking — reset so the first line of the callback is seen as "new"
+	dbg.lastBreakpoint.filename = ""
+	dbg.lastBreakpoint.line = 0
+	dbg.lastBreakpoint.pc = -1
+	dbg.lastBreakpoint.stackDepth = 0
+	dbg.lastDebugLine = -1
+	dbg.lastDebugDepth = -1
+	dbg.lastLine = 0
+	dbg.currentLine = 0
+
+	// Variable / scope caches — stale from previous callback
+	dbg.pausedVarSnapshot = nil
+	dbg.pausedVarSnapshotLine = 0
+	dbg.sourceVarCache = nil
+	dbg.globalVarCache = nil
+	dbg.sourceCacheValid = false
+	dbg.varDeclLines = nil
+	dbg.varValueCache = nil
+	dbg.varValueCacheLine = -1
+	dbg.cachedGlobalNames = nil
+	dbg.globalsCaptured = false
+
+	// Call stack / return value caches
+	dbg.functionCallStack = nil
+	dbg.pendingReturnValues = nil
+	dbg.returnValueCache = nil
+	dbg.currentScopeDepth = 0
+	dbg.scopeVariables = nil
+
+	// Filename / line cache (will be rebuilt on next breakpoint() call)
+	dbg.cachedPrg = nil
+	dbg.cachedFilename = ""
+	dbg.cachedNormFile = ""
+	dbg.cachedLinePrg = nil
+	dbg.cachedPC = -1
+	dbg.cachedLine = 0
+	dbg.cachedSourceLines = nil
+	dbg.cachedSourceLinesPrg = nil
+	dbg.cachedIsUserFilePrg = nil
+	dbg.cachedIsUserFileByName = nil
+	dbg.cachedBaseFilePrg = nil
+
+	// Conditional breakpoints — stale from previous callback
+	dbg.conditionalBPs = nil
+
+	// CRITICAL: Disable init-BP dedup inside gherkin callbacks.
+	// During init, the VM evaluates `Given(pattern, function() { ... })` —
+	// the function literal at (say) line 55 is "hit" and recorded in the
+	// init-BP set. Later, when gherkin.run() actually CALLS that callback,
+	// the breakpoint at line 55 would be suppressed because the init-BP
+	// dedup thinks it already fired. Setting initBPSnapshotDone=true with
+	// a nil snapshot makes wasHitDuringInit() return false for ALL lines,
+	// so breakpoints fire normally inside the callback.
+	// This is safe because:
+	//   - PrepareForCallback is only called by gherkin (sub-step transitions)
+	//   - Between callbacks, suppressDebugger=true prevents any breakpoint checks
+	//   - Non-gherkin code uses ResetForPhaseTransition which does NOT clear this
+	dbg.initBPSnapshot = nil
+	dbg.initBPSnapshotDone = true
 }
 
 // ResetForNewRun clears all per-run step/phase state from a cached Debugger so it
