@@ -580,12 +580,28 @@ func GetGlobalRegistry() VMRegistry {
 	return globalVMRegistry
 }
 
+// bpSnapshot is an immutable, atomically-swapped snapshot of all breakpoints.
+// Read-path methods (HasBreakpoint, FileHasBreakpoints, Count) load this via
+// atomic.Pointer with zero lock acquisitions. Write-path methods (Set/Clear/ClearFile)
+// rebuild and Store a new snapshot under the write lock.
+type bpSnapshot struct {
+	breakpoints map[string][]int // normalized filename -> sorted line numbers
+	totalFiles  int              // cached len(breakpoints) for Count()
+}
+
 // GlobalBreakpointRegistry holds breakpoints shared across all debugger instances.
 type GlobalBreakpointRegistry struct {
 	mu            sync.RWMutex
 	breakpoints   map[string][]int // normalized filename -> sorted line numbers
 	breakpointIDs map[bpKey]int    // PERF: struct key avoids string alloc on lookup
 	nextID        int
+
+	// PERF: Lock-free read path — atomic pointer to immutable snapshot.
+	// Reads (HasBreakpoint, FileHasBreakpoints, Count) load this pointer
+	// with zero lock acquisitions. Writes (Set/Clear/ClearFile) take the
+	// mutex and atomically swap a new snapshot. This eliminates the RLock
+	// that was acquired on every instruction in the vm.debug() hot path.
+	snapshot atomic.Pointer[bpSnapshot]
 }
 
 // bpKey is used as a map key for breakpointIDs to avoid string concatenation allocations.
@@ -598,6 +614,22 @@ var globalBreakpoints = &GlobalBreakpointRegistry{
 	breakpoints:   make(map[string][]int),
 	breakpointIDs: make(map[bpKey]int),
 	nextID:        0,
+}
+
+// rebuildSnapshotLocked creates a new immutable bpSnapshot from the current
+// breakpoints map and stores it atomically. Must be called with mu held (write lock).
+// The snapshot is a deep copy — reads are safe without any lock.
+func (gbr *GlobalBreakpointRegistry) rebuildSnapshotLocked() {
+	snap := &bpSnapshot{
+		breakpoints: make(map[string][]int, len(gbr.breakpoints)),
+		totalFiles:  len(gbr.breakpoints),
+	}
+	for k, v := range gbr.breakpoints {
+		cp := make([]int, len(v))
+		copy(cp, v)
+		snap.breakpoints[k] = cp
+	}
+	gbr.snapshot.Store(snap)
 }
 
 // use composite key to avoid cross-file false positives
@@ -618,6 +650,11 @@ type GlobalInitTracker struct {
 	initBreakpointsByFile map[string]map[int]bool
 }
 
+// globalInitCompletedFlag is a monotonic atomic: 0 → 1 when the first file's init
+// completes, never reverts (except on full Reset). Allows HasAnyInitCompleted() to
+// return without acquiring any lock — eliminates one RLock per instruction on the hot path.
+var globalInitCompletedFlag uint32
+
 var globalInitTracker = &GlobalInitTracker{
 	initCompleted:         make(map[string]bool),
 	initBreakpointSet:     make(map[initBPKey]bool),
@@ -629,6 +666,8 @@ func (git *GlobalInitTracker) MarkInitCompleted(filename string) {
 	defer git.mu.Unlock()
 	normalizedFilename := normalizeFilename(filename)
 	git.initCompleted[normalizedFilename] = true
+	// PERF: Set monotonic atomic so HasAnyInitCompleted() is lock-free.
+	atomic.StoreUint32(&globalInitCompletedFlag, 1)
 	if debugInit {
 		fmt.Printf("[INIT-TRACKER] Init completed for: %s\n", normalizedFilename)
 	}
@@ -704,10 +743,11 @@ func (git *GlobalInitTracker) WasAnyBreakpointHitDuringInit(normalizedFilename s
 	return found
 }
 
+// HasAnyInitCompleted returns true once any file's init phase has completed.
+// PERF: Lock-free — uses a monotonic atomic flag instead of acquiring RLock.
+// The flag is set in MarkInitCompleted and only ever goes from 0→1.
 func (git *GlobalInitTracker) HasAnyInitCompleted() bool {
-	git.mu.RLock()
-	defer git.mu.RUnlock()
-	return len(git.initCompleted) > 0
+	return atomic.LoadUint32(&globalInitCompletedFlag) != 0
 }
 
 func (git *GlobalInitTracker) Reset() {
@@ -716,6 +756,8 @@ func (git *GlobalInitTracker) Reset() {
 	git.initCompleted = make(map[string]bool)
 	git.initBreakpointSet = make(map[initBPKey]bool)
 	git.initBreakpointsByFile = make(map[string]map[int]bool)
+	// PERF: Reset the monotonic atomic flag.
+	atomic.StoreUint32(&globalInitCompletedFlag, 0)
 }
 
 func GetGlobalInitTracker() *GlobalInitTracker {
@@ -750,6 +792,9 @@ func (gbr *GlobalBreakpointRegistry) SetBreakpoint(filename string, line int) (i
 			id, filename, line, len(gbr.breakpoints[filename]))
 	}
 
+	// PERF: Rebuild lock-free snapshot for read-path methods.
+	gbr.rebuildSnapshotLocked()
+
 	return id, nil
 }
 
@@ -773,6 +818,8 @@ func (gbr *GlobalBreakpointRegistry) ClearBreakpoint(filename string, line int) 
 		if debugBP {
 			fmt.Printf("[GLOBAL-BP] Breakpoint cleared: filename='%s', line=%d\n", filename, line)
 		}
+		// PERF: Rebuild lock-free snapshot for read-path methods.
+		gbr.rebuildSnapshotLocked()
 		return nil
 	}
 
@@ -803,18 +850,22 @@ func (gbr *GlobalBreakpointRegistry) ClearFileBreakpoints(filename string) {
 	if debugBP {
 		fmt.Printf("[GLOBAL-BP] Cleared all breakpoints for file '%s' (was %d)\n", filename, len(lines))
 	}
+
+	// PERF: Rebuild lock-free snapshot for read-path methods.
+	gbr.rebuildSnapshotLocked()
 }
 
 // HasBreakpoint checks for a breakpoint. Caller must pass a normalized filename.
-// PERF: no string allocation, no normalization, just a lock + binary search.
-// No defer — manual unlock is measurably faster in tight hot paths.
+// PERF: Fully lock-free — loads an immutable snapshot via atomic.Pointer.
+// No RLock, no defer, no allocation. One atomic load + map lookup + binary search.
 func (gbr *GlobalBreakpointRegistry) HasBreakpoint(normalizedFilename string, line int) bool {
-	gbr.mu.RLock()
-	lines := gbr.breakpoints[normalizedFilename]
+	snap := gbr.snapshot.Load()
+	if snap == nil {
+		return false
+	}
+	lines := snap.breakpoints[normalizedFilename]
 	idx := sort.SearchInts(lines, line)
-	found := idx < len(lines) && lines[idx] == line
-	gbr.mu.RUnlock()
-	return found
+	return idx < len(lines) && lines[idx] == line
 }
 
 func (gbr *GlobalBreakpointRegistry) GetBreakpointID(filename string, line int) int {
@@ -836,27 +887,34 @@ func (gbr *GlobalBreakpointRegistry) GetAllBreakpoints() map[string][]int {
 	return result
 }
 
+// Count returns the number of files that have breakpoints.
+// PERF: Lock-free — loads immutable snapshot via atomic.Pointer.
 func (gbr *GlobalBreakpointRegistry) Count() int {
-	gbr.mu.RLock()
-	defer gbr.mu.RUnlock()
-	return len(gbr.breakpoints)
+	snap := gbr.snapshot.Load()
+	if snap == nil {
+		return 0
+	}
+	return snap.totalFiles
 }
 
 // FileHasBreakpoints returns true if the file has any breakpoints registered.
-// PERF: O(1) map lookup under RLock — no allocation. Caller must pass a
-// normalized filename (or raw filename if that's how it was registered).
+// PERF: Lock-free — loads immutable snapshot via atomic.Pointer. O(1) map lookup.
 func (gbr *GlobalBreakpointRegistry) FileHasBreakpoints(normalizedFilename string) bool {
-	gbr.mu.RLock()
-	lines := gbr.breakpoints[normalizedFilename]
-	gbr.mu.RUnlock()
-	return len(lines) > 0
+	snap := gbr.snapshot.Load()
+	if snap == nil {
+		return false
+	}
+	return len(snap.breakpoints[normalizedFilename]) > 0
 }
 
 // HasBreakpointOnLine checks if ANY file has a breakpoint on the given line.
+// PERF: Lock-free — loads immutable snapshot via atomic.Pointer.
 func (gbr *GlobalBreakpointRegistry) HasBreakpointOnLine(line int) bool {
-	gbr.mu.RLock()
-	defer gbr.mu.RUnlock()
-	for _, lines := range gbr.breakpoints {
+	snap := gbr.snapshot.Load()
+	if snap == nil {
+		return false
+	}
+	for _, lines := range snap.breakpoints {
 		idx := sort.SearchInts(lines, line)
 		if idx < len(lines) && lines[idx] == line {
 			return true
@@ -868,10 +926,13 @@ func (gbr *GlobalBreakpointRegistry) HasBreakpointOnLine(line int) bool {
 // HasBreakpointOnLineExcluding checks if any file OTHER than the excluded ones
 // has a breakpoint on the given line. Used for bundled TS where the bundle filename
 // has already been checked and we only want to match original source filenames.
+// PERF: Lock-free — loads immutable snapshot via atomic.Pointer.
 func (gbr *GlobalBreakpointRegistry) HasBreakpointOnLineExcluding(line int, excludeFiles ...string) bool {
-	gbr.mu.RLock()
-	defer gbr.mu.RUnlock()
-	for file, lines := range gbr.breakpoints {
+	snap := gbr.snapshot.Load()
+	if snap == nil {
+		return false
+	}
+	for file, lines := range snap.breakpoints {
 		excluded := false
 		for _, ef := range excludeFiles {
 			if file == ef {
@@ -1000,6 +1061,18 @@ type Debugger struct {
 	pausedVarSnapshot     map[string]Value
 	pausedVarSnapshotLine int
 	pausedVarSnapshotPC   int
+
+	// PERF: Reusable map pool — avoids allocating make(map[string]Value, 64) on every
+	// pause. On cache miss we clear() this map and rebuild it. On cache hit we return
+	// pausedVarSnapshot directly (which points to the same map). Allocated once in
+	// newDebugger(), never set to nil — only cleared between pauses.
+	pausedVarPool map[string]Value
+
+	// pausedVarSnapshotFrozen is set true during evaluateComplexExpression.
+	// When frozen, buildPausedVarSnapshot returns the existing snapshot without
+	// rebuilding — preventing corruption if the eval expression triggers a getter
+	// that would otherwise overwrite the snapshot with stale data.
+	pausedVarSnapshotFrozen bool
 
 	// PERF: Source map name mapping cache — maps generated variable names (from
 	// the bundler output) to original names (from the user's TypeScript source)
@@ -1153,6 +1226,7 @@ func newDebugger(vm *vm) *Debugger {
 		varValueCacheLine:  -1,
 		hasConnection:      inheritConnection,
 		vmDoneCh:           make(chan struct{}),
+		pausedVarPool:      make(map[string]Value, 64), // PERF: pre-allocated, reused across pauses
 	}
 	// FIX: Initialize lastBreakpoint.pc to -1 so that pcAdvanced (currentPC != prevPC)
 	// is true at PC=0 (the first instruction of any function). Without this, step-in
@@ -4689,6 +4763,12 @@ func (dbg *Debugger) Evaluate(expr string) (Value, error) {
 // buildPausedVarSnapshot collects all accessible variables once per pause and caches them.
 // Subsequent evals during the same pause reuse the snapshot without re-walking the stash.
 func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
+	// PERF: If frozen (during eval), return the existing snapshot to prevent
+	// corruption from getter-triggered rebuilds.
+	if dbg.pausedVarSnapshotFrozen && dbg.pausedVarSnapshot != nil {
+		return dbg.pausedVarSnapshot
+	}
+
 	currentLine := dbg.Line()
 	currentPC := dbg.vm.pc
 	// Cache key includes BOTH line and PC. Multiple instructions can map to the
@@ -4698,7 +4778,17 @@ func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
 		return dbg.pausedVarSnapshot
 	}
 
-	snap := make(map[string]Value, 64)
+	// PERF: Reuse the pool map instead of allocating a new one on every pause.
+	// Delete-loop removes all entries without releasing the underlying memory.
+	snap := dbg.pausedVarPool
+	if snap == nil {
+		snap = make(map[string]Value, 64)
+		dbg.pausedVarPool = snap
+	} else {
+		for k := range snap {
+			delete(snap, k)
+		}
+	}
 
 	// Walk stash chain.
 	thisKey := unistring.String(thisBindingName)
@@ -4864,6 +4954,9 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 	savedPausedVarSnapshotPC := dbg.pausedVarSnapshotPC
 
 	dbg.inEvalContext = true
+	// PERF: Freeze the var snapshot during eval so getter-triggered rebuilds
+	// don't overwrite it with stale data mid-evaluation.
+	dbg.pausedVarSnapshotFrozen = true
 	defer func() {
 		dbg.lastBreakpoint = savedLastBreakpoint
 		dbg.exceptionBreakActive = savedExceptionBreakActive
@@ -4872,6 +4965,7 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		dbg.pausedVarSnapshotLine = savedPausedVarSnapshotLine
 		dbg.pausedVarSnapshotPC = savedPausedVarSnapshotPC
 		dbg.inEvalContext = false
+		dbg.pausedVarSnapshotFrozen = false
 	}()
 
 	// ── Core: compile as a direct-eval program with ctxVM=dbg.vm ──────────

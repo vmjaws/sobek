@@ -793,6 +793,7 @@ func (vm *vm) debug() {
 				goto executeInstruction
 			}
 
+
 			// CHANGED: Allow breakpoints during init phase for user scripts
 			// Only skip breakpoints during init if the current file is NOT a user file
 			// User files are those with breakpoints set on them
