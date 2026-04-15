@@ -1012,6 +1012,7 @@ func (vm *vm) debug() {
 				}
 
 				if !vm.debugger.active && (hasBreakpoint || vm.debugger.next || vm.debugger.stepIn) {
+
 					currentFilename := vm.debugger.Filename() // Use source-mapped filename for consistency
 					normalizedCurrentFilename := vm.debugger.cachedNormFile
 					currentLine := vm.debugger.Line()
@@ -1533,7 +1534,15 @@ func (vm *vm) debug() {
 						// new loop iteration — NOT a sub-expression. lastExecPC tracks the
 						// actual last executed instruction, so it catches backward jumps
 						// from any point in the loop (header, body, or continuation check).
-						if shouldBreak && vm.debugger.stepOverLastPC >= 0 && currentPC <= vm.debugger.stepOverLastPC && currentPC > lastExecPC {
+						//
+						// CRITICAL: Only skip when vm.prg matches the program where
+						// stepOverLastPC was computed. When a function returns to its
+						// caller (different vm.prg), the caller's PCs are unrelated
+						// to stepOverLastPC — comparing them causes ALL breakpoints
+						// in the caller to be skipped (the "loop back" / "runs through"
+						// bug when stepping over a function call).
+						sameProgram := vm.debugger.stepOverLastPCPrg == nil || vm.debugger.stepOverLastPCPrg == vm.prg
+						if shouldBreak && vm.debugger.stepOverLastPC >= 0 && sameProgram && currentPC <= vm.debugger.stepOverLastPC && currentPC > lastExecPC {
 							shouldBreak = false
 							breakReason = "next-skip-subexpr"
 							if debugVM {
@@ -1586,36 +1595,88 @@ func (vm *vm) debug() {
 						// This is intentional: step-over should step OVER function calls into non-user code
 						// and continue stepping when we return to user code at the correct depth
 						// The next flag will be cleared when we actually break (in the shouldBreak block below)
+				} else {
+					// For regular breakpoint: break if the SOURCE LINE or SOURCE FILE changed from where we last paused.
+					// We compare the line number AND the source-mapped filename because:
+					// 1. breakpoint() already confirmed this is a valid breakpoint location
+					// 2. Multiple bytecodes map to the same source line — after Continue, the user
+					//    should not be stopped again on subsequent PCs that are still on the same line
+					// 3. In bundled TypeScript, different source files (CcsApi.ts vs Stores.ts) can
+					//    have the same line number. We must compare the source-mapped filename too,
+					//    otherwise breakpoints in file B on the same line as file A are skipped.
+					sameFile := true
+					srcMapFile := vm.debugger.cachedSrcMapFile
+					if srcMapFile != "" && prevFilename != "" {
+						sameFile = srcMapFile == prevFilename || normalizeFilenameForMatch(srcMapFile) == normalizeFilenameForMatch(prevFilename)
+					}
+					sameLine := prevLine == currentLine && prevLine > 0 && sameFile
+					if sameLine {
+						shouldBreak = false
+						breakReason = "same-line-skip"
 					} else {
-						// For regular breakpoint: break if the SOURCE LINE or SOURCE FILE changed from where we last paused.
-						// We compare the line number AND the source-mapped filename because:
-						// 1. breakpoint() already confirmed this is a valid breakpoint location
-						// 2. Multiple bytecodes map to the same source line — after Continue, the user
-						//    should not be stopped again on subsequent PCs that are still on the same line
-						// 3. In bundled TypeScript, different source files (CcsApi.ts vs Stores.ts) can
-						//    have the same line number. We must compare the source-mapped filename too,
-						//    otherwise breakpoints in file B on the same line as file A are skipped.
-						sameFile := true
-						srcMapFile := vm.debugger.cachedSrcMapFile
-						if srcMapFile != "" && prevFilename != "" {
-							sameFile = srcMapFile == prevFilename || normalizeFilenameForMatch(srcMapFile) == normalizeFilenameForMatch(prevFilename)
-						}
-						sameLine := prevLine == currentLine && prevLine > 0 && sameFile
-						if sameLine {
-							shouldBreak = false
-							breakReason = "same-line-skip"
-						} else {
-							shouldBreak = true
-							breakReason = "breakpoint"
-						}
-						// Clear continuing unconditionally — it's now redundant with the line check
-						// but we clear it for cleanliness so other code paths don't see stale state.
-						vm.debugger.continuing = false
-						if vm.debugger.enableDebugLogging {
-							fmt.Printf("[VM] breakpoint check: sameLine=%v (line:%d->%d, file:%s->%s, PC:%d->%d), shouldBreak=%v, reason=%s\n",
-								sameLine, prevLine, currentLine, prevFilename, currentFilename, prevPC, currentPC, shouldBreak, breakReason)
+						shouldBreak = true
+						breakReason = "breakpoint"
+					}
+
+					// FIX: Skip breakpoints at implicit return instructions whose source
+					// position was inherited from code inside a skipped if-body (or other
+					// jumped-over block). The compiler emits _loadUndef + _ret at the end
+					// of functions without an explicit return; these instructions inherit
+					// the source position of the last compiled statement. When the last
+					// statement is inside an if-body that was skipped by a conditional
+					// jump, the implicit return's source line points to code that never
+					// executed — causing false breakpoint hits.
+					//
+					// Detection: _loadUndef followed by _ret (implicit return pattern),
+					// reached via a forward conditional/unconditional jump (gap between
+					// lastExecPC and currentPC), AND the bytecode immediately before the
+					// _loadUndef maps to the same source line (confirming position inheritance
+					// from the skipped block's last instruction).
+					//
+					// This does NOT affect explicit `return;` statements: those are reached
+					// sequentially (lastExecPC + 1 == currentPC, no gap), so the check
+					// doesn't trigger.
+					if shouldBreak && currentPC >= 0 && currentPC < len(vm.prg.code) {
+						switch vm.prg.code[currentPC].(type) {
+						case _loadUndef:
+							nextPC := currentPC + 1
+							if nextPC < len(vm.prg.code) {
+								if _, isRet := vm.prg.code[nextPC].(_ret); isRet {
+									// _loadUndef + _ret = implicit/explicit return pattern.
+									// Check if reached via a forward jump (gap in PCs) and
+									// the previous bytecode shares the same source line
+									// (confirming the position was inherited).
+									if currentPC > 0 && lastExecPC >= 0 && currentPC > lastExecPC+1 {
+										prevInstrLine := vm.prg.src.Position(vm.prg.sourceOffset(currentPC - 1)).Line
+										if prevInstrLine == currentLine {
+											shouldBreak = false
+											breakReason = "implicit-return-inherited-pos"
+										}
+									}
+								}
+							}
+						case _ret:
+							// _ret preceded by _loadUndef: second half of the implicit
+							// return pair. If the _loadUndef breakpoint fired, sameLine
+							// catches _ret. If _loadUndef was skipped (control flow),
+							// _ret should also be skipped. Safe to always skip here.
+							if currentPC > 0 {
+								if _, isLU := vm.prg.code[currentPC-1].(_loadUndef); isLU {
+									shouldBreak = false
+									breakReason = "implicit-return-ret"
+								}
+							}
 						}
 					}
+
+					// Clear continuing unconditionally — it's now redundant with the line check
+					// but we clear it for cleanliness so other code paths don't see stale state.
+					vm.debugger.continuing = false
+					if vm.debugger.enableDebugLogging {
+						fmt.Printf("[VM] breakpoint check: sameLine=%v (line:%d->%d, file:%s->%s, PC:%d->%d), shouldBreak=%v, reason=%s\n",
+							sameLine, prevLine, currentLine, prevFilename, currentFilename, prevPC, currentPC, shouldBreak, breakReason)
+					}
+				}
 
 					// In the shouldBreak computation for regular breakpoints,
 					// after hasBreakpoint is set to true:
@@ -1698,8 +1759,8 @@ func (vm *vm) debug() {
 
 						// DIAGNOSTIC: Log step flags that were active when we decided to break
 						if debugVM {
-							fmt.Printf("[VM-PRE-ACTIVATE] About to call activate(): wasStepIn=%v, wasNext=%v, lifecycleTransition=%v, reason=%s\n",
-								wasStepIn, wasNext, vm.debugger.lifecycleTransition, breakReason)
+							fmt.Printf("[VM-PRE-ACTIVATE] VU=%d About to call activate(): wasStepIn=%v, wasNext=%v, lifecycleTransition=%v, reason=%s, line=%d\n",
+								vm.debugger.vuID, wasStepIn, wasNext, vm.debugger.lifecycleTransition, breakReason, vm.debugger.currentLine)
 						}
 
 						// Pass the captured step flags to activate so it knows the context of the break
@@ -2042,6 +2103,28 @@ func (vm *vm) restoreStacks(iterLen, refLen uint32) (ex *Exception) {
 
 func (vm *vm) handleThrow(arg interface{}) *Exception {
 	ex := vm.exceptionFromValue(arg)
+
+	// ── Debugger: capture the throw-site location BEFORE unwinding ──────
+	// handleThrow restores vm.prg/vm.pc from the call stack when unwinding
+	// to a try frame, which clobbers the position where the throw occurred.
+	// Capture the throw-site file+line NOW (from the exception's stack trace
+	// which was populated by exceptionFromValue) so BreakOnException can
+	// show the correct source location — matching Node.js/Chrome DevTools.
+	var throwFile string
+	var throwLine int
+	if vm.debugMode && vm.debugger != nil && ex != nil && len(ex.stack) > 0 {
+		frame := &ex.stack[0]
+		pos := frame.Position()
+		throwFile = normalizeFilename(pos.Filename)
+		throwLine = pos.Line
+		// If the stack frame's position is empty (native code), try current vm state
+		if throwFile == "" && vm.prg != nil && vm.prg.src != nil {
+			pos = vm.prg.src.Position(vm.prg.sourceOffset(vm.pc))
+			throwFile = normalizeFilename(pos.Filename)
+			throwLine = pos.Line
+		}
+	}
+
 	for len(vm.tryStack) > 0 {
 		tf := &vm.tryStack[len(vm.tryStack)-1]
 		if tf.catchPos == -1 && tf.finallyPos == -1 || ex == nil && tf.catchPos != tryPanicMarker {
@@ -2066,8 +2149,17 @@ func (vm *vm) handleThrow(arg interface{}) *Exception {
 		if tf.catchPos >= 0 {
 			// exception is caught
 			// Break on caught exception if the debugger has that filter enabled.
-			if vm.debugMode && vm.debugger != nil && ex != nil {
-				vm.debugger.BreakOnException(ex.val, true)
+			// Don't break on exceptions from eval/debugger-internal code.
+			// CRITICAL: Pass throwFile/throwLine (captured BEFORE stack unwind)
+			// so the debugger pauses at the THROW site, not the catch handler.
+			if vm.debugMode && vm.debugger != nil && ex != nil && !vm.debugger.inEvalContext {
+				currentFile := ""
+				if vm.prg != nil && vm.prg.src != nil {
+					currentFile = vm.prg.src.Name()
+				}
+				if currentFile != "<debugger-eval>" {
+					vm.debugger.BreakOnException(ex.val, true, throwFile, throwLine)
+				}
 				if debugVM {
 					fmt.Printf("[HANDLETHROW] After BreakOnException(caught): next=%v, stepIn=%v, suppress=%v, pc will be=%d, depth=%d\n",
 						vm.debugger.next, vm.debugger.stepIn, vm.debugger.suppressDebugger, int(tf.catchPos), len(vm.callStack))
@@ -2097,9 +2189,36 @@ func (vm *vm) handleThrow(arg interface{}) *Exception {
 // In all other cases exceptions must be thrown using panic().
 func (vm *vm) throw(v interface{}) {
 	if ex := vm.handleThrow(v); ex != nil {
-		// Break on uncaught exception if the debugger has that filter enabled.
-		if vm.debugMode && vm.debugger != nil {
-			vm.debugger.BreakOnException(ex.val, false)
+		if vm.debugMode && vm.debugger != nil && !vm.debugger.inEvalContext {
+			currentFile := ""
+			if vm.prg != nil && vm.prg.src != nil {
+				currentFile = vm.prg.src.Name()
+			}
+			if currentFile != "<debugger-eval>" {
+				// Save the exception stack frames in the debugger BEFORE they're lost.
+				// handleThrow has already unwound vm.callStack, so CaptureCallStack()
+				// will return empty after this point. ex.stack has the original frames.
+				vm.debugger.SetLastExceptionStack(ex.stack)
+
+				// Extract the throw-site location from the exception's stack trace.
+				// handleThrow has already unwound vm.prg/vm.pc so we cannot use
+				// the debugger's Filename()/Line() — they'd point to the wrong place.
+				var throwFile string
+				var throwLine int
+				if len(ex.stack) > 0 {
+					pos := ex.stack[0].Position()
+					throwFile = normalizeFilename(pos.Filename)
+					throwLine = pos.Line
+				}
+				if debugActivate {
+					fmt.Printf("[EXCEPTION-TRACE] vm.throw: calling BreakOnException from throw(), throwFile=%s, throwLine=%d, exception=%q\n",
+						throwFile, throwLine, ex.val.String())
+				}
+				vm.debugger.BreakOnException(ex.val, false, throwFile, throwLine)
+				if debugActivate {
+					fmt.Printf("[EXCEPTION-TRACE] vm.throw: BreakOnException returned, about to panic\n")
+				}
+			}
 		}
 		panic(ex)
 	}
@@ -2135,21 +2254,45 @@ func (vm *vm) runTryInner() (ex *Exception) {
 	defer func() {
 		if x := recover(); x != nil {
 			ex = vm.handleThrow(x)
-			// FIX: When the VM panics with an uncaught exception (ex != nil) during
-			// a step operation, debug()'s post-loop VM-EXIT cleanup code is bypassed
-			// because the panic unwinds past it. We must close vmDoneCh here so that
-			// Continue() (which is waiting on vmDoneCh) doesn't get stuck forever.
-			if ex != nil && vm.debugMode && vm.debugger != nil &&
-				(vm.debugger.next || vm.debugger.stepIn) {
-				if debugVM {
-					fmt.Printf("[VM-EXIT] 🔧 Uncaught exception during step — closing vmDoneCh (next=%v, stepIn=%v, depth=%d)\n",
-						vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth())
+			if ex != nil && vm.debugMode && vm.debugger != nil {
+				// Save exception stack frames (may already be set by vm.throw,
+				// but also save here for exceptions caught only by runTryInner).
+				if len(ex.stack) > 0 {
+					vm.debugger.SetLastExceptionStack(ex.stack)
+				}
+				if debugActivate {
+					fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: recovered exception=%q, pendingUncaughtException=%v, inEvalContext=%v\n",
+						ex.val.String(), vm.debugger.pendingUncaughtException != nil, vm.debugger.inEvalContext)
+				}
+
+				if !vm.debugger.inEvalContext && vm.debugger.pendingUncaughtException == nil {
+					// Extract throw-site from the exception stack trace
+					var throwFile string
+					var throwLine int
+					if len(ex.stack) > 0 {
+						pos := ex.stack[0].Position()
+						throwFile = normalizeFilename(pos.Filename)
+						throwLine = pos.Line
+					}
+					if debugActivate {
+						fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: calling BreakOnException (no pending yet, throwFile=%s, throwLine=%d)\n",
+							throwFile, throwLine)
+					}
+					vm.debugger.BreakOnException(ex.val, false, throwFile, throwLine)
+				} else if debugActivate {
+					fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: SKIPPED BreakOnException (pending=%v, inEval=%v)\n",
+						vm.debugger.pendingUncaughtException != nil, vm.debugger.inEvalContext)
+				}
+
+				vm.debugger.uncaughtExceptionExit = true
+
+				if debugActivate {
+					fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: closing vmDoneCh, vmExited=true\n")
 				}
 				vm.debugger.vmExited = true
 				if vm.debugger.vmDoneCh != nil {
 					select {
 					case <-vm.debugger.vmDoneCh:
-						// Already closed
 					default:
 						close(vm.debugger.vmDoneCh)
 					}
@@ -2159,6 +2302,18 @@ func (vm *vm) runTryInner() (ex *Exception) {
 				GetGlobalCoordinator().ClearGlobalStepState()
 				if GetGlobalCoordinator().IsMultiVUDebug() {
 					GetGlobalCoordinator().ClearVUStepState(vm.debugger.vuID)
+				}
+
+				if vm.debugger.exceptionWaitCh != nil {
+					if debugActivate {
+						fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: BLOCKING on exceptionWaitCh — waiting for IDE user to dismiss\n")
+					}
+					<-vm.debugger.exceptionWaitCh
+					if debugActivate {
+						fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: exceptionWaitCh RELEASED — VM continuing exit\n")
+					}
+				} else if debugActivate {
+					fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: exceptionWaitCh is nil — NOT blocking (breakOnUncaughtExceptions likely disabled)\n")
 				}
 			}
 		}

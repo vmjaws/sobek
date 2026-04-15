@@ -40,9 +40,8 @@ var (
 	debugAll = os.Getenv("SOBEK_DEBUG_ALL") == "1" || os.Getenv("SOBEK_DEBUG_ALL") == "true"
 )
 
-// thisKeywordRegex matches the JS keyword 'this' at word boundaries,
-// avoiding false positives on identifiers like "synthesis" or "thistle".
-var thisKeywordRegex = regexp.MustCompile(`\bthis\b`)
+// tsSatisfiesRegex matches the TypeScript 'satisfies' operator: "expr satisfies Type" → "expr"
+var tsSatisfiesRegex = regexp.MustCompile(`\s+satisfies\s+[A-Za-z_$][\w$.<>, ]*`)
 
 func init() {
 	if debugAll {
@@ -923,8 +922,9 @@ type Debugger struct {
 	stepOverTargetDepth         int
 	stepOverOriginalTargetDepth int // the depth at which Next() was originally called — never overwritten by re-activation
 	stepOverStartLine           int
-	stepOverLastPC              int // last PC whose source-mapped line == stepOverStartLine; step-over won't break until currentPC > this
-	stepInLastPC                int // last PC whose source-mapped line == stepInStartLine; stepIn skips sub-expressions across depth changes
+	stepOverLastPC              int      // last PC whose source-mapped line == stepOverStartLine; step-over won't break until currentPC > this
+	stepOverLastPCPrg           *Program // the program stepOverLastPC was computed for; guard is invalid in any other program
+	stepInLastPC                int      // last PC whose source-mapped line == stepInStartLine; stepIn skips sub-expressions across depth changes
 	stepInLastPCPrg             *Program // the program stepInLastPC was computed for; guard is invalid in any other program
 	stepInStartLine             int // the line where the current stepIn operation began
 	stepOverMissCount           int // safety counter: instructions with startLine=0 and no valid currentLine
@@ -999,6 +999,7 @@ type Debugger struct {
 	// Cleared by Continue()/Next()/StepIn() before resuming.
 	pausedVarSnapshot     map[string]Value
 	pausedVarSnapshotLine int
+	pausedVarSnapshotPC   int
 
 	// PERF: Source map name mapping cache — maps generated variable names (from
 	// the bundler output) to original names (from the user's TypeScript source)
@@ -1041,9 +1042,36 @@ type Debugger struct {
 	vmExited bool
 	vmDoneCh chan struct{}
 
+	// uncaughtExceptionExit is set true when the VM exits due to an uncaught
+	// exception (TypeError, ReferenceError, etc.) in runTryInner. This allows
+	// Continue() and ResetVMExited() to distinguish between an uncaught-exception
+	// exit and a lifecycle transition (init→setup→default). When true, stale
+	// coordinator channels are drained in ResetVMExited() to prevent the next
+	// iteration's activate() from picking up a channel that was intended for
+	// the old (crashed) iteration — which manifests as the debugger "looping back"
+	// to the same breakpoint instead of showing the exception.
+	uncaughtExceptionExit bool
+
+	// pendingUncaughtException is set by BreakOnException when the VM is
+	// stepping (next/stepIn) and an uncaught exception occurs.  Instead of
+	// calling activate() — which races with Continue()'s channel cleanup
+	// (stale channel → immediate unblock → no pause) — we store the
+	// activation here and let Continue() return it directly when vmDoneCh
+	// closes.  This avoids the channel coordination race entirely.
+	pendingUncaughtException *DebuggerActivation
+
+	// exceptionWaitCh is created when an uncaught exception stores a
+	// pendingUncaughtException. The VM goroutine blocks on this channel
+	// (in runTryInner's defer) so that the k6 process doesn't exit before
+	// the user has seen and dismissed the exception popup in the IDE.
+	// The DAP layer closes this channel after the user clicks Continue.
+	exceptionWaitCh chan struct{}
+
 	pendingCh chan DebuggerActivation
 
-	suppressDebugger bool
+	suppressDebugger   bool
+	suppressDebugDepth int  // nesting depth of suppress calls; debugger active only when 0
+	inEvalContext      bool // true while evaluateComplexExpression is running
 
 	// inTestExecution is set true only while a Gherkin step function is being
 	// called by runPickleStep. When false, ALL breakpoint/stepping logic is
@@ -1056,6 +1084,10 @@ type Debugger struct {
 
 	// lastException stores the most recent uncaught exception for exceptionInfo requests
 	lastException Value
+	// lastExceptionStack stores the call stack at the throw site for uncaught exceptions.
+	// After handleThrow unwinds vm.callStack, CaptureCallStack returns empty. This saved
+	// stack lets the DAP layer return a meaningful stackTrace when paused on an exception.
+	lastExceptionStack []StackFrame
 
 	// breakOnCaughtExceptions: pause on exceptions caught by try/catch ("All Exceptions" in IDE)
 	breakOnCaughtExceptions bool
@@ -1149,13 +1181,14 @@ const (
 )
 
 type DebuggerActivation struct {
-	Reason   ActivationReason
-	Filename string
-	Line     int
-	Column   int // 1-based column from source map — enables VS Code token highlighting
-	ID       int
-	Epoch    uint64
-	VUID     uint64 // VU that triggered this activation (0 = VU0/lifecycle, >0 = VU N)
+	Reason        ActivationReason
+	Filename      string
+	Line          int
+	Column        int    // 1-based column from source map — enables VS Code token highlighting
+	ID            int
+	Epoch         uint64
+	VUID          uint64 // VU that triggered this activation (0 = VU0/lifecycle, >0 = VU N)
+	ExceptionText string // non-empty when Reason == ExceptionActivation; shown in IDE popup
 }
 
 var globalBuiltinKeys = map[string]bool{
@@ -1318,7 +1351,8 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 	savedLifecycleTransition := dbg.lifecycleTransition
 
 	if debugActivate {
-		fmt.Printf("[DEBUGGER-ACTIVATE-ENTRY] At %s:%d - savedStepIn=%v, savedNext=%v, savedLifecycleTransition=%v, reason=%v\n",
+		fmt.Printf("[DEBUGGER-ACTIVATE-ENTRY] VU=%d At %s:%d - savedStepIn=%v, savedNext=%v, savedLifecycleTransition=%v, reason=%v\n",
+			dbg.vuID,
 			filename, line, savedStepIn, savedNext, savedLifecycleTransition, reason)
 	}
 
@@ -1565,7 +1599,7 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 	retryTimer := time.NewTimer(5 * time.Second)
 	defer retryTimer.Stop()
 	for retries := 0; retries < 5; retries++ {
-		sendOK := safeSendActivation(ch, DebuggerActivation{
+		act := DebuggerActivation{
 			Reason:   reason,
 			Filename: filename,
 			Line:     line,
@@ -1573,7 +1607,11 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 			ID:       id,
 			Epoch:    epoch,
 			VUID:     dbg.vuID,
-		})
+		}
+		if reason == ExceptionActivation && dbg.lastException != nil {
+			act.ExceptionText = dbg.lastException.String()
+		}
+		sendOK := safeSendActivation(ch, act)
 		if sendOK {
 			break
 		}
@@ -1865,8 +1903,8 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 	dbg.currentCh = make(chan DebuggerActivation)
 
 	if debugContinue {
-		fmt.Printf("[DEBUGGER-CONTINUE] Attempting to send continue signal (stepIn=%v, next=%v, lifecycleTransition=%v)\n",
-			dbg.stepIn, dbg.next, dbg.lifecycleTransition)
+		fmt.Printf("[DEBUGGER-CONTINUE] Attempting to send continue signal (vuID=%d, stepIn=%v, next=%v, lifecycleTransition=%v)\n",
+			dbg.vuID, dbg.stepIn, dbg.next, dbg.lifecycleTransition)
 	}
 
 	// PERF: read global step state once at Continue() entry rather than re-reading
@@ -1944,8 +1982,8 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 			select {
 			case activation := <-dbg.currentCh:
 				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Received activation from %s: %s:%d (wait=%dms, total=%dms)\n",
-						source, activation.Filename, activation.Line,
+					fmt.Printf("[DEBUGGER-CONTINUE] Received activation from %s: %s:%d (activationVU=%d, myVU=%d, wait=%dms, total=%dms)\n",
+						source, activation.Filename, activation.Line, activation.VUID, dbg.vuID,
 						time.Since(waitStart).Milliseconds(), time.Since(continueStart).Milliseconds())
 				}
 				retryCount = 0
@@ -1970,8 +2008,8 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 		select {
 		case activation := <-dbg.currentCh:
 			if debugContinue {
-				fmt.Printf("[DEBUGGER-CONTINUE] Received activation from %s: %s:%d (wait=%dms, total=%dms)\n",
-					source, activation.Filename, activation.Line,
+				fmt.Printf("[DEBUGGER-CONTINUE] Received activation from %s: %s:%d (activationVU=%d, myVU=%d, wait=%dms, total=%dms)\n",
+					source, activation.Filename, activation.Line, activation.VUID, dbg.vuID,
 					time.Since(waitStart).Milliseconds(), time.Since(continueStart).Milliseconds())
 			}
 			retryCount = 0
@@ -2051,6 +2089,34 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 		hasGlobalStepState = globalNext || globalStepIn
 
 		if localTimedOut {
+			// ── FIX: Return pending uncaught exception immediately ─────────
+			// When the VM exited due to an uncaught exception while stepping,
+			// BreakOnException stored the activation info instead of calling
+			// activate() (which races with channel cleanup).  Return it now
+			// so the IDE shows "Paused on exception" instead of looping back
+			// to the same breakpoint in the next iteration.
+			if dbg.pendingUncaughtException != nil {
+				activation := *dbg.pendingUncaughtException
+				dbg.pendingUncaughtException = nil
+
+				// CRITICAL: Mark the debugger as active so that:
+				// 1. getActiveDebugger() returns THIS debugger (not a fallback)
+				// 2. stackTrace/scopes/variables/exceptionInfo requests work correctly
+				// Without this, the IDE receives the stopped event but gets empty
+				// stack traces, causing the stop to appear invisible.
+				dbg.active = true
+				dbg.exceptionBreakActive = true
+				if globalDebugCoordinator.IsInitialized() {
+					globalDebugCoordinator.SetActiveDebugger(dbg)
+				}
+
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] ✅ Returning pending uncaught exception activation: %s:%d (reason=%s, active=true)\n",
+						activation.Filename, activation.Line, activation.Reason)
+				}
+				return activation
+			}
+
 			// ── FIX: cross-VU channel resolution for multi-VU mode ───────────
 			// When the local VM has exited (phase transition), the per-VU channel
 			// that was captured at Continue() entry may belong to a DIFFERENT VU
@@ -2223,7 +2289,8 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 				} else if vmExited {
 					localTimedOut = true
 					if debugContinue {
-						fmt.Printf("[DEBUGGER-CONTINUE] Local VM exited, switching to global-only mode (hasGlobalStepState=%v)\n", hasGlobalStepState)
+						fmt.Printf("[DEBUGGER-CONTINUE] Local VM exited, switching to global-only mode (hasGlobalStepState=%v, uncaughtException=%v)\n",
+							hasGlobalStepState, dbg.uncaughtExceptionExit)
 					}
 				}
 				if isMultiVU {
@@ -2241,7 +2308,8 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 				} else if vmExited {
 					localTimedOut = true
 					if debugContinue {
-						fmt.Printf("[DEBUGGER-CONTINUE] VM exited after coordinator send, switching to global-only mode (hasGlobalStepState=%v)\n", hasGlobalStepState)
+						fmt.Printf("[DEBUGGER-CONTINUE] VM exited after coordinator send, switching to global-only mode (hasGlobalStepState=%v, uncaughtException=%v)\n",
+							hasGlobalStepState, dbg.uncaughtExceptionExit)
 					}
 				}
 				if isMultiVU {
@@ -2567,6 +2635,59 @@ func (dbg *Debugger) IsActive() bool {
 	return dbg.active
 }
 
+// IsVMExited returns true if the VM has exited (e.g. due to an uncaught exception
+// or end of execution). Used by the DAP layer to distinguish uncaught exceptions
+// (VM dead → terminate debug session) from caught exceptions (VM alive → continue).
+func (dbg *Debugger) IsVMExited() bool {
+	if dbg.vmExited {
+		return true
+	}
+	// Also check the channel in case vmExited hasn't been set yet
+	select {
+	case <-dbg.vmDoneCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// ReleaseException unblocks the VM goroutine that is waiting in runTryInner's
+// defer after an uncaught exception. Called by the DAP layer when the user
+// dismisses the exception popup (clicks Continue/Step/Stop).
+func (dbg *Debugger) ReleaseException() {
+	if dbg.exceptionWaitCh != nil {
+		select {
+		case <-dbg.exceptionWaitCh:
+			// already closed
+		default:
+			close(dbg.exceptionWaitCh)
+		}
+		dbg.exceptionWaitCh = nil
+	}
+	// Clear the exception-active state so the debugger transitions cleanly
+	dbg.exceptionBreakActive = false
+	dbg.active = false
+}
+
+// HasPendingException returns true if there is a pending uncaught exception
+// that hasn't been released yet (exceptionWaitCh still open).
+func (dbg *Debugger) HasPendingException() bool {
+	return dbg.exceptionWaitCh != nil
+}
+
+// GetLastExceptionStack returns the saved call stack from the throw site.
+// This is used by the DAP layer when CaptureCallStack returns empty
+// (because handleThrow unwound vm.callStack before the exception was stored).
+func (dbg *Debugger) GetLastExceptionStack() []StackFrame {
+	return dbg.lastExceptionStack
+}
+
+// SetLastExceptionStack saves the exception's stack frames in the debugger
+// so the DAP layer can use them for stackTrace requests after the VM has exited.
+func (dbg *Debugger) SetLastExceptionStack(stack []StackFrame) {
+	dbg.lastExceptionStack = stack
+}
+
 // AddWatch registers a watch expression. Returns its ID.
 func (dbg *Debugger) AddWatch(expression string) int {
 	id := int(atomic.AddInt64(&watchExprCounter, 1))
@@ -2858,14 +2979,17 @@ func (dbg *Debugger) Next() error {
 		// same expression — the call instruction at the end maps back to startLine).
 		if dbg.vm != nil && dbg.vm.prg != nil {
 			dbg.stepOverLastPC = dbg.vm.prg.lastPCForLine(startLine, dbg.vm.pc, steppingFilename)
+			dbg.stepOverLastPCPrg = dbg.vm.prg
 		} else {
 			dbg.stepOverLastPC = -1
+			dbg.stepOverLastPCPrg = nil
 		}
 	} else {
 		dbg.stepOverTargetDepth = dbg.lastBreakpoint.stackDepth
 		dbg.stepOverOriginalTargetDepth = dbg.stepOverTargetDepth
 		dbg.stepOverStartLine = 0
 		dbg.stepOverLastPC = -1
+		dbg.stepOverLastPCPrg = nil
 		dbg.stepOverMissCount = 0
 		dbg.steppingFilename = ""
 		if debugContinue {
@@ -2974,6 +3098,7 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 	// Write paths lazy-init them when needed, avoiding 5 map allocations per phase transition.
 	dbg.pausedVarSnapshot = nil
 	dbg.pausedVarSnapshotLine = 0
+	dbg.pausedVarSnapshotPC = -1
 	dbg.sourceVarCache = nil
 	dbg.globalVarCache = nil
 	dbg.sourceCacheValid = false
@@ -3006,6 +3131,23 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 	// VM exit state — reset for the new phase
 	dbg.vmExited = false
 	dbg.vmDoneCh = make(chan struct{})
+
+	// Exception state — clear stale exception data from previous phase.
+	// Without this, a caught exception in setup could leak exceptionBreakActive=true
+	// into the default phase, causing incorrect behaviour.
+	dbg.lastException = nil
+	dbg.exceptionBreakActive = false
+	dbg.uncaughtExceptionExit = false
+	dbg.pendingUncaughtException = nil
+	// Release any blocked exception wait before clearing
+	if dbg.exceptionWaitCh != nil {
+		select {
+		case <-dbg.exceptionWaitCh:
+		default:
+			close(dbg.exceptionWaitCh)
+		}
+		dbg.exceptionWaitCh = nil
+	}
 
 	// Drain stale entries from the activation channel
 	select {
@@ -3062,6 +3204,7 @@ func (dbg *Debugger) PrepareForCallback() {
 	// Variable / scope caches — stale from previous callback
 	dbg.pausedVarSnapshot = nil
 	dbg.pausedVarSnapshotLine = 0
+	dbg.pausedVarSnapshotPC = -1
 	dbg.sourceVarCache = nil
 	dbg.globalVarCache = nil
 	dbg.sourceCacheValid = false
@@ -3163,6 +3306,7 @@ func (dbg *Debugger) ResetForNewRun() {
 	// Write paths lazy-init them when needed, avoiding allocations on reset.
 	dbg.pausedVarSnapshot = nil
 	dbg.pausedVarSnapshotLine = 0
+	dbg.pausedVarSnapshotPC = -1
 	dbg.sourceVarCache = nil
 	dbg.globalVarCache = nil
 	dbg.sourceCacheValid = false
@@ -3662,7 +3806,52 @@ func (dbg *Debugger) ResetLastBreakpoint() {
 
 func (dbg *Debugger) ResetVMExited() {
 	if debugActivate {
-		fmt.Printf("[DEBUGGER] ResetVMExited: was=%v, setting to false\n", dbg.vmExited)
+		fmt.Printf("[DEBUGGER] ResetVMExited: was=%v, uncaughtException=%v, setting to false\n", dbg.vmExited, dbg.uncaughtExceptionExit)
+	}
+
+	// If the previous iteration exited due to an uncaught exception, the old
+	// Continue() may have left a stale currentCh in the coordinator channel.
+	// Drain it so the new iteration's activate() doesn't pick it up — which
+	// would cause the debugger to "loop back" to the same breakpoint.
+	if dbg.uncaughtExceptionExit {
+		// Drain per-VU coordinator channel
+		vuCh := globalDebugCoordinator.GetVUActivationChannel(dbg.vuID)
+		select {
+		case <-vuCh:
+			if debugActivate {
+				fmt.Printf("[DEBUGGER] ResetVMExited: drained stale channel from per-VU coordinator (vuID=%d)\n", dbg.vuID)
+			}
+		default:
+		}
+		// Drain global coordinator channel
+		globalCh := globalDebugCoordinator.ActivationChannel()
+		select {
+		case <-globalCh:
+			if debugActivate {
+				fmt.Printf("[DEBUGGER] ResetVMExited: drained stale channel from global coordinator\n")
+			}
+		default:
+		}
+		// Drain local activation channel
+		select {
+		case <-dbg.activationCh:
+			if debugActivate {
+				fmt.Printf("[DEBUGGER] ResetVMExited: drained stale channel from local activationCh\n")
+			}
+		default:
+		}
+	}
+
+	dbg.uncaughtExceptionExit = false
+	dbg.pendingUncaughtException = nil
+	// Release any blocked exception wait before clearing
+	if dbg.exceptionWaitCh != nil {
+		select {
+		case <-dbg.exceptionWaitCh:
+		default:
+			close(dbg.exceptionWaitCh)
+		}
+		dbg.exceptionWaitCh = nil
 	}
 	dbg.vmExited = false
 	dbg.vmDoneCh = make(chan struct{})
@@ -4251,7 +4440,8 @@ func (dbg *Debugger) resolveGeneratedName(generatedName string) string {
 
 // stripTypeScriptSyntax removes TypeScript-only syntax from an expression
 // so the JS runtime can evaluate it. Handles:
-//   - Type assertions: "expr as Type"  → "expr"
+//   - Type assertions: "expr as Type", "expr as const" → "expr"
+//   - Satisfies operator: "expr satisfies Type" → "expr"
 //   - Parenthesized: "(expr as Type).prop" → "(expr).prop"
 //   - Angle-bracket casts: "<Type>expr" → "expr"
 //   - Non-null assertions: "expr!" → "expr"
@@ -4259,7 +4449,11 @@ func (dbg *Debugger) resolveGeneratedName(generatedName string) string {
 //
 // Uses a regex-based approach that handles the common patterns seen in
 // debug evaluate/hover without needing a full TS parser.
-var tsAsTypeRegex = regexp.MustCompile(`\s+as\s+[A-Za-z_$][\w$]*(?:\[\]|\<[^>]*\>)*`)
+//
+// The regex handles both uppercase types (Error, Map<K,V>) and lowercase
+// TS built-in types (string, number, boolean, any, unknown, never, void,
+// object, symbol, bigint, undefined, null, const, readonly).
+var tsAsTypeRegex = regexp.MustCompile(`\s+as\s+(?:const|readonly|[A-Za-z_$][\w$]*(?:\[\]|\<[^>]*\>)*)`)
 
 // tsNonNullRegex matches TypeScript's non-null assertion operator (!)
 // in all positions. It captures the char before ! ($1) and the char/end
@@ -4269,12 +4463,141 @@ var tsAsTypeRegex = regexp.MustCompile(`\s+as\s+[A-Za-z_$][\w$]*(?:\[\]|\<[^>]*\
 // Examples: allStores!.length → allStores.length, arr![0] → arr[0]
 var tsNonNullRegex = regexp.MustCompile(`([\w)\]])!([.\[,);\s])`)
 
+// tsBuiltinLowercaseTypes are TypeScript-only type names that start with
+// a lowercase letter and would never appear in valid JS after "<" as a
+// comparison. Used by angle-bracket type cast stripping.
+var tsBuiltinLowercaseTypes = map[string]bool{
+	"string": true, "number": true, "boolean": true, "any": true,
+	"unknown": true, "never": true, "void": true, "object": true,
+	"symbol": true, "bigint": true, "undefined": true, "null": true,
+}
+
+// stripTypeScriptGenerics removes TypeScript generic type parameters from
+// function/method calls. Handles all TypeScript type argument patterns:
+//
+//   - Simple types:         parseJson<Store[]>(x)          → parseJson(x)
+//   - Nested generics:      Map<string, Array<number>>()   → Map()
+//   - Function types:       fn<(x: number) => string>(y)   → fn(y)
+//   - Object/mapped types:  fn<{key: string}>(obj)         → fn(obj)
+//   - Default type params:  fn<T = string>(x)              → fn(x)
+//   - Union/intersection:   fn<A | B>(x), fn<A & B>(x)    → fn(x)
+//   - Conditional types:    fn<T extends U ? X : Y>(x)     → fn(x)
+//   - Tuple types:          fn<[string, number]>(x)        → fn(x)
+//   - Optional chaining:    obj?.method<T>(x)              → obj?.method(x)
+//
+// The algorithm scans left-to-right. When '<' is preceded by a word
+// character, it tracks angle-bracket, parenthesis, and brace depth.
+// The closing '>' is only recognised at the outermost paren/brace level.
+// If the matching '>' is immediately followed by '(', the <…> span is
+// a TypeScript generic call and is stripped. Otherwise it is treated as
+// a less-than comparison and emitted verbatim.
+func stripTypeScriptGenerics(expr string) string {
+	var buf strings.Builder
+	buf.Grow(len(expr))
+	i := 0
+	for i < len(expr) {
+		ch := expr[i]
+		if ch == '<' && i > 0 && isWordOrCloseBracket(expr[i-1]) {
+			// Potential generic call: scan for matching '>' with full
+			// depth tracking for nested angle brackets, parentheses
+			// (function types), and braces (object/mapped types).
+			angleDepth := 1
+			parenDepth := 0
+			braceDepth := 0
+			j := i + 1
+			valid := true
+			for j < len(expr) && angleDepth > 0 {
+				switch expr[j] {
+				case '<':
+					// Only count angle brackets at the top paren/brace level.
+					// Inside (...) or {...}, '<' is a less-than operator.
+					if parenDepth == 0 && braceDepth == 0 {
+						angleDepth++
+					}
+				case '>':
+					// Distinguish closing '>' from the '=>' arrow in function types.
+					// In "(x: number) => string", the '>' after '=' is part of the
+					// arrow operator, NOT a closing angle bracket.
+					if j > 0 && expr[j-1] == '=' {
+						// This is '=>' (arrow) — skip, not a closing angle bracket.
+					} else if parenDepth == 0 && braceDepth == 0 {
+						angleDepth--
+					}
+				case '(':
+					parenDepth++
+				case ')':
+					parenDepth--
+					if parenDepth < 0 {
+						// Unbalanced paren — not a type argument.
+						valid = false
+						angleDepth = 0
+					}
+				case '{':
+					braceDepth++
+				case '}':
+					braceDepth--
+					if braceDepth < 0 {
+						valid = false
+						angleDepth = 0
+					}
+				case ';':
+					// Semicolons never appear inside type arguments.
+					valid = false
+					angleDepth = 0
+				}
+				if angleDepth > 0 {
+					j++
+				}
+			}
+			// Generic call confirmed when:
+			//   - valid (no unbalanced parens/braces/semis)
+			//   - all depths balanced (angle=0, paren=0, brace=0)
+			//   - closing '>' immediately followed by '('
+			if valid && angleDepth == 0 && parenDepth == 0 && braceDepth == 0 &&
+				j+1 < len(expr) && expr[j+1] == '(' {
+				// Skip the entire <TypeArgs> span — advance i past '>' to '('
+				i = j + 1
+				continue
+			}
+		}
+		buf.WriteByte(ch)
+		i++
+	}
+	return buf.String()
+}
+
+// isWordOrCloseBracket returns true if b can precede a TypeScript generic
+// '<' in a call expression. This includes identifier characters and ')'/']'
+// to handle expressions like `(expr as Fn)<T>(x)`.
+func isWordOrCloseBracket(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') || b == '_' || b == '$' || b == ')' || b == ']'
+}
+
 func stripTypeScriptSyntax(expr string) string {
-	// Strip "as Type" assertions (including "as Type[]", "as Map<K,V>")
+	// ── Generic call syntax: identifier<TypeArgs>( → identifier( ──────
+	// This MUST run first because type args can contain [] and other chars
+	// that would confuse subsequent patterns.
+	// e.g., "this.parseJson<Store[]>(response)" → "this.parseJson(response)"
+	// e.g., "new Map<string, number>()"          → "new Map()"
+	// e.g., "fn<T, U>(a, b)"                     → "fn(a, b)"
+	if strings.Contains(expr, "<") && strings.Contains(expr, ">(") {
+		expr = stripTypeScriptGenerics(expr)
+	}
+
+	// Strip "as Type" / "as const" / "as readonly" assertions
+	// (including "as Type[]", "as Map<K,V>", "as string", "as number")
 	// e.g., "(error as Error).message" → "(error).message"
 	// e.g., "arr as string[]" → "arr"
+	// e.g., "x as const" → "x"
 	if strings.Contains(expr, " as ") {
 		expr = tsAsTypeRegex.ReplaceAllString(expr, "")
+	}
+
+	// Strip "satisfies Type" (TypeScript 4.9+)
+	// e.g., "config satisfies Config" → "config"
+	if strings.Contains(expr, " satisfies ") {
+		expr = tsSatisfiesRegex.ReplaceAllString(expr, "")
 	}
 
 	// Strip angle-bracket type casts: "<Error>error" → "error"
@@ -4282,10 +4605,12 @@ func stripTypeScriptSyntax(expr string) string {
 	// less-than comparisons like "a < b"
 	if strings.HasPrefix(expr, "<") {
 		if idx := strings.Index(expr, ">"); idx > 0 {
-			// Verify it looks like a type (starts with uppercase or is a known type)
 			inner := expr[1:idx]
-			if len(inner) > 0 && (inner[0] >= 'A' && inner[0] <= 'Z') {
-				expr = expr[idx+1:]
+			if len(inner) > 0 {
+				// Accept uppercase types (Error, Map, etc.) and known lowercase TS types
+				if (inner[0] >= 'A' && inner[0] <= 'Z') || tsBuiltinLowercaseTypes[inner] {
+					expr = expr[idx+1:]
+				}
 			}
 		}
 	}
@@ -4296,16 +4621,18 @@ func stripTypeScriptSyntax(expr string) string {
 	if strings.Contains(expr, "!") {
 		expr = tsNonNullRegex.ReplaceAllString(expr, "${1}${2}")
 		// Also strip trailing ! (e.g., "getValue()!" → "getValue()")
-		if len(expr) > 1 && expr[len(expr)-1] == '!' {
+		for len(expr) > 1 && expr[len(expr)-1] == '!' {
 			before := expr[len(expr)-2]
 			if before == ')' || before == ']' || (before >= 'a' && before <= 'z') ||
 				(before >= 'A' && before <= 'Z') || (before >= '0' && before <= '9') || before == '_' || before == '$' {
 				expr = expr[:len(expr)-1]
+			} else {
+				break
 			}
 		}
 	}
 
-	return expr
+	return strings.TrimSpace(expr)
 }
 
 func (dbg *Debugger) Evaluate(expr string) (Value, error) {
@@ -4363,7 +4690,11 @@ func (dbg *Debugger) Evaluate(expr string) (Value, error) {
 // Subsequent evals during the same pause reuse the snapshot without re-walking the stash.
 func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
 	currentLine := dbg.Line()
-	if dbg.pausedVarSnapshot != nil && dbg.pausedVarSnapshotLine == currentLine {
+	currentPC := dbg.vm.pc
+	// Cache key includes BOTH line and PC. Multiple instructions can map to the
+	// same source line (e.g., before and after a call expression). Using line-only
+	// would serve stale data when the PC advances within the same line.
+	if dbg.pausedVarSnapshot != nil && dbg.pausedVarSnapshotLine == currentLine && dbg.pausedVarSnapshotPC == currentPC {
 		return dbg.pausedVarSnapshot
 	}
 
@@ -4480,6 +4811,7 @@ func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
 
 	dbg.pausedVarSnapshot = snap
 	dbg.pausedVarSnapshotLine = currentLine
+	dbg.pausedVarSnapshotPC = currentPC
 	return snap
 }
 
@@ -4487,6 +4819,11 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 	dbg.evalMutex.Lock()
 	defer dbg.evalMutex.Unlock()
 
+	if dbg.vm == nil || dbg.vm.r == nil {
+		return nil, fmt.Errorf("cannot evaluate: no runtime")
+	}
+
+	// Try registry first (multi-scope eval for setup/teardown phases)
 	registry := GetGlobalRegistry()
 	if registry != nil {
 		var result Value
@@ -4506,7 +4843,7 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 			return result, nil
 		}
 		if dbg.enableDebugLogging {
-			fmt.Printf("[DEBUGGER] Registry eval failed: %v, falling back to single-VM eval\n", err)
+			fmt.Printf("[DEBUGGER] Registry eval failed: %v, falling back to direct eval\n", err)
 		}
 	}
 
@@ -4514,192 +4851,236 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		return nil, fmt.Errorf("cannot evaluate: invalid execution state")
 	}
 
-	// PERF: use per-pause snapshot so we walk the stash chain only once per pause,
-	// regardless of how many variables the user hovers over.
-	varSnapshot := dbg.buildPausedVarSnapshot()
+	// CRITICAL FIX (Bug 2 + Bug 3): Save state that can be corrupted by an
+	// exception inside the eval expression (ReferenceError, TypeError, etc.).
+	// BreakOnException → activateWithStepState overwrites lastBreakpoint,
+	// causing the debugger to jump to the wrong location when the user resumes.
+	// Also set inEvalContext so BreakOnException can bail out early (Bug 3).
+	savedLastBreakpoint := dbg.lastBreakpoint
+	savedExceptionBreakActive := dbg.exceptionBreakActive
+	savedLastException := dbg.lastException
+	savedPausedVarSnapshot := dbg.pausedVarSnapshot
+	savedPausedVarSnapshotLine := dbg.pausedVarSnapshotLine
+	savedPausedVarSnapshotPC := dbg.pausedVarSnapshotPC
 
-	varNames := make([]string, 0, len(varSnapshot))
-	varValues := make([]Value, 0, len(varSnapshot))
-	for name, val := range varSnapshot {
-		varNames = append(varNames, name)
-		varValues = append(varValues, val)
-	}
+	dbg.inEvalContext = true
+	defer func() {
+		dbg.lastBreakpoint = savedLastBreakpoint
+		dbg.exceptionBreakActive = savedExceptionBreakActive
+		dbg.lastException = savedLastException
+		dbg.pausedVarSnapshot = savedPausedVarSnapshot
+		dbg.pausedVarSnapshotLine = savedPausedVarSnapshotLine
+		dbg.pausedVarSnapshotPC = savedPausedVarSnapshotPC
+		dbg.inEvalContext = false
+	}()
 
-	// Also add stack-based locals from debug symbols (not in stash snapshot).
-	currentPC := dbg.vm.pc
-	currentLine := dbg.Line()
-	seen := make(map[string]bool, len(varSnapshot))
-	for _, n := range varNames {
-		seen[n] = true
-	}
+	// ── Core: compile as a direct-eval program with ctxVM=dbg.vm ──────────
+	//
+	// By passing dbg.vm as evalVm to the compiler, the compiled program
+	// sees the current stash chain as its outer scope, giving it access to:
+	//   - All local variables in the current function
+	//   - All closure variables from enclosing functions
+	//   - The correct `this` binding (resolved naturally from the stash chain)
+	//   - The full prototype chain
+	//   - Import bindings from ESM modules
+	//
+	// This mirrors how Node.js/V8 evaluates watch/hover expressions: compile
+	// in the context of the paused call frame so the eval code uses dynamic
+	// scope lookup (loadMixed/resolveMixed in sobek, LD_VAR_SCOPE in V8).
+	//
+	// This is strictly better than the previous approach of injecting variables
+	// into the global object because: (a) closures actually work, (b) `this`
+	// is correct without wrapping, (c) prototype methods are available,
+	// (d) no global pollution, (e) lexical bindings work correctly.
 
-	if dbg.vm.prg != nil && dbg.vm.prg.debugSymbols != nil {
-		varLocs := dbg.vm.prg.debugSymbols.LookupVarsAtPC(currentPC)
-		if len(varLocs) > 0 {
-			if dbg.enableDebugLogging {
-				fmt.Printf("[DEBUGGER] Found %d debug symbols at PC=%d (line %d)\n", len(varLocs), currentPC, currentLine)
-			}
-			for _, varLoc := range varLocs {
-				if seen[varLoc.Name] {
-					continue
-				}
-				val, err := dbg.getValueFromLocation(varLoc)
-				if err == nil && val != nil && !isNullValue(val) {
-					seen[varLoc.Name] = true
-					varNames = append(varNames, varLoc.Name)
-					varValues = append(varValues, val)
-				}
-			}
+	// Determine inGlobal: mirror runtime.eval()'s logic for direct eval.
+	// If there's any variable stash between the current scope and global,
+	// we're NOT in global scope.
+	inGlobal := true
+	for s := dbg.vm.stash; s != nil; s = s.outer {
+		if s.isVariable() {
+			inGlobal = false
+			break
 		}
 	}
 
-	if varInfo := dbg.getSourceVarInfo(currentLine); varInfo != nil {
-		for paramName, paramIdx := range varInfo.params {
-			if seen[paramName] {
-				continue
-			}
-			pIdx := -(paramIdx + 1)
-			stackPos := dbg.vm.sb + 1 + pIdx
-			if stackPos >= dbg.vm.sb && stackPos < dbg.vm.sp && stackPos < len(dbg.vm.stack) {
-				val := dbg.vm.stack[stackPos]
-				if val != nil && !isNullValue(val) && !isFunctionValue(val) {
-					seen[paramName] = true
-					varNames = append(varNames, paramName)
-					varValues = append(varValues, val)
-				}
-			}
-		}
-		for localName, localIdx := range varInfo.locals {
-			if seen[localName] {
-				continue
-			}
-			declLine := varInfo.declLines[localName]
-			if declLine > currentLine {
-				continue
-			}
-			stackPos := dbg.vm.sb + 2 + localIdx
-			if stackPos >= dbg.vm.sb && stackPos < dbg.vm.sp && stackPos < len(dbg.vm.stack) {
-				val := dbg.vm.stack[stackPos]
-				if val != nil && !isNullValue(val) && !isFunctionValue(val) {
-					seen[localName] = true
-					varNames = append(varNames, localName)
-					varValues = append(varValues, val)
-				}
-			}
-		}
-	}
+	// Determine strict mode from the current execution context.
+	// ESM modules (k6 TypeScript via esbuild) are always strict.
+	inStrict := dbg.isCurrentScopeStrict()
 
 	if dbg.enableDebugLogging {
-		fmt.Printf("[DEBUGGER] Evaluating '%s' with %d variables available\n", expr, len(varNames))
+		fmt.Printf("[DEBUGGER] evaluateComplexExpression: compiling %q (inGlobal=%v, strict=%v)\n", expr, inGlobal, inStrict)
 	}
 
-	globalObj := dbg.vm.r.globalObject
-	savedVars := make(map[string]Value, len(varNames))
-	for i, name := range varNames {
-		nameUni := unistring.String(name)
-		if existingVal := safeGetGlobalProperty(globalObj, nameUni); existingVal != nil {
-			savedVars[name] = existingVal
+	// ── Inject 'this' into the stash chain ────────────────────────────────
+	//
+	// When the compiler compiles eval code, it emits getThisDynamic{} for
+	// 'this' references. getThisDynamic walks the stash chain looking for
+	// thisBindingName (" this"). But if the enclosing function was compiled
+	// without knowing an eval() would happen, 'this' may still be on the
+	// stack (vm.stack[vm.sb]) instead of in any stash.
+	//
+	// Fix: create a temporary wrapper stash containing the correct 'this'
+	// value. This stash wraps the current stash chain so getThisDynamic
+	// finds it immediately. We set vm.stash to this wrapper BEFORE
+	// compilation (so the compiler accounts for the extra scope level in
+	// its stash walking at compiler.go:1761) and BEFORE execution.
+	// After execution, we restore the original stash.
+	//
+	// This is safe because:
+	//   - loadDynamic/getThisDynamic search by name → will find " this"
+	//   - Other name lookups skip this stash (they search by name too)
+	//   - The wrapper has funcType=funcNone so the compiler's funcType
+	//     detection (line 1761-1766) walks past it correctly
+
+	thisVal := dbg.getCurrentThis()
+	origStash := dbg.vm.stash
+
+	// Only inject the wrapper if we actually have a valid 'this' to inject.
+	// For top-level module code, 'this' is undefined and doesn't need injection.
+	thisInjected := false
+	if thisVal != nil && thisVal != _undefined {
+		thisKey := unistring.String(thisBindingName)
+		wrapperStash := &stash{
+			values: []Value{thisVal},
+			names:  map[unistring.String]uint32{thisKey: 0},
+			outer:  origStash,
+			vm:     dbg.vm,
+			// funcType stays funcNone — the compiler's funcType detection
+			// (line 1761) will walk past this to find the real function stash.
 		}
-		globalObj.self.setOwnStr(nameUni, varValues[i], false)
+		dbg.vm.stash = wrapperStash
+		thisInjected = true
 	}
 
-	// FIX: Restore globals in a defer so that a panic inside RunProgram
-	// (which can happen in sobek) does not permanently corrupt the global object.
-	// Previously the restore loop was inline after RunProgram and would be skipped
-	// on panic, leaving injected debugger variables on the global object.
-	restoreGlobals := func() {
-		for _, name := range varNames {
-			nameUni := unistring.String(name)
-			if savedVal, hadValue := savedVars[name]; hadValue {
-				globalObj.self.setOwnStr(nameUni, savedVal, false)
-			} else {
-				globalObj.self.deleteStr(nameUni, false)
-			}
-		}
-	}
-	defer restoreGlobals()
-
-	prog, compileErr := compile("<eval>", expr, false, true, nil, dbg.vm.debugMode, dbg.vm.r.parserOptions...)
+	// Compile with dbg.vm as evalVm — this is the key difference from
+	// the previous approach. The compiler emits loadDynamic/getThisDynamic
+	// instructions that dynamically search the live stash chain at runtime,
+	// exactly as eval(...) inside the paused function would.
+	prog, compileErr := compile("<debugger-eval>", expr, inStrict, inGlobal, dbg.vm, dbg.vm.debugMode, dbg.vm.r.parserOptions...)
 	if compileErr != nil {
-		return nil, fmt.Errorf("compilation error: %w", compileErr)
-	}
-
-	// Check if the expression references 'this' — if so, wrap it in a function
-	// and .call() it with the current frame's 'this'. The keyword 'this' cannot
-	// be injected as a global property; it must be resolved via the call context.
-	needsThisBinding := thisKeywordRegex.MatchString(expr)
-	var thisBindProg *Program
-	if needsThisBinding {
-		wrappedExpr := "(function(){\nreturn (\n" + expr + "\n);\n})"
-		var wrapErr error
-		thisBindProg, wrapErr = compile("<eval>", wrappedExpr, false, true, nil, dbg.vm.debugMode, dbg.vm.r.parserOptions...)
-		if wrapErr != nil {
-			// Fallback: if wrapping fails, use the raw program
-			thisBindProg = nil
+		// Restore stash before returning on compile error.
+		if thisInjected {
+			dbg.vm.stash = origStash
 		}
+		return nil, fmt.Errorf("compilation error: %w", compileErr)
 	}
 
 	var result Value
 	var evalErr error
-	// Suppress the debugger during eval execution. Exceptions from the eval
-	// (e.g., "decrypted is not defined") must NOT trigger BreakOnException
-	// or breakpoint checks — this is an internal debugger operation.
-	// Use a wrapper func with defer to ensure suppressDebugger is restored
-	// even if RunProgram panics.
+
+	// Execute using the pushCtx/runTry/popCtx pattern (mirrors runtime.eval
+	// for direct eval). We must NOT use RunProgram because it resets
+	// vm.stash to global in recursive calls, wiping the scope chain
+	// that the compiled program needs.
 	func() {
+		dbg.suppressDebugDepth++
 		dbg.suppressDebugger = true
-		defer func() { dbg.suppressDebugger = false }()
+		defer func() {
+			dbg.suppressDebugDepth--
+			if dbg.suppressDebugDepth == 0 {
+				dbg.suppressDebugger = false
+			}
+		}()
+		defer func() {
+			// Always restore the original stash, even on panic.
+			if thisInjected {
+				dbg.vm.stash = origStash
+			}
+		}()
 		defer func() {
 			if r := recover(); r != nil {
-				evalErr = fmt.Errorf("evaluation panicked: %v", r)
+				if ex, ok := r.(*Exception); ok {
+					evalErr = ex
+				} else if ex, ok := r.(*StackOverflowError); ok {
+					evalErr = fmt.Errorf("evaluation error: %s", ex.Error())
+				} else {
+					evalErr = fmt.Errorf("evaluation panicked: %v", r)
+				}
 				if dbg.enableDebugLogging {
-					fmt.Printf("[DEBUGGER] evaluateComplexExpression: RunProgram panicked: %v\n", r)
+					fmt.Printf("[DEBUGGER] evaluateComplexExpression: panicked: %v\n", r)
 				}
 			}
 		}()
 
-		if thisBindProg != nil {
-			// Run the wrapper to get the function, then call it with 'this'
-			rawResult, runErr := dbg.vm.r.RunProgram(thisBindProg)
-			if runErr != nil {
-				evalErr = runErr
-				return
+		vm := dbg.vm
+
+		// Save context — pushCtx saves prg, stash, pc, sb, sp, args, etc.
+		vm.pushCtx()
+
+		// Get the function object from the current frame (like runtime.eval direct mode)
+		funcObj := Value(_undefined)
+		if vm.sb > 0 && vm.sb-1 < len(vm.stack) {
+			if v := vm.stack[vm.sb-1]; v != nil {
+				funcObj = v
 			}
-			if fn, ok := AssertFunction(rawResult); ok {
-				thisVal := dbg.getCurrentThis()
-				result, evalErr = fn(thisVal)
-			} else {
-				result = rawResult
-			}
+		}
+
+		// DO NOT reset vm.stash — keeping the current stash (with the
+		// injected 'this' wrapper) is what makes this a "direct eval"
+		// with full scope chain access.
+
+		vm.prg = prog
+		vm.pc = 0
+		vm.args = 0
+		vm.result = _undefined
+		vm.push(funcObj)
+		vm.sb = vm.sp
+		vm.push(nil) // this slot — actual 'this' is resolved via stash chain
+		ex := vm.runTry()
+		retval := vm.result
+		vm.popCtx()
+		vm.sp -= 2
+
+		if ex != nil {
+			evalErr = ex
 		} else {
-			result, evalErr = dbg.vm.r.RunProgram(prog)
+			result = retval
 		}
 	}()
+
 	if evalErr != nil {
 		if exc, ok := evalErr.(*Exception); ok {
-			evalErr = exc
+			return nil, exc
 		}
-	}
-
-	// NOTE: restoreGlobals() runs via defer above — no inline restore needed.
-
-	if evalErr != nil {
 		return nil, fmt.Errorf("evaluation error: %w", evalErr)
 	}
+
+	// Unwrap Promises: k6 functions often return Promises; the user wants
+	// the resolved value, not a Promise wrapper.
+	result = dbg.unwrapPromiseResult(result)
+
 	return result, nil
 }
 
+// isCurrentScopeStrict returns true if the current VM scope is in strict mode.
+// ESM modules compiled by k6 (via esbuild) are always strict.
+func (dbg *Debugger) isCurrentScopeStrict() bool {
+	if dbg.vm == nil || dbg.vm.stash == nil {
+		return false
+	}
+	for s := dbg.vm.stash; s != nil; s = s.outer {
+		if s.funcType == funcModule {
+			return true
+		}
+	}
+	return false
+}
+
 // getCurrentThis returns the 'this' value for the current stack frame.
-// Used by evaluateComplexExpression to bind 'this' correctly in eval.
-// 'this' is a keyword in JS and cannot be injected as a global property,
-// so we resolve it from the stash chain (for class methods, arrow functions
-// with lexical this) or the stack base (for regular functions).
+// Used by evaluateComplexExpression to inject 'this' into the stash chain
+// so that getThisDynamic (emitted by the compiler for eval code) finds it.
+//
+// Resolution order:
+//  1. Walk the stash chain for " this" (thisBindingName) — works for class
+//     methods with closures, arrow functions with lexical this, etc.
+//  2. Fall back to vm.stack[vm.sb] — works for regular function calls where
+//     'this' is passed on the stack and never moved to a stash.
 func (dbg *Debugger) getCurrentThis() Value {
 	if dbg.vm == nil {
 		return _undefined
 	}
-	// Try stash chain for " this" (thisBindingName) first — works for
-	// class methods, arrow functions with lexical this, etc.
+	// Try stash chain for " this" (thisBindingName) first.
 	thisKey := unistring.String(thisBindingName)
 	for s := dbg.vm.stash; s != nil; s = s.outer {
 		if s.names == nil {
@@ -4715,7 +5096,7 @@ func (dbg *Debugger) getCurrentThis() Value {
 			}
 		}
 	}
-	// Fallback: stack base (vm.sb) holds 'this' for regular functions
+	// Fallback: stack base (vm.sb) holds 'this' for regular function calls.
 	if dbg.vm.sb >= 0 && dbg.vm.sb < len(dbg.vm.stack) {
 		v := dbg.vm.stack[dbg.vm.sb]
 		if v != nil && !isNullValue(v) {
@@ -4725,6 +5106,35 @@ func (dbg *Debugger) getCurrentThis() Value {
 		}
 	}
 	return _undefined
+}
+
+// unwrapPromiseResult checks if a Value is a fulfilled Promise and returns
+// its resolved value. For rejected promises, returns _undefined. For
+// pending promises or non-promise values, returns the value as-is.
+func (dbg *Debugger) unwrapPromiseResult(val Value) Value {
+	if val == nil {
+		return val
+	}
+	obj, ok := val.(*Object)
+	if !ok {
+		return val
+	}
+	promise, ok := obj.self.(*Promise)
+	if !ok {
+		return val
+	}
+	switch promise.State() {
+	case PromiseStateFulfilled:
+		return promise.Result()
+	case PromiseStateRejected:
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] Promise rejected: %v\n", promise.Result())
+		}
+		return _undefined
+	default:
+		// Pending — can't resolve synchronously, return as-is
+		return val
+	}
 }
 
 func (dbg *Debugger) captureReturnValue(varName string, value Value) {
@@ -4816,10 +5226,14 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 	savedUserCommandIssued := dbg.userCommandIssued
 	savedLifecycleTransition := dbg.lifecycleTransition
 
+	dbg.suppressDebugDepth++
 	dbg.suppressDebugger = true
 
 	defer func() {
-		dbg.suppressDebugger = false
+		dbg.suppressDebugDepth--
+		if dbg.suppressDebugDepth == 0 {
+			dbg.suppressDebugger = false
+		}
 
 		dbg.vm.pc = savedPC
 		dbg.vm.sb = savedSB
@@ -5076,20 +5490,25 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 		//
 		// Fix: walk ALL stash levels inside the current function (up to
 		// the module/global stash) and collect any named variable not
-		// already in locals. The "isModuleLevel" heuristic is replaced
-		// by a depth-bounded walk: we stop at the stash whose funcType
-		// is set (the function stash) or after a reasonable depth.
+		// already in locals. For functions with default parameters, the
+		// parameter environment is a separate stash OUTSIDE the function
+		// body scope. We must continue past the first funcType boundary
+		// to reach it, but stop at the module boundary (funcModule) or
+		// after two function boundaries (to avoid leaking into enclosing
+		// functions).
 		{
-			const maxFuncStashDepth = 8 // safety bound
+			const maxFuncStashDepth = 10 // safety bound
 			depth := 0
+			funcBoundariesHit := 0
 			for s := dbg.vm.stash; s != nil && depth < maxFuncStashDepth; s = s.outer {
 				depth++
 				if s.names == nil {
-					// Stop at the function-scope boundary even if names is nil,
-					// because the next outer stash belongs to the enclosing scope
-					// (module/global). funcType != 0 means this is a function stash.
 					if s.funcType != 0 {
-						break
+						funcBoundariesHit++
+						// Stop at module/global scope boundary
+						if s.funcType == funcModule || funcBoundariesHit >= 2 {
+							break
+						}
 					}
 					continue
 				}
@@ -5132,10 +5551,15 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 						}
 					}
 				}
-				// If this stash belongs to a function scope, stop here;
-				// anything further out is the enclosing module/global scope.
+				// Track function scope boundaries. Stop at module/global
+				// scope or after passing through 2 function boundaries
+				// (body + params of the same function). This prevents
+				// leaking variables from an enclosing function.
 				if s.funcType != 0 {
-					break
+					funcBoundariesHit++
+					if s.funcType == funcModule || funcBoundariesHit >= 2 {
+						break
+					}
 				}
 			}
 		}
@@ -5143,6 +5567,67 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 		if dbg.enableDebugLogging {
 			fmt.Printf("[DEBUGGER] GetLocalVariables: collected %d function-local variables from debug symbols\n", len(locals))
 		}
+
+		// ── Snapshot enrichment ──────────────────────────────────────────
+		// The debug-symbols path and stash-chain fallback above may miss
+		// variables when:
+		//   - The stash layout at runtime differs from compile-time
+		//     assumptions (block scopes, try/catch pushed extra stashes).
+		//   - Default parameters create a separate parameter scope that
+		//     the funcType-bounded fallback doesn't reach.
+		//   - The PC falls between two PCRange entries in the debug symbols.
+		//
+		// buildPausedVarSnapshot walks the ENTIRE stash chain (no funcType
+		// boundary) and always finds these variables — that's why eval/hover
+		// works while the Variables panel doesn't.
+		//
+		// Fix: merge in any snapshot variable whose NAME appears in the
+		// debug symbols for this function. This scopes the enrichment to
+		// function-local variables (params + body vars) and prevents
+		// leaking module-level globals into the Local scope.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if dbg.enableDebugLogging {
+						fmt.Printf("[DEBUGGER] GetLocalVariables: snapshot enrichment panicked: %v\n", r)
+					}
+				}
+			}()
+			// Build the set of variable names that debug symbols say are
+			// local to this function. We already iterated varLocs above;
+			// collect the names into a set for fast lookup.
+			debugSymbolNames := make(map[string]bool, len(varLocs))
+			for _, vl := range varLocs {
+				dn := vl.Name
+				if strings.TrimSpace(dn) == "this" {
+					dn = "this"
+				}
+				debugSymbolNames[dn] = true
+			}
+
+			snap := dbg.buildPausedVarSnapshot()
+			enriched := 0
+			for name, val := range snap {
+				// Only enrich variables that:
+				// 1. Are in the debug symbols (function-scoped)
+				// 2. Are missing from locals OR have a nil/_undefined value
+				//    that the snapshot resolved to a real value
+				if !debugSymbolNames[name] {
+					continue
+				}
+				existing, exists := locals[name]
+				if exists && existing != nil && existing != _undefined {
+					continue // already have a real value
+				}
+				if val != nil && !isNullValue(val) {
+					locals[name] = val
+					enriched++
+				}
+			}
+			if enriched > 0 && dbg.enableDebugLogging {
+				fmt.Printf("[DEBUGGER] GetLocalVariables: snapshot enrichment added %d variables\n", enriched)
+			}
+		}()
 
 		// ── Source map name remapping ────────────────────────────────────
 		// Remap generated names → original names so the IDE variables panel
@@ -5973,53 +6458,129 @@ func (dbg *Debugger) SetExceptionBreakpoints(caught, uncaught bool) {
 
 // BreakOnException is called by the VM's handleThrow when an exception occurs.
 // If the matching exception breakpoint is enabled, it pauses the VM.
-func (dbg *Debugger) BreakOnException(exceptionVal Value, caught bool) bool {
+//
+// throwFile and throwLine provide the ORIGINAL throw location (captured before
+// handleThrow unwinds the stack). If both are empty/zero, the method falls back
+// to dbg.Filename()/dbg.Line() and then lastBreakpoint.
+//
+// Node.js debugger behaviour:
+//   - With "All Exceptions" enabled → pause at the throw site for both caught and uncaught
+//   - With "Uncaught Exceptions" only → pause only when no try/catch will handle it
+//   - try/catch: the exception is paused at the throw line (NOT the catch handler)
+//   - Variables pane shows all in-scope variables at the throw point
+func (dbg *Debugger) BreakOnException(exceptionVal Value, caught bool, throwFile string, throwLine int) bool {
 	if dbg == nil || dbg.vm == nil || !dbg.vm.debugMode || dbg.suppressDebugger {
+		if debugActivate {
+			fmt.Printf("[EXCEPTION-TRACE] BreakOnException: SKIPPED (nil=%v, vm=%v, debugMode=%v, suppress=%v)\n",
+				dbg == nil, dbg != nil && dbg.vm == nil, dbg != nil && dbg.vm != nil && !dbg.vm.debugMode, dbg != nil && dbg.suppressDebugger)
+		}
+		return false
+	}
+	if dbg.inEvalContext {
 		return false
 	}
 	if exceptionVal == nil {
+		if debugActivate {
+			fmt.Printf("[EXCEPTION-TRACE] BreakOnException: SKIPPED (exceptionVal is nil)\n")
+		}
 		return false
 	}
 
-	shouldBreak := false
-	if caught && dbg.breakOnCaughtExceptions {
-		shouldBreak = true
+	if debugActivate {
+		fmt.Printf("[EXCEPTION-TRACE] BreakOnException CALLED: caught=%v, exception=%q, throwFile=%s, throwLine=%d, pendingAlreadySet=%v, exceptionWaitCh=%v, breakOnCaught=%v, breakOnUncaught=%v\n",
+			caught, exceptionVal.String(), throwFile, throwLine, dbg.pendingUncaughtException != nil, dbg.exceptionWaitCh != nil, dbg.breakOnCaughtExceptions, dbg.breakOnUncaughtExceptions)
 	}
-	if !caught && dbg.breakOnUncaughtExceptions {
-		shouldBreak = true
+
+	// ── Resolve the throw location ─────────────────────────────────────
+	// Priority: 1) explicit throwFile/throwLine (caller captured before unwind)
+	//           2) dbg.Filename()/Line() (may be wrong after stack unwind)
+	//           3) lastBreakpoint (last known good user position)
+	filename := throwFile
+	line := throwLine
+	if filename == "" || line <= 0 {
+		filename = dbg.Filename()
+		line = dbg.Line()
 	}
-	if !shouldBreak {
+	if filename == "" || line <= 0 {
+		filename = dbg.lastBreakpoint.filename
+		line = dbg.lastBreakpoint.line
+		if debugActivate {
+			fmt.Printf("[EXCEPTION-TRACE] BreakOnException: using lastBreakpoint fallback: %s:%d\n", filename, line)
+		}
+	}
+
+	// Skip truly internal/native files — exception breakpoints must work in
+	// ANY user file. This matches Node.js behaviour.
+	if filename == "" || filename == "<native>" || filename == "<eval>" || filename == "<anonymous>" || filename == "<debugger-eval>" {
+		if debugActivate {
+			fmt.Printf("[EXCEPTION-TRACE] BreakOnException: SKIPPED internal file %q\n", filename)
+		}
 		return false
 	}
 
-	// Store the exception for exceptionInfo requests
-	dbg.lastException = exceptionVal
-	dbg.exceptionBreakActive = true
+	// ── Caught exceptions ──────────────────────────────────────────────
+	if caught {
+		if !dbg.breakOnCaughtExceptions {
+			return false
+		}
 
-	// Determine the current source location using existing helpers
-	filename := dbg.Filename()
-	line := dbg.Line()
+		dbg.lastException = exceptionVal
+		dbg.exceptionBreakActive = true
 
-	// Only skip truly internal/native files — NOT user source files.
-	// Exception breakpoints must work in ANY user file, regardless of whether
-	// regular breakpoints are set in that file. This matches Node.js behavior
-	// where "break on uncaught exceptions" stops at ANY user code that throws.
-	if filename == "" || filename == "<native>" || filename == "<eval>" || filename == "<anonymous>" {
+		if dbg.enableDebugLogging || debugActivate {
+			fmt.Printf("[DEBUGGER] BreakOnException: caught exception=%q, pausing at throw site %s:%d\n",
+				exceptionVal.String(), filename, line)
+		}
+
+		// Pause the VM at the THROW site — blocks until user issues Continue/Step in the IDE.
+		// We pass false/false for step flags so activate() treats this as a fresh pause.
+		dbg.activateWithStepState(ExceptionActivation, filename, line, false, false)
+
 		dbg.exceptionBreakActive = false
+		return true
+	}
+
+	// ── Uncaught exceptions ────────────────────────────────────────────
+	// Uncaught exceptions ALWAYS pause the debugger in debug mode.
+	// An uncaught exception crashes the k6 iteration — the user must see it
+	// regardless of the "Uncaught Exceptions" checkbox in the IDE.
+	// This matches Node.js behaviour where uncaught exceptions always halt
+	// execution and show the error. The breakOnUncaughtExceptions flag only
+	// matters for the DAP "Uncaught Exceptions" filter visibility, but in k6
+	// there is no recovery from an uncaught throw — the iteration is dead.
+
+	// Guard: if pendingUncaughtException is already set, skip duplicate
+	if dbg.pendingUncaughtException != nil {
+		if debugActivate {
+			fmt.Printf("[EXCEPTION-TRACE] BreakOnException: SKIPPED duplicate uncaught (pendingUncaughtException already set)\n")
+		}
 		return false
 	}
 
-	if dbg.enableDebugLogging {
-		fmt.Printf("[DEBUGGER] BreakOnException: caught=%v, exception=%q, at %s:%d\n",
-			caught, exceptionVal.String(), filename, line)
+	if debugActivate || debugContinue {
+		fmt.Printf("[DEBUGGER] BreakOnException: VU=%d storing pending uncaught exception at %s:%d (next=%v, stepIn=%v, exception=%s)\n",
+			dbg.vuID, filename, line, dbg.next, dbg.stepIn, exceptionVal.String())
 	}
 
-	// Pause the VM — blocks until user issues Continue/Step in the IDE
-	dbg.activateWithStepState(ExceptionActivation, filename, line, false, false)
+	dbg.lastException = exceptionVal
+	dbg.pendingUncaughtException = &DebuggerActivation{
+		Reason:        ExceptionActivation,
+		Filename:      filename,
+		Line:          line,
+		Column:        dbg.Column(),
+		Epoch:         globalDebugCoordinator.NextGlobalEpoch(),
+		VUID:          dbg.vuID,
+		ExceptionText: exceptionVal.String(),
+	}
+	dbg.exceptionWaitCh = make(chan struct{})
 
-	dbg.exceptionBreakActive = false
-	return true
+	if debugActivate {
+		fmt.Printf("[EXCEPTION-TRACE] BreakOnException: STORED pendingUncaughtException at %s:%d, exceptionWaitCh created\n",
+			filename, line)
+	}
+	return false
 }
+
 
 // IsExceptionBreak returns true if the debugger is currently paused due to an exception.
 func (dbg *Debugger) IsExceptionBreak() bool {
@@ -6031,5 +6592,15 @@ func (dbg *Debugger) IsExceptionBreak() bool {
 // breaks are all skipped. Used by the DAP layer during property enumeration
 // (obj.Get(), obj.Keys()) to prevent re-entering the debugger from JS getters.
 func (dbg *Debugger) SuppressDebuggerFlag(suppress bool) {
-	dbg.suppressDebugger = suppress
+	if suppress {
+		dbg.suppressDebugDepth++
+		dbg.suppressDebugger = true
+	} else {
+		if dbg.suppressDebugDepth > 0 {
+			dbg.suppressDebugDepth--
+		}
+		if dbg.suppressDebugDepth == 0 {
+			dbg.suppressDebugger = false
+		}
+	}
 }
