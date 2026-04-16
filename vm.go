@@ -1263,6 +1263,29 @@ func (vm *vm) debug() {
 										}
 									}
 								}
+								// When a conditional jump takes a forward jump (skipping an
+								// if-body because the condition is false), the landing instruction
+								// may inherit the source-map position of the last instruction in
+								// the skipped body. Detect: if the landing line matches any source
+								// line in the skipped PC range, it's an inherited/stale position.
+								if !isControlFlowOnly && currentPC > lastExecPC+1 && vm.prg.src != nil {
+									landingLine := currentLine
+									scanLimit := currentPC
+									if scanLimit > lastExecPC+64 {
+										scanLimit = lastExecPC + 64
+									}
+									for scanPC := lastExecPC + 1; scanPC < scanLimit; scanPC++ {
+										scanPos := vm.prg.src.Position(vm.prg.sourceOffset(scanPC))
+										if scanPos.Line == landingLine {
+											isControlFlowOnly = true
+											if debugVM {
+												fmt.Printf("[VM-STEPIN-CJUMP] Conditional jump from PC=%d landed at PC=%d (line %d) — line matches skipped body PC=%d, marking as control-flow-only\n",
+													lastExecPC, currentPC, landingLine, scanPC)
+											}
+											break
+										}
+									}
+								}
 							}
 						}
 
@@ -1493,6 +1516,31 @@ func (vm *vm) debug() {
 										switch vm.prg.code[nextPC].(type) {
 										case try, *enterCatchBlock, enterFinally:
 											isControlFlowOnly = true
+										}
+									}
+								}
+								// When a conditional jump takes a forward jump (skipping an
+								// if-body because the condition is false), the landing instruction
+								// may inherit the source-map position of the last instruction in
+								// the skipped body. Detect: if the landing line matches any source
+								// line in the skipped PC range, it's an inherited/stale position.
+								// This does NOT affect else branches: else-body lines are distinct
+								// from if-body lines, so the landing line won't match.
+								if !isControlFlowOnly && currentPC > lastExecPC+1 && vm.prg.src != nil {
+									landingLine := currentLine
+									scanLimit := currentPC
+									if scanLimit > lastExecPC+64 {
+										scanLimit = lastExecPC + 64
+									}
+									for scanPC := lastExecPC + 1; scanPC < scanLimit; scanPC++ {
+										scanPos := vm.prg.src.Position(vm.prg.sourceOffset(scanPC))
+										if scanPos.Line == landingLine {
+											isControlFlowOnly = true
+											if debugVM {
+												fmt.Printf("[VM-STEPOVER-CJUMP] Conditional jump from PC=%d landed at PC=%d (line %d) — line matches skipped body PC=%d, marking as control-flow-only\n",
+													lastExecPC, currentPC, landingLine, scanPC)
+											}
+											break
 										}
 									}
 								}
