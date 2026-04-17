@@ -940,22 +940,27 @@ func (vm *vm) debug() {
 				// instead of calling HasAnyInitCompleted() again which acquires a redundant RLock.
 				anyInitCompleted := vm.debugger.initComplete
 
-				// Read step state from the appropriate source:
-				// - In multi-VU mode: per-VU step state (scoped to this VU only)
-				// - In single-VU mode: global step state (shared across VUs for lifecycle transitions)
+				// PERF: Atomic fast-path — skip the RLock-protected GetGlobalStepState /
+				// GetVUStepState entirely when no step state exists anywhere. This is the
+				// common case (99.9% of instructions between breakpoints) and eliminates
+				// 2 RLock acquisitions per instruction.
+				hasGlobalStep := false
 				var globalNext, globalStepIn bool
 				var globalSteppingFile string
 				var globalTargetDepth int
-				isMultiVU := GetGlobalCoordinator().IsMultiVUDebug()
+				isMultiVU := false
 
-				if isMultiVU {
-					// Per-VU step state: only inherit state set by this VU's own
-					// Next()/StepIn()/StepOut() call. Other VUs' step state is invisible.
-					globalNext, globalStepIn, globalSteppingFile, globalTargetDepth = GetGlobalCoordinator().GetVUStepState(vm.debugger.vuID)
-				} else {
-					globalNext, globalStepIn, globalSteppingFile, globalTargetDepth = GetGlobalCoordinator().GetGlobalStepState()
+				if GetGlobalCoordinator().HasAnyStepStateFast() {
+					// Step state exists somewhere — take the RLock to read it.
+					isMultiVU = GetGlobalCoordinator().IsMultiVUDebug()
+
+					if isMultiVU {
+						globalNext, globalStepIn, globalSteppingFile, globalTargetDepth = GetGlobalCoordinator().GetVUStepState(vm.debugger.vuID)
+					} else {
+						globalNext, globalStepIn, globalSteppingFile, globalTargetDepth = GetGlobalCoordinator().GetGlobalStepState()
+					}
+					hasGlobalStep = globalNext || globalStepIn
 				}
-				hasGlobalStep := globalNext || globalStepIn
 
 				// Allow step state inheritance if:
 				// - Init hasn't completed yet (early phase — stepping through init), OR
@@ -2172,6 +2177,15 @@ func (vm *vm) handleThrow(arg interface{}) *Exception {
 			throwFile = normalizeFilename(pos.Filename)
 			throwLine = pos.Line
 		}
+
+		// Capture the stash chain at the throw site BEFORE unwinding.
+		// handleThrow restores vm.stash from the try frame (tf.stash),
+		// losing all local variables at the throw point. Save them so
+		// buildPausedVarSnapshot can show throw-site variables when paused
+		// on an exception — matching Chrome DevTools / Node.js behaviour.
+		vm.debugger.exceptionStash = vm.stash
+		vm.debugger.exceptionSB = vm.sb
+		vm.debugger.exceptionPrg = vm.prg
 	}
 
 	for len(vm.tryStack) > 0 {
@@ -2333,27 +2347,38 @@ func (vm *vm) runTryInner() (ex *Exception) {
 						vm.debugger.pendingUncaughtException != nil, vm.debugger.inEvalContext)
 				}
 
-				vm.debugger.uncaughtExceptionExit = true
+				vm.debugger.uncaughtExceptionExit = !vm.debugger.inEvalContext
 
 				if debugActivate {
 					fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: closing vmDoneCh, vmExited=true\n")
 				}
-				vm.debugger.vmExited = true
-				if vm.debugger.vmDoneCh != nil {
-					select {
-					case <-vm.debugger.vmDoneCh:
-					default:
-						close(vm.debugger.vmDoneCh)
+				// CRITICAL: Do NOT mark the VM as exited when the exception
+				// originated inside a debugger eval (evaluateComplexExpression).
+				// Eval exceptions (e.g., ReferenceError for a variable preview)
+				// are caught by eval's own recovery handler and must not poison
+				// the real VM's lifecycle state.  Closing vmDoneCh here causes
+				// Continue() to think the VM terminated, breaking the entire
+				// debug session.
+				if !vm.debugger.inEvalContext {
+					vm.debugger.vmExited = true
+					if vm.debugger.vmDoneCh != nil {
+						select {
+						case <-vm.debugger.vmDoneCh:
+						default:
+							close(vm.debugger.vmDoneCh)
+						}
 					}
-				}
-				vm.debugger.next = false
-				vm.debugger.stepIn = false
-				GetGlobalCoordinator().ClearGlobalStepState()
-				if GetGlobalCoordinator().IsMultiVUDebug() {
-					GetGlobalCoordinator().ClearVUStepState(vm.debugger.vuID)
+					vm.debugger.next = false
+					vm.debugger.stepIn = false
+					GetGlobalCoordinator().ClearGlobalStepState()
+					if GetGlobalCoordinator().IsMultiVUDebug() {
+						GetGlobalCoordinator().ClearVUStepState(vm.debugger.vuID)
+					}
+				} else if debugActivate {
+					fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: SKIPPED vmExited/vmDoneCh (inEvalContext=true)\n")
 				}
 
-				if vm.debugger.exceptionWaitCh != nil {
+				if !vm.debugger.inEvalContext && vm.debugger.exceptionWaitCh != nil {
 					if debugActivate {
 						fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: BLOCKING on exceptionWaitCh — waiting for IDE user to dismiss\n")
 					}
@@ -7046,7 +7071,11 @@ func (_createArgsRestStash) exec(vm *vm) {
 type concatStrings int
 
 func (n concatStrings) exec(vm *vm) {
-	strs := vm.stack[vm.sp-int(n) : vm.sp]
+	low := vm.sp - int(n)
+	if low < 0 || low > vm.sp || vm.sp > len(vm.stack) {
+		panic(referenceError(fmt.Sprintf("internal: concatStrings stack underflow (sp=%d, n=%d, stackLen=%d)", vm.sp, int(n), len(vm.stack))))
+	}
+	strs := vm.stack[low:vm.sp]
 	length := 0
 	allAscii := true
 	for i, s := range strs {
