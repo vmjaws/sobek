@@ -497,8 +497,9 @@ func (f *baseJsFuncObject) __call(args []Value, newTarget, this Value) (Value, *
 		}
 	}
 
-	// ARROW-DEBUG: Log after the JS function returns
-	if vm.debugger != nil && debugVM {
+	// ARROW-DEBUG: Log after the JS function returns — only when step flags are active
+	// to avoid flooding the log with millions of entries during normal execution.
+	if vm.debugger != nil && debugVM && (vm.debugger.stepIn || vm.debugger.next) {
 		fmt.Printf("[ARROW-DEBUG] __call returned from JS func: stepIn=%v, next=%v, depth=%d\n",
 			vm.debugger.stepIn, vm.debugger.next, len(vm.callStack))
 	}

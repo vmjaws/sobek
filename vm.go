@@ -739,8 +739,10 @@ func (vm *vm) debug() {
 		if vm.prg != nil && vm.prg.src != nil {
 			srcName = vm.prg.src.Name()
 		}
-		fmt.Printf("[VM-DEBUG-ENTRY] debug() entered: func=%q, file=%s, PC=%d, next=%v, stepIn=%v, suppress=%v, depth=%d\n",
+		if debugVM {
+			fmt.Printf("[VM-DEBUG-ENTRY] debug() entered: func=%q, file=%s, PC=%d, next=%v, stepIn=%v, suppress=%v, depth=%d\n",
 			funcName, srcName, vm.pc, vm.debugger.next, vm.debugger.stepIn, vm.debugger.suppressDebugger, vm.debugger.callStackDepth())
+		}
 	}
 	if vm.profTracker != nil && !vm.runWithProfiler() {
 		return
@@ -757,10 +759,12 @@ func (vm *vm) debug() {
 		if vm.prg != nil {
 			funcName = string(vm.prg.funcName)
 		}
-		fmt.Printf("[ARROW-DEBUG] debug() entered at PC=0: func=%q, file=%s, stepIn=%v, next=%v, depth=%d, lastBP={file=%s, line=%d, pc=%d, depth=%d}, suppressDebugger=%v\n",
+		if debugVM {
+			fmt.Printf("[ARROW-DEBUG] debug() entered at PC=0: func=%q, file=%s, stepIn=%v, next=%v, depth=%d, lastBP={file=%s, line=%d, pc=%d, depth=%d}, suppressDebugger=%v\n",
 			funcName, srcName, vm.debugger.stepIn, vm.debugger.next, len(vm.callStack),
 			vm.debugger.lastBreakpoint.filename, vm.debugger.lastBreakpoint.line, vm.debugger.lastBreakpoint.pc, vm.debugger.lastBreakpoint.stackDepth,
 			vm.debugger.suppressDebugger)
+		}
 	}
 
 	count := 0
@@ -1005,6 +1009,12 @@ func (vm *vm) debug() {
 				hasBreakpoint := false
 				if !skipBreakpoints {
 					hasBreakpoint = vm.debugger.breakpoint()
+				} else if vm.debugger.breakpointCheckCount < 3 {
+					vm.debugger.breakpointCheckCount++
+					if debugVM {
+						fmt.Printf("[BP-TRACE] SKIPPED breakpoint() call: skipBreakpoints=true, initPhase=%v, initComplete=%v, normFile=%q\n",
+						vm.debugger.initPhase, vm.debugger.initComplete, vm.debugger.cachedNormFile)
+					}
 				}
 
 				// Skip breaking at module entry point (PC=0) when we just inherited step state.
@@ -1036,6 +1046,26 @@ func (vm *vm) debug() {
 					// For regular breakpoint: always break if location changed
 					shouldBreak := false
 					breakReason := ""
+
+					// FIX: Check if current line is suppressed due to inherited position
+					// from a skipped if-body. When a conditional jump skips a block, the
+					// instructions after the block inherit the source position of the last
+					// statement in the block. We suppress ALL breaks at that line until
+					// execution moves to a different line.
+					suppressedByInheritedLine := false
+					if vm.debugger.suppressedInheritedLine > 0 {
+						if currentLine == vm.debugger.suppressedInheritedLine && normalizedCurrentFilename == vm.debugger.suppressedInheritedFile {
+							suppressedByInheritedLine = true
+							fmt.Printf("[VM-SUPPRESS] Suppressing line %d (PC=%d) in %s — inherited from skipped if-body (suppressedInheritedLine=%d)\n",
+								currentLine, currentPC, normalizedCurrentFilename, vm.debugger.suppressedInheritedLine)
+						} else {
+							fmt.Printf("[VM-SUPPRESS] Clearing suppressedInheritedLine=%d (was for %s), now at line %d in %s\n",
+								vm.debugger.suppressedInheritedLine, vm.debugger.suppressedInheritedFile, currentLine, normalizedCurrentFilename)
+							// Line changed — clear the suppression
+							vm.debugger.suppressedInheritedLine = 0
+							vm.debugger.suppressedInheritedFile = ""
+						}
+					}
 
 					// CRITICAL: Check if current file is a "user file" (has breakpoints or is the stepping source)
 					// This prevents stepping through internal k6 code like handleSummary
@@ -1283,6 +1313,8 @@ func (vm *vm) debug() {
 										scanPos := vm.prg.src.Position(vm.prg.sourceOffset(scanPC))
 										if scanPos.Line == landingLine {
 											isControlFlowOnly = true
+											vm.debugger.suppressedInheritedLine = landingLine
+											vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
 											if debugVM {
 												fmt.Printf("[VM-STEPIN-CJUMP] Conditional jump from PC=%d landed at PC=%d (line %d) — line matches skipped body PC=%d, marking as control-flow-only\n",
 													lastExecPC, currentPC, landingLine, scanPC)
@@ -1294,8 +1326,33 @@ func (vm *vm) debug() {
 							}
 						}
 
-						shouldBreak = pcAdvanced && lineChanged && vmInValidState && isUserFile && !isControlFlowOnly
+						shouldBreak = pcAdvanced && lineChanged && vmInValidState && isUserFile && !isControlFlowOnly && !suppressedByInheritedLine
 						breakReason = "stepIn"
+
+						// FIX: Also check inherited position for step-in (same as step-over).
+						if shouldBreak && currentPC > 0 && lastExecPC >= 0 && currentPC > lastExecPC+1 && vm.prg.src != nil {
+							prevInstrLine := vm.prg.src.Position(vm.prg.sourceOffset(currentPC - 1)).Line
+							if prevInstrLine == currentLine {
+								shouldBreak = false
+								breakReason = "stepIn-inherited-pos-after-jump"
+								vm.debugger.suppressedInheritedLine = currentLine
+								vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
+								fmt.Printf("[VM-STEPIN-SKIP] Skipping step-in break at line %d (PC=%d): reached via forward jump from lastExecPC=%d, prev bytecode (PC=%d) has same source line\n",
+									currentLine, currentPC, lastExecPC, currentPC-1)
+							}
+						}
+
+						// DIAGNOSTIC: Log when step-in would break near an if-body to trace false breaks
+						if shouldBreak && vm.debugger.enableDebugLogging && lastExecPC >= 0 && currentPC > lastExecPC+1 {
+							lastExecInstrType := fmt.Sprintf("%T", vm.prg.code[lastExecPC])
+							curInstrType := fmt.Sprintf("%T", vm.prg.code[currentPC])
+							prevBytecodeLineStr := "N/A"
+							if currentPC > 0 && vm.prg.src != nil {
+								prevBytecodeLineStr = fmt.Sprintf("%d", vm.prg.src.Position(vm.prg.sourceOffset(currentPC-1)).Line)
+							}
+							fmt.Printf("[VM-STEPIN-DIAG] STEPIN WILL FIRE after forward jump: line=%d, PC=%d, lastExecPC=%d, gap=%d, curInstr=%s, lastExecInstr=%s, prevBytecodeLine=%s, isControlFlowOnly=%v, file=%s\n",
+								currentLine, currentPC, lastExecPC, currentPC-lastExecPC, curInstrType, lastExecInstrType, prevBytecodeLineStr, isControlFlowOnly, currentFilename)
+						}
 
 						// FIX: Skip sub-expressions in multi-line call expressions (stepIn).
 						// Two-level guard:
@@ -1541,6 +1598,10 @@ func (vm *vm) debug() {
 										scanPos := vm.prg.src.Position(vm.prg.sourceOffset(scanPC))
 										if scanPos.Line == landingLine {
 											isControlFlowOnly = true
+											// Remember this line so subsequent instructions
+											// with the same inherited position are also suppressed
+											vm.debugger.suppressedInheritedLine = landingLine
+											vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
 											if debugVM {
 												fmt.Printf("[VM-STEPOVER-CJUMP] Conditional jump from PC=%d landed at PC=%d (line %d) — line matches skipped body PC=%d, marking as control-flow-only\n",
 													lastExecPC, currentPC, landingLine, scanPC)
@@ -1552,29 +1613,39 @@ func (vm *vm) debug() {
 							}
 						}
 
-						shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState && isUserFile && !isControlFlowOnly
+						shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState && isUserFile && !isControlFlowOnly && !suppressedByInheritedLine
 						breakReason = "next"
 
-						// DIAGNOSTIC: Log every instruction where lineChanged is true during step-over
-						// to trace exactly why the false break at catch-block lines happens.
-						if lineChanged && pcAdvanced && isUserFile && debugVM {
-							lastExecInstrType := "N/A"
-							if lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
-								lastExecInstrType = fmt.Sprintf("%T", vm.prg.code[lastExecPC])
+						// FIX: Also check inherited position for step-over.
+						// The isControlFlowOnly scan above catches the FIRST instruction
+						// after a conditional jump, but subsequent instructions at the
+						// jump target may also have inherited source positions. Check
+						// if we reached this PC via a forward jump and the previous
+						// bytecode has the same source line (inherited position).
+						if shouldBreak && currentPC > 0 && lastExecPC >= 0 && currentPC > lastExecPC+1 && vm.prg.src != nil {
+							prevInstrLine := vm.prg.src.Position(vm.prg.sourceOffset(currentPC - 1)).Line
+							if prevInstrLine == currentLine {
+								shouldBreak = false
+								breakReason = "next-inherited-pos-after-jump"
+								vm.debugger.suppressedInheritedLine = currentLine
+								vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
+								fmt.Printf("[VM-STEPOVER-SKIP] Skipping step-over break at line %d (PC=%d): reached via forward jump from lastExecPC=%d, prev bytecode (PC=%d) has same source line\n",
+									currentLine, currentPC, lastExecPC, currentPC-1)
 							}
-							currentInstrType := "N/A"
-							if currentPC >= 0 && currentPC < len(vm.prg.code) {
-								currentInstrType = fmt.Sprintf("%T", vm.prg.code[currentPC])
-							}
-							nextAfterLastExec := "N/A"
-							if lastExecPC >= 0 && lastExecPC+1 < len(vm.prg.code) {
-								nextAfterLastExec = fmt.Sprintf("%T", vm.prg.code[lastExecPC+1])
-							}
-							fmt.Printf("[VM-STEPOVER-DIAG] PC=%d(line %d) lastExecPC=%d, curInstr=%s, lastExecInstr=%s, lastExec+1=%s, isControlFlow=%v, atDepth=%v(%d<=%d), vmValid=%v, stepOverLastPC=%d, shouldBreak=%v\n",
-								currentPC, currentLine, lastExecPC, currentInstrType, lastExecInstrType, nextAfterLastExec,
-								isControlFlowOnly, atValidDepth, currentStackDepth, vm.debugger.stepOverTargetDepth, vmInValidState,
-								vm.debugger.stepOverLastPC, shouldBreak)
 						}
+
+						// DIAGNOSTIC: Log when step-over would break after a forward jump
+						if shouldBreak && vm.debugger.enableDebugLogging && lastExecPC >= 0 && currentPC > lastExecPC+1 {
+							lastExecInstrType := fmt.Sprintf("%T", vm.prg.code[lastExecPC])
+							curInstrType := fmt.Sprintf("%T", vm.prg.code[currentPC])
+							prevBytecodeLineStr := "N/A"
+							if currentPC > 0 && vm.prg.src != nil {
+								prevBytecodeLineStr = fmt.Sprintf("%d", vm.prg.src.Position(vm.prg.sourceOffset(currentPC-1)).Line)
+							}
+							fmt.Printf("[VM-STEPOVER-FWDJUMP] STEPOVER WILL FIRE after forward jump: line=%d, PC=%d, lastExecPC=%d, gap=%d, curInstr=%s, lastExecInstr=%s, prevBytecodeLine=%s, isControlFlowOnly=%v, file=%s\n",
+								currentLine, currentPC, lastExecPC, currentPC-lastExecPC, curInstrType, lastExecInstrType, prevBytecodeLineStr, isControlFlowOnly, currentFilename)
+						}
+
 
 						// FIX: Skip sub-expressions in multi-line call expressions.
 						// When stepping over from line N, the compiler may emit bytecodes
@@ -1672,55 +1743,60 @@ func (vm *vm) debug() {
 						breakReason = "breakpoint"
 					}
 
-					// FIX: Skip breakpoints at implicit return instructions whose source
-					// position was inherited from code inside a skipped if-body (or other
-					// jumped-over block). The compiler emits _loadUndef + _ret at the end
-					// of functions without an explicit return; these instructions inherit
-					// the source position of the last compiled statement. When the last
-					// statement is inside an if-body that was skipped by a conditional
-					// jump, the implicit return's source line points to code that never
-					// executed — causing false breakpoint hits.
+					// Also suppress if this line was already identified as inherited
+					if suppressedByInheritedLine {
+						shouldBreak = false
+						breakReason = "suppressed-inherited-line"
+					}
+
+					// FIX: Skip breakpoints/steps at ANY instruction whose source position
+					// was inherited from code inside a skipped block (if-body, else-body,
+					// loop body, etc.).
 					//
-					// Detection: _loadUndef followed by _ret (implicit return pattern),
-					// reached via a forward conditional/unconditional jump (gap between
-					// lastExecPC and currentPC), AND the bytecode immediately before the
-					// _loadUndef maps to the same source line (confirming position inheritance
-					// from the skipped block's last instruction).
+					// When the compiler emits bytecodes, instructions without explicit source
+					// positions inherit the position of the last instruction that had one.
+					// If the last compiled statement is inside an if-body, instructions emitted
+					// AFTER that body (implicit returns, next statements, etc.) inherit the
+					// source line of that last body statement.
 					//
-					// This does NOT affect explicit `return;` statements: those are reached
-					// sequentially (lastExecPC + 1 == currentPC, no gap), so the check
-					// doesn't trigger.
-					if shouldBreak && currentPC >= 0 && currentPC < len(vm.prg.code) {
-						switch vm.prg.code[currentPC].(type) {
-						case _loadUndef:
-							nextPC := currentPC + 1
-							if nextPC < len(vm.prg.code) {
-								if _, isRet := vm.prg.code[nextPC].(_ret); isRet {
-									// _loadUndef + _ret = implicit/explicit return pattern.
-									// Check if reached via a forward jump (gap in PCs) and
-									// the previous bytecode shares the same source line
-									// (confirming the position was inherited).
-									if currentPC > 0 && lastExecPC >= 0 && currentPC > lastExecPC+1 {
-										prevInstrLine := vm.prg.src.Position(vm.prg.sourceOffset(currentPC - 1)).Line
-										if prevInstrLine == currentLine {
-											shouldBreak = false
-											breakReason = "implicit-return-inherited-pos"
-										}
-									}
-								}
-							}
-						case _ret:
-							// _ret preceded by _loadUndef: second half of the implicit
-							// return pair. If the _loadUndef breakpoint fired, sameLine
-							// catches _ret. If _loadUndef was skipped (control flow),
-							// _ret should also be skipped. Safe to always skip here.
-							if currentPC > 0 {
-								if _, isLU := vm.prg.code[currentPC-1].(_loadUndef); isLU {
-									shouldBreak = false
-									breakReason = "implicit-return-ret"
-								}
-							}
+					// When the if-condition is false, the conditional jump skips the body and
+					// lands on these inherited-position instructions. If the user has a
+					// breakpoint on that inherited line (or is stepping), the debugger falsely
+					// pauses — the IDE shows "I'm at line X inside the if-body" even though
+					// the body was never entered.
+					//
+					// Detection: current PC was reached via a forward jump (gap between
+					// lastExecPC and currentPC > 1), AND the bytecode immediately before the
+					// current PC maps to the same source line (confirming position inheritance
+					// from the skipped block's last compiled instruction).
+					//
+					// This does NOT affect code reached sequentially (lastExecPC + 1 == currentPC),
+					// so explicit statements on the same line are not suppressed.
+					if shouldBreak && currentPC > 0 && lastExecPC >= 0 && currentPC > lastExecPC+1 && vm.prg.src != nil {
+						prevInstrLine := vm.prg.src.Position(vm.prg.sourceOffset(currentPC - 1)).Line
+						if prevInstrLine == currentLine {
+							shouldBreak = false
+							breakReason = "inherited-pos-after-jump"
+							vm.debugger.suppressedInheritedLine = currentLine
+							vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
+							fmt.Printf("[VM-BP-SKIP] Skipping break at line %d (PC=%d): reached via forward jump from lastExecPC=%d, prev bytecode (PC=%d) has same source line (inherited position)\n",
+								currentLine, currentPC, lastExecPC, currentPC-1)
 						}
+					}
+					// DIAGNOSTIC: Log when breakpoint fires at a line that was reached via forward jump
+					// to diagnose cases where inherited-pos-after-jump didn't trigger
+					if shouldBreak && vm.debugger.enableDebugLogging {
+						curInstrType := fmt.Sprintf("%T", vm.prg.code[currentPC])
+						lastExecInstrType := "N/A"
+						if lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
+							lastExecInstrType = fmt.Sprintf("%T", vm.prg.code[lastExecPC])
+						}
+						prevBytecodeLineStr := "N/A"
+						if currentPC > 0 && vm.prg.src != nil {
+							prevBytecodeLineStr = fmt.Sprintf("%d", vm.prg.src.Position(vm.prg.sourceOffset(currentPC-1)).Line)
+						}
+						fmt.Printf("[VM-BP-DIAG] BREAKPOINT WILL FIRE: line=%d, PC=%d, lastExecPC=%d, gap=%d, curInstr=%s, lastExecInstr=%s, prevBytecodeLine=%s, file=%s\n",
+							currentLine, currentPC, lastExecPC, currentPC-lastExecPC, curInstrType, lastExecInstrType, prevBytecodeLineStr, currentFilename)
 					}
 
 					// Clear continuing unconditionally — it's now redundant with the line check
@@ -1744,7 +1820,24 @@ func (vm *vm) debug() {
 						}
 					}
 
-					if shouldBreak {
+						if shouldBreak {
+						// DIAGNOSTIC: Log ALL breaks with forward-jump info
+						if vm.debugger.enableDebugLogging {
+							lastExecInstrType := "N/A"
+							if lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
+								lastExecInstrType = fmt.Sprintf("%T", vm.prg.code[lastExecPC])
+							}
+							curInstrType := "N/A"
+							if currentPC >= 0 && currentPC < len(vm.prg.code) {
+								curInstrType = fmt.Sprintf("%T", vm.prg.code[currentPC])
+							}
+							prevBytecodeLineStr := "N/A"
+							if currentPC > 0 && vm.prg.src != nil {
+								prevBytecodeLineStr = fmt.Sprintf("%d", vm.prg.src.Position(vm.prg.sourceOffset(currentPC-1)).Line)
+							}
+							fmt.Printf("[VM-BREAK-TRACE] WILL BREAK: reason=%s, line=%d, PC=%d, lastExecPC=%d, gap=%d, curInstr=%s, lastExecInstr=%s, prevBytecodeLine=%s, hasBreakpoint=%v, file=%s\n",
+								breakReason, currentLine, currentPC, lastExecPC, currentPC-lastExecPC, curInstrType, lastExecInstrType, prevBytecodeLineStr, hasBreakpoint, currentFilename)
+						}
 						// SKIP-PHASE-ENTRY: When RunOnce() enabled stepIn for a lifecycle
 						// transition AND set skipPhaseEntryBreak, don't stop at the
 						// function-signature line (PC=0).  Record the position so that
@@ -1768,12 +1861,18 @@ func (vm *vm) debug() {
 						if vm.debugger.enableDebugLogging {
 							// Clarify when we stopped due to step command but there's also a breakpoint here
 							if hasBreakpoint && (breakReason == "next" || breakReason == "stepIn") {
-								fmt.Printf("[VM] BREAKING at line %d (PC=%d), reason=%s (NOTE: also has breakpoint, step takes precedence)\n", currentLine, currentPC, breakReason)
+								if debugVM {
+									fmt.Printf("[VM] BREAKING at line %d (PC=%d), reason=%s (NOTE: also has breakpoint, step takes precedence)\n", currentLine, currentPC, breakReason)
+								}
 							} else if breakReason == "next" {
-								fmt.Printf("[VM] BREAKING at line %d (PC=%d), reason=%s (step-over from line %d completed)\n",
+								if debugVM {
+									fmt.Printf("[VM] BREAKING at line %d (PC=%d), reason=%s (step-over from line %d completed)\n",
 									currentLine, currentPC, breakReason, vm.debugger.stepOverStartLine)
+								}
 							} else {
-								fmt.Printf("[VM] BREAKING at line %d (PC=%d), reason=%s\n", currentLine, currentPC, breakReason)
+								if debugVM {
+									fmt.Printf("[VM] BREAKING at line %d (PC=%d), reason=%s\n", currentLine, currentPC, breakReason)
+								}
 							}
 						}
 						vm.debugger.lastBreakpoint.filename = currentFilename
@@ -1797,6 +1896,8 @@ func (vm *vm) debug() {
 						vm.debugger.stepInLastPCPrg = nil // Clear stepIn program reference
 						vm.debugger.stepInStartLine = 0   // Clear stepIn start line
 						vm.debugger.continuing = false    // Clear continuing flag when we break
+						vm.debugger.suppressedInheritedLine = 0 // Clear inherited-line suppression
+						vm.debugger.suppressedInheritedFile = ""
 						// NOTE: Do NOT clear global step state here! The activate() function reads and
 						// clears it after applying it. Clearing here would race with activate() and
 						// cause the global step state (e.g., set by EnableStepIn() for lifecycle transitions)
@@ -1949,8 +2050,10 @@ func (vm *vm) debug() {
 		// during handleSummary text rendering (hundreds of function calls at depth 5-16)
 		depth := vm.debugger.callStackDepth()
 		if depth <= 2 {
-			fmt.Printf("[VM-EXIT] VM exited normally (no step active, next=%v, stepIn=%v, depth=%d)\n",
+			if debugVM {
+				fmt.Printf("[VM-EXIT] VM exited normally (no step active, next=%v, stepIn=%v, depth=%d)\n",
 				vm.debugger.next, vm.debugger.stepIn, depth)
+			}
 		}
 	}
 
@@ -4163,8 +4266,12 @@ type getPropCallee unistring.String
 
 func (g getPropCallee) exec(vm *vm) {
 	v := vm.stack[vm.sp-1]
-	obj := v.baseObject(vm.r)
 	n := unistring.String(g)
+	if v == nil {
+		vm.throw(vm.r.NewTypeError("Cannot read property '%s' of undefined or null", n))
+		return
+	}
+	obj := v.baseObject(vm.r)
 	if obj == nil {
 		vm.throw(vm.r.NewTypeError("Cannot read property '%s' of undefined or null", n))
 		return
@@ -4678,11 +4785,15 @@ func (g loadStashLex) exec(vm *vm) {
 			if vm.prg != nil && vm.prg.src != nil {
 				srcName = vm.prg.src.Name()
 			}
-			fmt.Printf("[LOADSTASHLEX-TDZ] level=%d, idx=%d, stashLen=%d, pc=%d, src=%s\n",
+			if debugCompiler {
+				fmt.Printf("[LOADSTASHLEX-TDZ] level=%d, idx=%d, stashLen=%d, pc=%d, src=%s\n",
 				level, idx, len(stash.values), vm.pc, srcName)
+			}
 			if stash.names != nil {
 				for name, sidx := range stash.names {
-					fmt.Printf("[LOADSTASHLEX-TDZ]   stash name=%s idx=%d\n", name, sidx)
+					if debugCompiler {
+						fmt.Printf("[LOADSTASHLEX-TDZ]   stash name=%s idx=%d\n", name, sidx)
+					}
 				}
 			}
 		}
@@ -5280,6 +5391,43 @@ func (numargs call) exec(vm *vm) {
 	v := vm.stack[vm.sp-n-1] // callee
 	obj := vm.toCallee(v)
 
+	// DEBUG: Log when calling a non-function object in debug mode
+	if vm.debugMode {
+		if _, ok := obj.self.assertCallable(); !ok {
+			posFile := ""
+			posLine := 0
+			if vm.prg != nil && vm.prg.src != nil {
+				pos := vm.prg.src.Position(vm.prg.sourceOffset(vm.pc))
+				posFile = pos.Filename
+				posLine = pos.Line
+			}
+			if debugVM {
+				fmt.Printf("[CALL-DEBUG] About to call non-function: %s (%T) at %s:%d (pc=%d, numargs=%d)\n",
+				obj.String(), obj.self, posFile, posLine, vm.pc, n)
+			}
+			// Print the bytecode around the call site
+			if vm.prg != nil {
+				start := vm.pc - 5
+				if start < 0 {
+					start = 0
+				}
+				end := vm.pc + 3
+				if end > len(vm.prg.code) {
+					end = len(vm.prg.code)
+				}
+				for i := start; i < end; i++ {
+					marker := " "
+					if i == vm.pc {
+						marker = ">"
+					}
+					if debugVM {
+						fmt.Printf("[CALL-DEBUG] %s [%d] %T\n", marker, i, vm.prg.code[i])
+					}
+				}
+			}
+		}
+	}
+
 	obj.self.vmCall(vm, n)
 }
 
@@ -5483,6 +5631,21 @@ func (e *enterFunc) exec(vm *vm) {
 		vv[i] = nil
 	}
 	vm.sp = sp + ss
+
+	// DEBUG FIX: In debug mode, the compiler moves the " this" binding to stash
+	// (allInStash=true rewrites loadStack→loadStash). But enterFunc only copies
+	// args to stash (when argsToStash=true), NOT 'this' (which lives at vm.sb).
+	// Without this, class methods see 'this' as undefined because the stash slot
+	// is never initialized.
+	if vm.debugMode && e.names != nil {
+		if thisIdx, ok := e.names[unistring.String(thisBindingName)]; ok {
+			idx := thisIdx & 0x00FFFFFF
+			if int(idx) < len(stash.values) && stash.values[idx] == nil {
+				stash.initByIdx(idx, vm.stack[vm.sb])
+			}
+		}
+	}
+
 	vm.pc++
 }
 
@@ -5542,6 +5705,16 @@ func (e *enterFunc1) exec(vm *vm) {
 		}
 	}
 
+	// DEBUG FIX: Same as enterFunc — copy 'this' from stack to stash in debug mode.
+	if vm.debugMode && e.names != nil {
+		if thisIdx, ok := e.names[unistring.String(thisBindingName)]; ok {
+			idx := thisIdx & 0x00FFFFFF
+			if int(idx) < len(stash.values) && stash.values[idx] == nil {
+				stash.initByIdx(idx, vm.stack[vm.sb])
+			}
+		}
+	}
+
 	vm.pc++
 }
 
@@ -5597,6 +5770,18 @@ func (e *enterFuncBody) exec(vm *vm) {
 		}
 	}
 	vm.sp = nsp
+
+	// DEBUG FIX: Same as enterFunc — copy 'this' from stack to stash in debug mode.
+	if vm.debugMode && e.names != nil {
+		stash := vm.stash
+		if thisIdx, ok := e.names[unistring.String(thisBindingName)]; ok {
+			idx := thisIdx & 0x00FFFFFF
+			if int(idx) < len(stash.values) && stash.values[idx] == nil {
+				stash.initByIdx(idx, vm.stack[vm.sb])
+			}
+		}
+	}
+
 	vm.pc++
 }
 

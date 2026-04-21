@@ -23,11 +23,29 @@ type SourceTextModuleInstance struct {
 }
 
 func (s *SourceTextModuleInstance) ExecuteModule(rt *Runtime, res, rej func(interface{}) error) (CyclicModuleInstance, error) {
+	// If the debugger is active, suppress it during module body execution.
+	// The module body must run synchronously to completion (for non-TLA modules)
+	// so the promise resolves. If the debugger pauses mid-execution, the promise
+	// stays Pending and we panic at the state check below.
+	// User breakpoints in module-level code will still be hit when the module's
+	// exported functions are called (setup, default, teardown).
+	if rt.vm.debugMode && rt.vm.debugger != nil && !rt.vm.debugger.suppressDebugger {
+		rt.vm.debugger.suppressDebugger = true
+		rt.vm.debugger.suppressDebugDepth++
+		defer func() {
+			rt.vm.debugger.suppressDebugDepth--
+			if rt.vm.debugger.suppressDebugDepth == 0 {
+				rt.vm.debugger.suppressDebugger = false
+			}
+		}()
+	}
+
 	promiseP := s.pcap.promise.self.(*Promise)
 	if len(promiseP.fulfillReactions) == 1 {
 		ar := promiseP.fulfillReactions[0].asyncRunner
 		_ = ar.onFulfilled(FunctionCall{Arguments: []Value{_undefined}})
 	}
+
 
 	promise := s.asyncPromise
 	if !s.HasTLA() {

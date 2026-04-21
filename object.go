@@ -922,6 +922,26 @@ func (o *baseObject) assertCallable() (func(FunctionCall) Value, bool) {
 }
 
 func (o *baseObject) vmCall(vm *vm, _ int) {
+	if vm.debugMode && vm.prg != nil && vm.prg.src != nil {
+		pos := vm.prg.src.Position(vm.prg.sourceOffset(vm.pc))
+		if debugVM {
+			fmt.Printf("[VMCALL-ERROR] Not a function: %s at %s:%d (pc=%d, sp=%d, callDepth=%d)\n",
+			o.val.toString(), pos.Filename, pos.Line, vm.pc, vm.sp, len(vm.callStack))
+		}
+		// Dump the callee and a few stack entries for context
+		for i := vm.sp - 1; i >= 0 && i >= vm.sp-5; i-- {
+			v := vm.stack[i]
+			if v != nil {
+				if debugVM {
+					fmt.Printf("[VMCALL-ERROR]   stack[%d] = %T: %s\n", i, v, v.String())
+				}
+			} else {
+				if debugVM {
+					fmt.Printf("[VMCALL-ERROR]   stack[%d] = <nil>\n", i)
+				}
+			}
+		}
+	}
 	panic(vm.r.NewTypeError("Not a function: %s", o.val.toString()))
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -1041,8 +1042,11 @@ type Debugger struct {
 	stepInLastPCPrg             *Program // the program stepInLastPC was computed for; guard is invalid in any other program
 	stepInStartLine             int // the line where the current stepIn operation began
 	stepOverMissCount           int // safety counter: instructions with startLine=0 and no valid currentLine
+	suppressedInheritedLine     int // line to suppress after detecting inherited position from skipped if-body
+	suppressedInheritedFile     string // file for the suppressed line (to avoid cross-file suppression)
 	steppingFilename            string
 	enableDebugLogging          bool
+	breakpointCheckCount        int // TEMP: counter for debug logging
 	skipPhaseEntryBreak         bool
 	lifecycleTransition         bool
 	userCommandIssued           bool
@@ -1302,10 +1306,14 @@ func newDebugger(vm *vm) *Debugger {
 	dbg.lastBreakpoint.pc = -1
 	if debugActivate {
 		if inheritConnection {
-			fmt.Printf("[DEBUGGER] New debugger inherited global connection status: %v\n", inheritConnection)
+			if debugActivate {
+				fmt.Printf("[DEBUGGER] New debugger inherited global connection status: %v\n", inheritConnection)
+			}
 		} else {
-			fmt.Printf("[DEBUGGER] New debugger NOT inheriting connection (globalInitialized=%v, inheritConnection=%v)\n",
+			if debugActivate {
+				fmt.Printf("[DEBUGGER] New debugger NOT inheriting connection (globalInitialized=%v, inheritConnection=%v)\n",
 				globalInitialized, inheritConnection)
+			}
 		}
 	}
 	return dbg
@@ -1709,8 +1717,10 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 	id := 0
 	if debugActivate {
 		channelWait := time.Since(activateStart)
-		fmt.Printf("[DEBUGGER-ACTIVATE] Channel handshake completed in %dms at %s:%d\n",
+		if debugActivate {
+			fmt.Printf("[DEBUGGER-ACTIVATE] Channel handshake completed in %dms at %s:%d\n",
 			channelWait.Milliseconds(), filename, line)
+		}
 	}
 	if reason != DebuggerStatementActivation {
 		id = globalBreakpoints.GetBreakpointID(filename, line)
@@ -1966,8 +1976,10 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 
 	if debugActivate {
 		totalActivate := time.Since(activateStart)
-		fmt.Printf("[DEBUGGER-ACTIVATE] Total activate() time: %dms at %s:%d\n",
+		if debugActivate {
+			fmt.Printf("[DEBUGGER-ACTIVATE] Total activate() time: %dms at %s:%d\n",
 			totalActivate.Milliseconds(), filename, line)
+		}
 	}
 }
 
@@ -1997,6 +2009,10 @@ func safeCloseActivationCh(ch chan DebuggerActivation) {
 	}
 	// Use defer+recover to handle the race where another goroutine closes
 	// the channel between our check and our close() call.
+	// NOTE: The previous select{case <-ch / default: close(ch)} pattern had
+	// a TOCTOU race: another goroutine could close the channel between the
+	// default branch (channel is open) and the close() call, causing a panic.
+	// The recover-based approach is the only correct way to handle this in Go.
 	defer func() {
 		if r := recover(); r != nil {
 			if debugContinue {
@@ -2004,16 +2020,7 @@ func safeCloseActivationCh(ch chan DebuggerActivation) {
 			}
 		}
 	}()
-	// A closed channel returns immediately on receive; an open one enters default.
-	select {
-	case <-ch:
-		// Channel was already closed (or had a buffered value drained).
-		if debugContinue {
-			fmt.Printf("[DEBUGGER-SAFE-CLOSE] Channel already closed, skipping\n")
-		}
-	default:
-		close(ch)
-	}
+	close(ch)
 }
 
 // safeSendActivation sends an activation on ch, recovering gracefully if ch
@@ -2203,6 +2210,11 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 	isMultiVU := globalDebugCoordinator.IsMultiVUDebug()
 	// In multi-VU mode, use per-VU activation channel instead of the global one.
 	vuActivationCh := globalDebugCoordinator.GetVUActivationChannel(dbg.vuID)
+	// crossVUSent tracks whether we've already sent currentCh to the cross-VU
+	// channels. Prevents the localTimedOut loop from re-sending on every retry
+	// iteration, which causes thousands of "cross-VU fallback" log messages
+	// and wastes CPU draining/sending on channels that already have our entry.
+	crossVUSent := false
 
 	if debugContinue {
 		fmt.Printf("[DEBUGGER-CONTINUE] Loop init: localTimedOut=%v, isMultiVU=%v, vuID=%d, currentCh=%p, vuCh=%p, vmExited=%v\n",
@@ -2217,6 +2229,8 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 		// a nil channel and deadlocks.
 		if dbg.currentCh == nil {
 			dbg.currentCh = make(chan DebuggerActivation)
+			// Reset the sent flag so the new channel gets sent to cross-VU channels.
+			crossVUSent = false
 			if debugContinue {
 				fmt.Printf("[DEBUGGER-CONTINUE] currentCh was nil (phase transition?), recreated %p\n", dbg.currentCh)
 			}
@@ -2281,6 +2295,11 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 			// This ensures Continue() finds the debugger that is actually waiting,
 			// regardless of which VU it belongs to.
 			sent := false
+			// Only attempt cross-VU channel sends on the first iteration.
+			// After that, our currentCh is already in the target channel —
+			// re-sending would drain the previous entry and replace it,
+			// wasting CPU and flooding logs with "cross-VU fallback" messages.
+			if !crossVUSent {
 			if isMultiVU {
 				activeDbg := globalDebugCoordinator.GetActiveDebugger()
 				if activeDbg != nil && activeDbg != dbg && activeDbg.IsActive() {
@@ -2360,6 +2379,8 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 					}
 				}
 			}
+			crossVUSent = true
+			} // end if !crossVUSent
 			if activation, ok, _ := waitForActivation("global", true); ok {
 				return activation
 			}
@@ -3323,6 +3344,20 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 		globalDebugCoordinator.DrainVUActivationChannel(dbg.vuID)
 		globalDebugCoordinator.ClearVUStepState(dbg.vuID)
 	}
+	// RACE FIX: Close pendingCh and currentCh BEFORE nil-ing them.
+	// If Continue() is in-flight on another goroutine, it may have sent
+	// currentCh into an activation channel. When activate() receives it
+	// and tries to send, the channel must be closed (unblocking activate())
+	// rather than orphaned (causing activate() to block forever on a channel
+	// nobody reads from). safeCloseActivationCh handles double-close safely.
+	if dbg.pendingCh != nil {
+		if dbg.pendingCh != dbg.currentCh {
+			safeCloseActivationCh(dbg.pendingCh)
+		}
+	}
+	if dbg.currentCh != nil {
+		safeCloseActivationCh(dbg.currentCh)
+	}
 	dbg.pendingCh = nil
 	dbg.currentCh = nil
 
@@ -3436,6 +3471,13 @@ func (dbg *Debugger) ResetForNewRun() {
 	dbg.steppingFilename = ""
 	dbg.stepInLastPC = -1
 	dbg.stepInStartLine = 0
+
+	// CRITICAL: Reset suppression state. If a previous session crashed during
+	// ExecuteModule (onFulfilled panic) or a Go→JS callback, suppressDebugger
+	// could be stuck true. Without clearing it here, the new session would
+	// silently skip ALL breakpoints.
+	dbg.suppressDebugger = false
+	dbg.suppressDebugDepth = 0
 
 	// Breakpoint position cache
 	// FIX: pc must be -1 (not 0) so that pcAdvanced (currentPC != prevPC) is true
@@ -3573,6 +3615,11 @@ func (dbg *Debugger) breakpoint() bool {
 		dbg.hasGlobalBPs = globalBreakpoints.Count() > 0
 	}
 	if dbg.vm.prg == nil || (!dbg.hasLocalBPs && !dbg.hasGlobalBPs) {
+		if dbg.breakpointCheckCount <= 5 {
+			if debugBreakpoint {
+				fmt.Printf("[BP-TRACE] EARLY EXIT: prg=%v, hasLocal=%v, hasGlobal=%v\n", dbg.vm.prg != nil, dbg.hasLocalBPs, dbg.hasGlobalBPs)
+			}
+		}
 		return false
 	}
 
@@ -3586,6 +3633,16 @@ func (dbg *Debugger) breakpoint() bool {
 	// called there before breakpoint(), so we skip the redundant call here.
 	normalizedFilename := dbg.cachedNormFile
 	line := dbg.Line()
+
+	// TEMP DEBUG: Log the first 5 breakpoint checks to diagnose filename matching
+	if dbg.breakpointCheckCount < 5 {
+		dbg.breakpointCheckCount++
+		srcMapFile := dbg.cachedSrcMapFile
+		if debugBreakpoint {
+			fmt.Printf("[BP-TRACE] vuID=%d, normFile=%q, srcMapFile=%q, line=%d, hasLocal=%v, hasGlobal=%v, globalCount=%d\n",
+			dbg.vuID, normalizedFilename, srcMapFile, line, dbg.hasLocalBPs, dbg.hasGlobalBPs, globalBreakpoints.Count())
+		}
+	}
 
 	// Capture init filename lazily (same as before, but uses cached normalized form).
 	if dbg.initPhase && dbg.initFilename == "" && normalizedFilename != "" {
@@ -3652,6 +3709,13 @@ func (dbg *Debugger) breakpoint() bool {
 		if !found && srcMapFile != "" && srcMapFile != normalizedFilename {
 			found = globalBreakpoints.HasBreakpoint(srcMapFile, line)
 		}
+		// TEMP DEBUG: Log first few global BP checks
+		if dbg.breakpointCheckCount <= 10 {
+			if debugBreakpoint {
+				fmt.Printf("[BP-TRACE-MATCH] vuID=%d, normFile=%q, srcMap=%q, line=%d, found=%v\n",
+				dbg.vuID, normalizedFilename, srcMapFile, line, found)
+			}
+		}
 	}
 
 	if found && dbg.initPhase {
@@ -3676,9 +3740,13 @@ func (dbg *Debugger) breakpoint() bool {
 			skipReason = "step-in active (will break at new line)"
 		}
 		if willStop {
-			fmt.Printf("[BREAKPOINT-CHECK] ✅✅ BREAKPOINT HIT at line %d in '%s' - will activate debugger\n", line, dbg.cachedFilename)
+			if debugBreakpoint {
+				fmt.Printf("[BREAKPOINT-CHECK] ✅✅ BREAKPOINT HIT at line %d in '%s' - will activate debugger\n", line, dbg.cachedFilename)
+			}
 		} else {
-			fmt.Printf("[BREAKPOINT-CHECK] ⚠️ BREAKPOINT at line %d in '%s' - WILL BE SKIPPED (%s)\n", line, dbg.cachedFilename, skipReason)
+			if debugBreakpoint {
+				fmt.Printf("[BREAKPOINT-CHECK] ⚠️ BREAKPOINT at line %d in '%s' - WILL BE SKIPPED (%s)\n", line, dbg.cachedFilename, skipReason)
+			}
 		}
 	}
 
@@ -4478,7 +4546,9 @@ func (dbg *Debugger) buildSourceMapNameMapping() (genToOrig, origToGen map[strin
 	if debugCompiler && len(genToOrig) > 0 {
 		fmt.Printf("[DEBUGGER] Source map name mapping built: %d entries\n", len(genToOrig))
 		for gen, orig := range genToOrig {
-			fmt.Printf("[DEBUGGER]   %s → %s (original)\n", gen, orig)
+			if debugActivate {
+				fmt.Printf("[DEBUGGER]   %s → %s (original)\n", gen, orig)
+			}
 		}
 	}
 
@@ -4973,7 +5043,8 @@ func (dbg *Debugger) Evaluate(expr string) (Value, error) {
 
 	if isDotPropertyChain(expr) {
 		parts := strings.Split(expr, ".")
-		rootVal, err := dbg.getValue(parts[0])
+		root := parts[0]
+		rootVal, err := dbg.getValue(root)
 		if err == nil && rootVal != nil {
 			if _, isUnresolved := rootVal.(valueUnresolved); !isUnresolved {
 				// Wrap property access in withSuppressedDebugger — obj.Get()
@@ -4997,6 +5068,17 @@ func (dbg *Debugger) Evaluate(expr string) (Value, error) {
 				if result != nil {
 					return result, nil
 				}
+			}
+		}
+		// PERF: If the root identifier isn't in the paused var snapshot,
+		// it's not in scope — skip the expensive evaluateComplexExpression
+		// which would compile+run JS only to get a ReferenceError.
+		// This is critical for VS Code inline value preview (hover context)
+		// which sends hundreds of evaluate requests per pause.
+		snap := dbg.buildPausedVarSnapshot()
+		if snap != nil {
+			if _, found := snap[root]; !found {
+				return nil, fmt.Errorf("variable '%s' not found in current scope", root)
 			}
 		}
 	}
@@ -5161,6 +5243,13 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 	if dbg.vmResuming.Load() {
 		return nil, fmt.Errorf("cannot evaluate: VM is resuming")
 	}
+	// CRITICAL: Only allow eval when the debugger is paused (active=true).
+	// If the VM is running (not stopped at a breakpoint), eval would run
+	// on the same VM concurrently — corrupting stack, stash, pc, and
+	// causing nil pointer panics or wrong exceptions that kill the VU.
+	if !dbg.active {
+		return nil, fmt.Errorf("cannot evaluate: VM is not paused")
+	}
 	dbg.evalMutex.Lock()
 	defer dbg.evalMutex.Unlock()
 	// Track this operation so activate() waits for it before resuming.
@@ -5176,8 +5265,11 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 	}
 
 	// Try registry first (multi-scope eval for setup/teardown phases)
+	// PERF: Only use the registry for simple identifiers or dot-property roots.
+	// Complex expressions (function calls, array access, etc.) will never match
+	// a variable name in the registry — skip to avoid expensive phase iteration.
 	registry := GetGlobalRegistry()
-	if registry != nil {
+	if registry != nil && isSimpleIdentifier(expr) {
 		var result Value
 		var err error
 		func() {
@@ -5376,8 +5468,12 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 				} else {
 					evalErr = fmt.Errorf("evaluation panicked: %v", r)
 				}
-				if dbg.enableDebugLogging {
-					fmt.Printf("[DEBUGGER] evaluateComplexExpression: panicked: %v\n", r)
+				// Always log panics in eval (not just when enableDebugLogging)
+				// to diagnose nil pointer dereferences
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				if debugActivate {
+					fmt.Printf("[DEBUGGER] evaluateComplexExpression: panicked: %v\nStack:\n%s\n", r, buf[:n])
 				}
 			}
 		}()
@@ -5392,6 +5488,26 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		// instructions like concatStrings see a wrong sp and panic with
 		// "slice bounds out of range".
 		savedSP := vm.sp
+		savedResult := vm.result
+
+		// CRITICAL: Save the live stack values at and just below sp.
+		// The eval's pushCtx/push(funcObj)/push(nil) writes into stack slots
+		// starting at savedSP. If the eval's enterFunc/runTry modifies these
+		// slots and an exception causes incomplete cleanup, the paused program
+		// could read corrupted values when it resumes. Saving and restoring
+		// the stack region guarantees the paused program's live data is intact.
+		// We save up to 4 slots above sp as a safety margin for intermediate
+		// values that might be live on the stack during a mid-expression pause.
+		const stackGuardSlots = 4
+		stackGuardEnd := savedSP + stackGuardSlots
+		if stackGuardEnd > len(vm.stack) {
+			stackGuardEnd = len(vm.stack)
+		}
+		var savedStackRegion []Value
+		if stackGuardEnd > savedSP {
+			savedStackRegion = make([]Value, stackGuardEnd-savedSP)
+			copy(savedStackRegion, vm.stack[savedSP:stackGuardEnd])
+		}
 
 		// Save context — pushCtx saves prg, stash, pc, sb, args (NOT sp).
 		vm.pushCtx()
@@ -5432,6 +5548,15 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		// may have already adjusted sp unpredictably — using the saved value
 		// guarantees the main program resumes with its original stack intact.
 		vm.sp = savedSP
+		vm.result = savedResult
+
+		// Restore the stack region that the eval may have overwritten.
+		// This is critical for mid-expression pauses where intermediate
+		// values are live on the stack (e.g., after loadStash pushed a
+		// value but before the next instruction consumed it).
+		if savedStackRegion != nil {
+			copy(vm.stack[savedSP:savedSP+len(savedStackRegion)], savedStackRegion)
+		}
 
 		if ex != nil {
 			evalErr = ex
@@ -5622,6 +5747,22 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 	savedResult := dbg.vm.result
 	savedCallStackLen := len(dbg.vm.callStack)
 	savedStackLen := len(dbg.vm.stack)
+
+	// CRITICAL: Save the stack values at and around sp. Getter execution can
+	// modify stack slots that contain the paused program's live intermediate
+	// values (e.g., the result of loadStash before it's consumed by the next
+	// instruction). Without this, intermittent corruption occurs when a hover
+	// eval triggers a getter at a mid-expression pause point.
+	stackGuardEnd := savedSP + 4
+	if stackGuardEnd > savedStackLen {
+		stackGuardEnd = savedStackLen
+	}
+	var savedStackValues []Value
+	if stackGuardEnd > 0 {
+		// Save values from 0..stackGuardEnd to protect all live values
+		savedStackValues = make([]Value, stackGuardEnd)
+		copy(savedStackValues, dbg.vm.stack[:stackGuardEnd])
+	}
 
 	savedNext := dbg.next
 	savedStepIn := dbg.stepIn
@@ -6511,34 +6652,46 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 							return resolved, nil
 						}
 					}
-				} else {
-					for parent := s.outer; parent != nil; parent = parent.outer {
-						if parent.names != nil {
-							if parentRawIdx, exists := parent.names[name]; exists {
-								parentActualIdx := parentRawIdx & 0x00FFFFFF
-								if int(parentActualIdx) < len(parent.values) {
-									val := parent.values[parentActualIdx]
-									if val != nil {
-										if dbg.enableDebugLogging {
-											fmt.Printf("[DEBUGGER] getValue('%s'): Found non-indirect in parent stash, idx=%d\n", varName, parentActualIdx)
-										}
-										return val, nil
-									}
-								}
-							}
+			} else {
+				// Read from the stash where the name was found FIRST.
+				if int(actualIdx) >= 0 && int(actualIdx) < len(s.values) {
+					val := s.values[actualIdx]
+					if val != nil && !isNullValue(val) {
+						if dbg.enableDebugLogging {
+							fmt.Printf("[DEBUGGER] getValue('%s'): Found non-indirect in stash level %d, idx %d\n", varName, stashLevel, actualIdx)
 						}
-						if parent.obj != nil {
-							if !globalUnsafeKeys[varName] {
-								if v := safeGetGlobalProperty(parent.obj, name); v != nil {
+						return val, nil
+					}
+				}
+				// Value is nil in the current stash — check parent stashes
+				// (e.g., closure variable shadowed by an uninitialized let/const).
+				for parent := s.outer; parent != nil; parent = parent.outer {
+					if parent.names != nil {
+						if parentRawIdx, exists := parent.names[name]; exists {
+							parentActualIdx := parentRawIdx & 0x00FFFFFF
+							if int(parentActualIdx) < len(parent.values) {
+								val := parent.values[parentActualIdx]
+								if val != nil {
 									if dbg.enableDebugLogging {
-										fmt.Printf("[DEBUGGER] getValue('%s'): Found in parent object\n", varName)
+										fmt.Printf("[DEBUGGER] getValue('%s'): Found non-indirect in parent stash, idx=%d\n", varName, parentActualIdx)
 									}
-									return v, nil
+									return val, nil
 								}
 							}
 						}
 					}
+					if parent.obj != nil {
+						if !globalUnsafeKeys[varName] {
+							if v := safeGetGlobalProperty(parent.obj, name); v != nil {
+								if dbg.enableDebugLogging {
+									fmt.Printf("[DEBUGGER] getValue('%s'): Found in parent object\n", varName)
+								}
+								return v, nil
+							}
+						}
+					}
 				}
+			}
 				// Variable name exists in stash but value is nil/undefined
 				// (const/let before assignment, e.g. RHS threw an exception).
 				// Return _undefined so hover/variables show it instead of nothing.
