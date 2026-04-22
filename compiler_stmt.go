@@ -804,6 +804,13 @@ func (c *compiler) compileReturnStatement(v *ast.ReturnStatement) {
 		c.assert(b != nil, int(v.Return)-1, "Derived constructor, but no 'this' binding")
 		b.markAccessPoint()
 	}
+	// DEBUGGER FIX: Emit a source map entry for the function's closing '}'
+	// BEFORE the ret instruction. This makes the debugger pause at the closing
+	// brace after the return value is computed, matching Node.js/V8 behaviour
+	// where stepping over a return statement stops at '}' before exiting.
+	if c.debug && c.funcClosingBracePos > 0 {
+		c.p.addSrcMap(int(c.funcClosingBracePos) - 1)
+	}
 	c.emit(ret)
 }
 

@@ -127,6 +127,11 @@ type compiledFunctionLiteral struct {
 	isExpr          bool
 
 	isAsync, isGenerator bool
+
+	// closingBracePos is the file position of the function body's closing '}'.
+	// Used by the debugger to emit a source-map entry for the implicit return
+	// so that step-over/step-in stops at the '}' (like Node.js/V8 debuggers).
+	closingBracePos file.Idx
 }
 
 type compiledBracketExpr struct {
@@ -1551,6 +1556,10 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 	if e.isGenerator {
 		e.c.emit(yieldEmpty)
 	}
+	// Save and set the closing brace position for this function so that
+	// compileReturnStatement can emit a source-map entry at '}' for explicit returns.
+	savedClosingBrace := e.c.funcClosingBracePos
+	e.c.funcClosingBracePos = e.closingBracePos
 	e.c.compileStatements(body, false)
 
 	var last ast.Statement
@@ -1558,6 +1567,15 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 		last = body[l-1]
 	}
 	if _, ok := last.(*ast.ReturnStatement); !ok {
+		// DEBUGGER FIX: Emit a source map entry for the closing '}' of the
+		// function body before the implicit return (loadUndef + ret). This makes
+		// the debugger pause at the closing brace after the last statement
+		// executes, matching Node.js/V8 debugger behaviour. Without this, the
+		// implicit return inherits the source position of the last compiled
+		// statement and the debugger skips past it.
+		if e.c.debug && e.closingBracePos > 0 {
+			e.c.p.addSrcMap(int(e.closingBracePos) - 1)
+		}
 		if e.typ == funcDerivedCtor {
 			e.c.emit(loadUndef)
 			thisBinding.markAccessPoint()
@@ -1566,6 +1584,9 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 			e.c.emit(loadUndef, ret)
 		}
 	}
+
+	// Restore the outer function's closing brace position.
+	e.c.funcClosingBracePos = savedClosingBrace
 
 	delta := 0
 	code := e.c.p.code
@@ -1836,6 +1857,7 @@ func (c *compiler) compileFunctionLiteral(v *ast.FunctionLiteral, isExpr bool) *
 		strict:          strictBody,
 		isAsync:         v.Async,
 		isGenerator:     v.Generator,
+		closingBracePos: v.Body.RightBrace,
 	}
 	r.init(c, v.Idx0())
 	return r
@@ -2342,10 +2364,12 @@ func (c *compiler) compileCtor(ctor *ast.FunctionLiteral, derived bool) (p *Prog
 func (c *compiler) compileArrowFunctionLiteral(v *ast.ArrowFunctionLiteral) *compiledFunctionLiteral {
 	var strictBody *ast.StringLiteral
 	var body []ast.Statement
+	var closingBrace file.Idx
 	switch b := v.Body.(type) {
 	case *ast.BlockStatement:
 		strictBody = c.isStrictStatement(b)
 		body = b.List
+		closingBrace = b.RightBrace
 	case *ast.ExpressionBody:
 		body = []ast.Statement{
 			&ast.ReturnStatement{
@@ -2364,6 +2388,7 @@ func (c *compiler) compileArrowFunctionLiteral(v *ast.ArrowFunctionLiteral) *com
 		typ:             funcArrow,
 		strict:          strictBody,
 		isAsync:         v.Async,
+		closingBracePos: closingBrace,
 	}
 	r.init(c, v.Idx0())
 	return r

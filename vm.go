@@ -1052,20 +1052,24 @@ func (vm *vm) debug() {
 					// instructions after the block inherit the source position of the last
 					// statement in the block. We suppress ALL breaks at that line until
 					// execution moves to a different line.
-					suppressedByInheritedLine := false
-					if vm.debugger.suppressedInheritedLine > 0 {
-						if currentLine == vm.debugger.suppressedInheritedLine && normalizedCurrentFilename == vm.debugger.suppressedInheritedFile {
-							suppressedByInheritedLine = true
+				suppressedByInheritedLine := false
+				if vm.debugger.suppressedInheritedLine > 0 {
+					if currentLine == vm.debugger.suppressedInheritedLine && normalizedCurrentFilename == vm.debugger.suppressedInheritedFile {
+						suppressedByInheritedLine = true
+						if debugVM {
 							fmt.Printf("[VM-SUPPRESS] Suppressing line %d (PC=%d) in %s — inherited from skipped if-body (suppressedInheritedLine=%d)\n",
 								currentLine, currentPC, normalizedCurrentFilename, vm.debugger.suppressedInheritedLine)
-						} else {
+						}
+					} else {
+						if debugVM {
 							fmt.Printf("[VM-SUPPRESS] Clearing suppressedInheritedLine=%d (was for %s), now at line %d in %s\n",
 								vm.debugger.suppressedInheritedLine, vm.debugger.suppressedInheritedFile, currentLine, normalizedCurrentFilename)
-							// Line changed — clear the suppression
-							vm.debugger.suppressedInheritedLine = 0
-							vm.debugger.suppressedInheritedFile = ""
 						}
+						// Line changed — clear the suppression
+						vm.debugger.suppressedInheritedLine = 0
+						vm.debugger.suppressedInheritedFile = ""
 					}
+				}
 
 					// CRITICAL: Check if current file is a "user file" (has breakpoints or is the stepping source)
 					// This prevents stepping through internal k6 code like handleSummary
@@ -1249,28 +1253,12 @@ func (vm *vm) debug() {
 						// Skip control-flow-only instructions (same as step-over)
 						isControlFlowOnly := false
 						if currentPC >= 0 && currentPC < len(vm.prg.code) {
-							switch vm.prg.code[currentPC].(type) {
-							case jump, *leaveBlock, *enterCatchBlock, leaveTry, enterFinally:
-								isControlFlowOnly = true
-							case _loadUndef:
-								// Detect implicit return pattern: _loadUndef followed by _ret.
-								// See step-over path for full explanation.
-								nextPC := currentPC + 1
-								if nextPC < len(vm.prg.code) {
-									if _, isRet := vm.prg.code[nextPC].(_ret); isRet {
-										isControlFlowOnly = true
-									}
-								}
-							case _ret:
-								// Also skip _ret after _loadUndef (implicit return pattern).
-								if currentPC > 0 {
-									if _, isLU := vm.prg.code[currentPC-1].(_loadUndef); isLU {
-										isControlFlowOnly = true
-									}
-								}
-							}
+						switch vm.prg.code[currentPC].(type) {
+						case jump, *leaveBlock, *enterCatchBlock, leaveTry, enterFinally:
+							isControlFlowOnly = true
 						}
-						// Same forward-jump detection as step-over (see comments there).
+					}
+					// Same forward-jump detection as step-over (see comments there).
 						// NOTE: Use lastExecPC (the actual last executed instruction's PC),
 						// NOT prevPC (which is the last BREAKPOINT PC and may be stale).
 						if !isControlFlowOnly && lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
@@ -1336,9 +1324,11 @@ func (vm *vm) debug() {
 								shouldBreak = false
 								breakReason = "stepIn-inherited-pos-after-jump"
 								vm.debugger.suppressedInheritedLine = currentLine
-								vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
+							vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
+							if debugVM {
 								fmt.Printf("[VM-STEPIN-SKIP] Skipping step-in break at line %d (PC=%d): reached via forward jump from lastExecPC=%d, prev bytecode (PC=%d) has same source line\n",
 									currentLine, currentPC, lastExecPC, currentPC-1)
+							}
 							}
 						}
 
@@ -1506,33 +1496,10 @@ func (vm *vm) debug() {
 						// so it's always false during the instruction loop. Check the PC directly.
 						isControlFlowOnly := false
 						if currentPC >= 0 && currentPC < len(vm.prg.code) {
-							switch vm.prg.code[currentPC].(type) {
-							case jump, *leaveBlock, *enterCatchBlock, leaveTry, enterFinally:
-								isControlFlowOnly = true
-							case _loadUndef:
-								// Detect implicit return pattern: _loadUndef followed by _ret.
-								// The compiler emits this at the end of functions without an explicit
-								// return. These instructions inherit the source position of the last
-								// compiled statement, which may be in the ELSE branch of an if/else.
-								// When stepping past the if-body (via jump), the debugger would
-								// incorrectly break at the else body's source line. Marking the
-								// implicit return as control-flow-only prevents this false stop.
-								nextPC := currentPC + 1
-								if nextPC < len(vm.prg.code) {
-									if _, isRet := vm.prg.code[nextPC].(_ret); isRet {
-										isControlFlowOnly = true
-									}
-								}
-							case _ret:
-								// Also skip the _ret that follows _loadUndef in the implicit return
-								// pattern. After _loadUndef is skipped (above), _ret would still
-								// trigger a break because it inherits the same wrong source position.
-								if currentPC > 0 {
-									if _, isLU := vm.prg.code[currentPC-1].(_loadUndef); isLU {
-										isControlFlowOnly = true
-									}
-								}
-							}
+						switch vm.prg.code[currentPC].(type) {
+						case jump, *leaveBlock, *enterCatchBlock, leaveTry, enterFinally:
+							isControlFlowOnly = true
+						}
 						}
 						// Also detect forward jumps that skip over try-catch blocks.
 						// The source map often maps the post-try cleanup PC to the catch/finally
@@ -1628,9 +1595,11 @@ func (vm *vm) debug() {
 								shouldBreak = false
 								breakReason = "next-inherited-pos-after-jump"
 								vm.debugger.suppressedInheritedLine = currentLine
-								vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
+							vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
+							if debugVM {
 								fmt.Printf("[VM-STEPOVER-SKIP] Skipping step-over break at line %d (PC=%d): reached via forward jump from lastExecPC=%d, prev bytecode (PC=%d) has same source line\n",
 									currentLine, currentPC, lastExecPC, currentPC-1)
+							}
 							}
 						}
 
@@ -1779,8 +1748,10 @@ func (vm *vm) debug() {
 							breakReason = "inherited-pos-after-jump"
 							vm.debugger.suppressedInheritedLine = currentLine
 							vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
-							fmt.Printf("[VM-BP-SKIP] Skipping break at line %d (PC=%d): reached via forward jump from lastExecPC=%d, prev bytecode (PC=%d) has same source line (inherited position)\n",
-								currentLine, currentPC, lastExecPC, currentPC-1)
+							if debugVM {
+								fmt.Printf("[VM-BP-SKIP] Skipping break at line %d (PC=%d): reached via forward jump from lastExecPC=%d, prev bytecode (PC=%d) has same source line (inherited position)\n",
+									currentLine, currentPC, lastExecPC, currentPC-1)
+							}
 						}
 					}
 					// DIAGNOSTIC: Log when breakpoint fires at a line that was reached via forward jump

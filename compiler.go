@@ -160,6 +160,11 @@ type compiler struct {
 	evalVM *vm  // VM used to evaluate constant expressions
 	ctxVM  *vm  // VM in which an eval() code is compiled
 
+	// funcClosingBracePos stores the file position of the current function's
+	// closing '}'. Used by compileReturnStatement to emit a source-map entry
+	// so the debugger pauses at '}' after a return (like Node.js/V8).
+	funcClosingBracePos file.Idx
+
 	codeScratchpad []instruction
 
 	stringCache map[unistring.String]Value
