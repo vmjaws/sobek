@@ -939,7 +939,7 @@ func (vm *vm) debug() {
 				// The init-skip logic below (justInheritedStepState) handles not stopping
 				// at module-level init code.
 			justInheritedStepState := false
-			if !vm.debugger.next && !vm.debugger.stepIn {
+			if !vm.debugger.next && !vm.debugger.stepIn && !vm.debugger.suppressStepInheritance {
 				// FIX #1: Use the already-cached initComplete flag (updated ~20 lines above)
 				// instead of calling HasAnyInitCompleted() again which acquires a redundant RLock.
 				anyInitCompleted := vm.debugger.initComplete

@@ -1050,6 +1050,7 @@ type Debugger struct {
 	enableDebugLogging          bool
 	breakpointCheckCount        int // TEMP: counter for debug logging
 	skipPhaseEntryBreak         bool
+	suppressStepInheritance     bool // true during _initFields to prevent global step state from re-enabling step flags
 	lifecycleTransition         bool
 	userCommandIssued           bool
 	configuredCh                chan struct{}
@@ -5040,6 +5041,10 @@ func (dbg *Debugger) Evaluate(expr string) (Value, error) {
 		parts := strings.Split(expr, ".")
 		root := parts[0]
 		rootVal, err := dbg.getValue(root)
+		if debugVM && root == "this" {
+			fmt.Printf("[DEBUGGER-EVAL] Evaluate(%q): root='this', getValue returned val=%v (nil=%v), err=%v\n",
+				expr, rootVal, rootVal == nil, err)
+		}
 		if err == nil && rootVal != nil {
 			if _, isUnresolved := rootVal.(valueUnresolved); !isUnresolved {
 				// Wrap property access in withSuppressedDebugger — obj.Get()
@@ -5944,24 +5949,52 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 	locals := make(map[string]Value, 16) // PERF: pre-allocate; will grow if needed
 
 	if !dbg.active || dbg.vm.prg == nil {
-		return locals, nil
+		if dbg.vm.prg == nil {
+			if debugVM {
+				fmt.Printf("[DEBUGGER] GetLocalVariables: early return — active=%v, prg=nil\n", dbg.active)
+			}
+			return locals, nil
+		}
+		// active=false but prg is valid — allow access (ret transition)
 	}
 
 	if dbg.vm.sb < 0 {
-		if dbg.enableDebugLogging {
+		if debugVM {
 			fmt.Printf("[DEBUGGER] GetLocalVariables: vm.sb=%d at PC=%d (function stash not yet pushed), returning empty locals\n", dbg.vm.sb, dbg.vm.pc)
 		}
 		return locals, nil
 	}
 
 	if dbg.vm.stash == nil {
+		if debugVM {
+			fmt.Printf("[DEBUGGER] GetLocalVariables: stash is nil at PC=%d, returning empty locals\n", dbg.vm.pc)
+		}
 		return locals, nil
 	}
 
 	if dbg.vm.debugMode && dbg.vm.prg.debugSymbols != nil {
-		if dbg.vm.prg.funcName == "" {
+		// Check if we're at module level (not inside any function).
+		// Class constructors and methods may have empty funcName but they
+		// ARE functions — they have a stash with parameter/this bindings.
+		// Only skip if we're truly at the top-level module scope.
+		// Check the ENTIRE stash chain — block scopes may have been popped
+		// by leaveBlock but the function-level stash is still present.
+		isModuleLevel := dbg.vm.prg.funcName == ""
+		if isModuleLevel {
+			for s := dbg.vm.stash; s != nil; s = s.outer {
+				if s.names != nil && len(s.names) > 0 {
+					isModuleLevel = false
+					break
+				}
+				// Stop at function boundary — don't look into enclosing functions
+				if s.funcType != 0 {
+					break
+				}
+			}
+		}
+		if isModuleLevel {
 			if dbg.enableDebugLogging {
-				fmt.Printf("[DEBUGGER] GetLocalVariables: at module-level code (funcName=''), returning empty locals (globals handled by GetGlobalVariables)\n")
+				fmt.Printf("[DEBUGGER] GetLocalVariables: at module-level code (funcName='', no stash names), returning empty locals (globals handled by GetGlobalVariables)\n")
 			}
 			return locals, nil
 		}
@@ -6075,12 +6108,13 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 					continue
 				}
 				for name, idx := range s.names {
-					// PERF: Check for " this" using the constant directly, avoiding
-					// both String() allocation and TrimSpace call.
-					if name == unistring.String(thisBindingName) {
-						continue
-					}
+					// Map " this" (sobek internal name) to "this" for display.
+					// Previously this was skipped entirely, making class instance
+					// properties invisible in the Variables panel.
 					nameStr := name.String()
+					if name == unistring.String(thisBindingName) {
+						nameStr = "this"
+					}
 					if !isIdentifierLike(nameStr) {
 						continue
 					}
@@ -6128,6 +6162,18 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 
 		if dbg.enableDebugLogging {
 			fmt.Printf("[DEBUGGER] GetLocalVariables: collected %d function-local variables from debug symbols\n", len(locals))
+		}
+
+		// Ensure 'this' is in locals for class constructors/methods.
+		// The stash names map may not include " this" (excluded by makeNamesMap
+		// in production mode, or missing debug symbols). Resolve it explicitly
+		// via getValue which checks both stash and stack[sb].
+		if _, hasThis := locals["this"]; !hasThis {
+			if thisVal, err := dbg.getValue("this"); err == nil && thisVal != nil && !isNullValue(thisVal) {
+				if _, isUnresolved := thisVal.(valueUnresolved); !isUnresolved {
+					locals["this"] = thisVal
+				}
+			}
 		}
 
 		// ── Snapshot enrichment ──────────────────────────────────────────
@@ -6535,8 +6581,15 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 	// If the VM is running (active=false), accessing vm.stash/sb/pc races with
 	// the executing goroutine and can cause nil pointer panics, wrong values,
 	// or stack corruption that kills the VU init.
+	// EXCEPTION: When the VM just returned from a nested debug loop (e.g., _ret
+	// at the end of a constructor), active may be briefly false while the outer
+	// loop hasn't broken yet. Allow access if the VM appears to be in a stable
+	// state (stash and prg are valid).
 	if !dbg.active {
-		return nil, fmt.Errorf("cannot access variables: VM is not paused")
+		if dbg.vm.prg == nil || dbg.vm.stash == nil {
+			return nil, fmt.Errorf("cannot access variables: VM is not paused")
+		}
+		// VM state looks valid — allow access despite active=false
 	}
 
 	isLifecycleEntry := dbg.vm.sb < 0 && dbg.vm.pc == 0
@@ -6555,28 +6608,48 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 		// PERF: Direct map lookup using the known key " this" (thisBindingName)
 		// instead of iterating all names and calling n.String() + TrimSpace().
 		thisKey := unistring.String(thisBindingName)
+		stashDepth := 0
 		for s := dbg.vm.stash; s != nil; s = s.outer {
 			if s.names == nil {
+				stashDepth++
 				continue
 			}
 			if idx, found := s.names[thisKey]; found {
 				actualIdx := int(idx & uint32(maskIndex))
 				if s.values != nil && actualIdx < len(s.values) {
 					v := s.values[actualIdx]
+					if debugVM {
+						fmt.Printf("[DEBUGGER-THIS] Found ' this' in stash depth=%d, idx=%d, value=%v (nil=%v, isNull=%v)\n",
+							stashDepth, actualIdx, v, v == nil, v != nil && isNullValue(v))
+					}
 					if v != nil && !isNullValue(v) {
 						return v, nil
 					}
+				} else if debugVM {
+					fmt.Printf("[DEBUGGER-THIS] Found ' this' key in stash depth=%d but values array too small (idx=%d, len=%d)\n",
+						stashDepth, actualIdx, len(s.values))
 				}
 			}
+			stashDepth++
 		}
 		// Fall back to stack frame base — works for regular methods
 		if dbg.vm.sb >= 0 && dbg.vm.sb < len(dbg.vm.stack) {
 			v := dbg.vm.stack[dbg.vm.sb]
+			if debugVM {
+				fmt.Printf("[DEBUGGER-THIS] Stash lookup failed, trying stack[sb=%d]: value=%v (nil=%v)\n",
+					dbg.vm.sb, v, v == nil)
+			}
 			if v != nil && !isNullValue(v) {
 				if _, isUnresolved := v.(valueUnresolved); !isUnresolved {
 					return v, nil
 				}
 			}
+		} else if debugVM {
+			fmt.Printf("[DEBUGGER-THIS] Stash lookup failed, sb=%d out of range (stack len=%d)\n",
+				dbg.vm.sb, len(dbg.vm.stack))
+		}
+		if debugVM {
+			fmt.Printf("[DEBUGGER-THIS] 'this' NOT resolved — falling through to general lookup\n")
 		}
 	}
 

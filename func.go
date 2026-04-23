@@ -325,22 +325,39 @@ func (f *classFuncObject) _initFields(instance *Object) {
 	}
 	if f.initFields != nil {
 		vm := f.val.runtime.vm
-		if vm.debugMode && vm.debugger != nil && debugVM {
-			funcName := ""
-			if f.initFields.funcName != "" {
-				funcName = string(f.initFields.funcName)
+
+		// STEP-IN FIX: Suppress step-in/next during field initialization.
+		// Node.js/Chrome debuggers step into the constructor BODY, not field
+		// initializers. Save+clear step flags before running _initFields,
+		// restore after. Also set suppressStepInheritance to prevent the
+		// global coordinator from re-enabling step flags mid-execution.
+		var savedStepIn, savedNext bool
+		if vm.debugMode && vm.debugger != nil {
+			savedStepIn = vm.debugger.stepIn
+			savedNext = vm.debugger.next
+			if savedStepIn || savedNext {
+				if debugVM {
+					funcName := ""
+					if f.initFields.funcName != "" {
+						funcName = string(f.initFields.funcName)
+					}
+					srcName := ""
+					if f.initFields.src != nil {
+						srcName = f.initFields.src.Name()
+					}
+					entryLine := 0
+					if f.initFields.src != nil && len(f.initFields.code) > 0 {
+						entryLine = f.initFields.src.Position(f.initFields.sourceOffset(0)).Line
+					}
+					fmt.Printf("[CLASS-INITFIELDS] Suppressing step flags during _initFields: func=%q, file=%s, entryLine=%d, codeLen=%d, stepIn=%v, next=%v, lastBPLine=%d\n",
+						funcName, srcName, entryLine, len(f.initFields.code), savedStepIn, savedNext, vm.debugger.lastBreakpoint.line)
+				}
+				vm.debugger.stepIn = false
+				vm.debugger.next = false
+				vm.debugger.suppressStepInheritance = true
 			}
-			srcName := ""
-			if f.initFields.src != nil {
-				srcName = f.initFields.src.Name()
-			}
-			entryLine := 0
-			if f.initFields.src != nil && len(f.initFields.code) > 0 {
-				entryLine = f.initFields.src.Position(f.initFields.sourceOffset(0)).Line
-			}
-			fmt.Printf("[CLASS-INITFIELDS] Entering _initFields: func=%q, file=%s, entryLine=%d, codeLen=%d, stepIn=%v, next=%v, lastBPLine=%d\n",
-				funcName, srcName, entryLine, len(f.initFields.code), vm.debugger.stepIn, vm.debugger.next, vm.debugger.lastBreakpoint.line)
 		}
+
 		vm.pushCtx()
 		vm.prg = f.initFields
 		vm.stash = f.stash
@@ -372,6 +389,21 @@ func (f *classFuncObject) _initFields(instance *Object) {
 				vm.debugger.vmDoneCh = make(chan struct{})
 			default:
 			}
+
+			// Restore step flags that were suppressed before _initFields.
+			vm.debugger.suppressStepInheritance = false
+			if !vm.debugger.stepIn && !vm.debugger.next {
+				// No new step operation was started inside — restore saved flags
+				vm.debugger.stepIn = savedStepIn
+				vm.debugger.next = savedNext
+				if debugVM && (savedStepIn || savedNext) {
+					fmt.Printf("[CLASS-INITFIELDS] Restored step flags after _initFields: stepIn=%v, next=%v\n", savedStepIn, savedNext)
+				}
+			} else if debugVM {
+				fmt.Printf("[CLASS-INITFIELDS] Keeping user-initiated step flags after _initFields: stepIn=%v, next=%v\n",
+					vm.debugger.stepIn, vm.debugger.next)
+			}
+
 			// If step-over/step-in was active in the inner loop, we must be careful
 			// NOT to corrupt stepOverTargetDepth when the step was initiated OUTSIDE
 			// the initializer (at a shallower depth). The original target depth is

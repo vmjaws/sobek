@@ -1499,12 +1499,20 @@ func (s *scope) makeNamesMap() map[unistring.String]uint32 {
 	stackIdx := uint32(0)
 
 	for _, b := range s.bindings {
-		// Skip 'this' — it's handled by loadThisStash/loadThisStack, not by name lookup.
-		// But we MUST still advance the counter so subsequent bindings get the right index.
+		// In production mode, skip 'this' — it's handled by loadThisStash/loadThisStack.
+		// In debug mode, INCLUDE it so the debugger can resolve 'this' via stash name
+		// lookup (getValue, GetLocalVariables, hover evaluation).
 		if b.name == thisBindingName {
 			if allInStash || b.inStash {
+				if s.c.debug {
+					names[b.name] = stashIdx
+				}
 				stashIdx++
 			} else {
+				if s.c.debug {
+					// this is on stack in non-debug, but allInStash should be true in debug mode
+					names[b.name] = stackIdx
+				}
 				stackIdx++
 			}
 			continue
