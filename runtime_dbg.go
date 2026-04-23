@@ -15,15 +15,14 @@ import (
 // in order to get when it blocks on a debugger statement or breakpoint
 // There can only be 1 debugger attached at a time, attaching more is has undefined behaviour
 func (r *Runtime) AttachDebugger() *Debugger {
-	// Return existing debugger if already attached (singleton per runtime).
-	// This prevents creating duplicate debuggers when reusing cached VU 0
-	// across lifecycle phases (setup → teardown → handleSummary).
 	if r.vm.debugger != nil {
 		r.vm.debugMode = true
+		r.vm.dbgHooks = newVMDebugHooks(r.vm)
 		return r.vm.debugger
 	}
-	r.vm.debugMode = true // maybe don't do this?
+	r.vm.debugMode = true
 	r.vm.debugger = newDebugger(r.vm)
+	r.vm.dbgHooks = newVMDebugHooks(r.vm)
 	return r.vm.debugger
 }
 
@@ -44,6 +43,13 @@ func (r *Runtime) IsDebugMode() bool {
 // debug-mode TDZ relaxation check (vm.debugMode) is false.
 func (r *Runtime) SetDebugMode(enabled bool) {
 	r.vm.debugMode = enabled
+	if enabled {
+		if r.vm.dbgHooks == nil {
+			r.vm.dbgHooks = newVMDebugHooks(r.vm)
+		}
+	} else {
+		r.vm.dbgHooks = nil
+	}
 }
 
 // CompileASTDebug is like CompileAST but enables debug mode when compiling

@@ -6,7 +6,6 @@ package sobek
 import (
 	"fmt"
 	"sort"
-	"strings"
 )
 
 type DebugSymbols struct {
@@ -66,7 +65,6 @@ type VarLocation struct {
 	EndPC      int // PC where variable goes out of scope
 }
 
-type compiler struct {
 
 func (p *Program) addStmtPC() {
 	pc := len(p.code)
@@ -132,14 +130,6 @@ func (p *Program) lastPCForLine(line int, startPC int, filename string) int {
 	return lastPC
 }
 
-func (s *scope) lookupName(name unistring.String) (binding *binding, noDynamics bool) {
-	noDynamics = true
-	toStash := false
-	for curScope := s; ; curScope = curScope.outer {
-		if curScope.outer != nil {
-			if b, exists := curScope.boundNames[name]; exists {
-				if toStash && !b.inStash {
-					b.moveToStash()
 
 func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx int) {
 	if s.c.p.debugSymbols == nil {

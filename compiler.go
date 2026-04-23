@@ -87,6 +87,7 @@ type Program struct {
 	stmtPCs []int
 }
 
+type compiler struct {
 	p     *Program
 	scope *scope
 	block *block
@@ -515,6 +516,14 @@ func (p *Program) addSrcMap(srcPos int) {
 
 // addStmtPC records the current code length as a statement-start PC.
 // Only called in debug mode from compiler_stmt.go.
+func (s *scope) lookupName(name unistring.String) (binding *binding, noDynamics bool) {
+	noDynamics = true
+	toStash := false
+	for curScope := s; ; curScope = curScope.outer {
+		if curScope.outer != nil {
+			if b, exists := curScope.boundNames[name]; exists {
+				if toStash && !b.inStash {
+					b.moveToStash()
 				}
 				binding = b
 				return
@@ -932,6 +941,7 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 }
 
 
+
 func (s *scope) moveArgsToStash() {
 	for _, b := range s.bindings {
 		if !b.isArg {
@@ -1086,10 +1096,10 @@ func (c *compiler) compileModule(module *SourceTextModuleRecord) {
 	}
 	var enter *enterBlock
 	c.emit(&enterFuncBody{
+		enterBlock:  enterBlock{names: c.scope.makeNamesMap()},
 		funcType:    funcModule,
 		extensible:  true,
 		adjustStack: true,
-		names:       c.scope.makeNamesMap(),
 	})
 	for _, in := range module.indirectExportEntries {
 		v, ambiguous := module.ResolveExport(in.exportName)

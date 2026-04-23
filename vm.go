@@ -183,8 +183,8 @@ type stashRefLex struct {
 func (r *stashRefLex) get() Value {
 	v := (*r.v)[r.idx]
 	if v == nil {
-		if r.vm != nil && r.vm.debugger != nil {
-			return _undefined
+		if r.vm != nil && r.vm.dbgHooks != nil {
+			return r.vm.dbgHooks.stashRefLexRelaxed()
 		}
 		panic(errAccessBeforeInit)
 	}
@@ -391,6 +391,7 @@ type vm struct {
 	profTracker *profTracker
 	debugger    *Debugger
 	debugMode   bool // TODO drop this as we can just check debugger is nil or not
+	dbgHooks    debugHooks
 }
 
 type instruction interface {
@@ -487,14 +488,8 @@ func (s *stash) initByIdx(idx uint32, v Value) {
 	if s.obj != nil {
 		panic("Attempt to init by idx into an object scope")
 	}
-
-	if s.vm != nil && s.vm.debugMode {
-		// Grow the values slice defensively if the compiler emitted a higher index than preallocated.
-		if int(idx) >= len(s.values) {
-			needed := int(idx) + 1
-			extra := make([]Value, needed-len(s.values))
-			s.values = append(s.values, extra...)
-		}
+	if s.vm != nil && s.vm.dbgHooks != nil {
+		s.vm.dbgHooks.stashInitGrow(s, idx)
 	}
 	s.values[idx] = v
 }
@@ -509,10 +504,11 @@ func (s *stash) initByName(name unistring.String, v Value) {
 
 func (s *stash) getByIdx(idx uint32) Value {
 	if int(idx) >= len(s.values) {
-		// In debug mode, accessing an out-of-bounds index can happen when
-		// code is compiled with different debug symbol info
-		if s.vm != nil && s.vm.debugMode {
-			return _undefined
+		if s.vm != nil && s.vm.dbgHooks != nil {
+			v, handled := s.vm.dbgHooks.stashGetSafe(s, idx)
+			if handled {
+				return v
+			}
 		}
 		return nil
 	}
@@ -529,10 +525,8 @@ func (s *stash) getByName(name unistring.String) (v Value, exists bool) {
 	if idx, exists := s.names[name]; exists {
 		v := s.values[idx&^maskTyp]
 		if v == nil {
-			if s.vm != nil && s.vm.debugMode {
-				// In debug mode, return undefined instead of panicking
-				// This handles function parameters and variables that haven't been initialized yet
-				v = _undefined
+			if s.vm != nil && s.vm.dbgHooks != nil {
+				v = s.vm.dbgHooks.stashGetByNameRelaxed(s, idx&^maskTyp)
 			} else {
 				if idx&maskVar == 0 {
 					panic(errAccessBeforeInit)
@@ -590,7 +584,6 @@ func (s *stash) getRefByName(name unistring.String, strict bool) ref {
 					n:   name,
 					v:   &s.values,
 					idx: int(idx &^ maskTyp),
-					vm:  s.vm,
 				}
 			}
 		}
@@ -724,7 +717,6 @@ func (vm *vm) runWithProfiler() bool {
 	return false
 }
 
-
 func (vm *vm) Interrupt(v interface{}) {
 	vm.interruptLock.Lock()
 	vm.interruptVal = v
@@ -842,35 +834,20 @@ func (vm *vm) restoreStacks(iterLen, refLen uint32) (ex *Exception) {
 
 func (vm *vm) handleThrow(arg interface{}) *Exception {
 	ex := vm.exceptionFromValue(arg)
-
-	// ── Debugger: capture the throw-site location BEFORE unwinding ──────
-	// handleThrow restores vm.prg/vm.pc from the call stack when unwinding
-	// to a try frame, which clobbers the position where the throw occurred.
-	// Capture the throw-site file+line NOW (from the exception's stack trace
-	// which was populated by exceptionFromValue) so BreakOnException can
-	// show the correct source location — matching Node.js/Chrome DevTools.
+	// ── Debugger: capture throw-site location BEFORE unwinding ──
 	var throwFile string
 	var throwLine int
-	if vm.debugMode && vm.debugger != nil && ex != nil && len(ex.stack) > 0 {
+	if vm.dbgHooks != nil && vm.debugger != nil && ex != nil && len(ex.stack) > 0 {
 		frame := &ex.stack[0]
 		pos := frame.Position()
 		throwFile = normalizeFilename(pos.Filename)
 		throwLine = pos.Line
-		// If the stack frame's position is empty (native code), try current vm state
 		if throwFile == "" && vm.prg != nil && vm.prg.src != nil {
 			pos = vm.prg.src.Position(vm.prg.sourceOffset(vm.pc))
 			throwFile = normalizeFilename(pos.Filename)
 			throwLine = pos.Line
 		}
-
-		// Capture the stash chain at the throw site BEFORE unwinding.
-		// handleThrow restores vm.stash from the try frame (tf.stash),
-		// losing all local variables at the throw point. Save them so
-		// buildPausedVarSnapshot can show throw-site variables when paused
-		// on an exception — matching Chrome DevTools / Node.js behaviour.
-		vm.debugger.exceptionStash = vm.stash
-		vm.debugger.exceptionSB = vm.sb
-		vm.debugger.exceptionPrg = vm.prg
+		vm.dbgHooks.onThrowCaptureState(vm, ex)
 	}
 
 	for len(vm.tryStack) > 0 {
@@ -896,22 +873,8 @@ func (vm *vm) handleThrow(arg interface{}) *Exception {
 
 		if tf.catchPos >= 0 {
 			// exception is caught
-			// Break on caught exception if the debugger has that filter enabled.
-			// Don't break on exceptions from eval/debugger-internal code.
-			// CRITICAL: Pass throwFile/throwLine (captured BEFORE stack unwind)
-			// so the debugger pauses at the THROW site, not the catch handler.
-			if vm.debugMode && vm.debugger != nil && ex != nil && !vm.debugger.inEvalContext {
-				currentFile := ""
-				if vm.prg != nil && vm.prg.src != nil {
-					currentFile = vm.prg.src.Name()
-				}
-				if currentFile != "<debugger-eval>" {
-					vm.debugger.BreakOnException(ex.val, true, throwFile, throwLine)
-				}
-				if debugVM {
-					fmt.Printf("[HANDLETHROW] After BreakOnException(caught): next=%v, stepIn=%v, suppress=%v, pc will be=%d, depth=%d\n",
-						vm.debugger.next, vm.debugger.stepIn, vm.debugger.suppressDebugger, int(tf.catchPos), len(vm.callStack))
-				}
+			if vm.dbgHooks != nil && ex != nil {
+				vm.dbgHooks.onCaughtException(vm, ex, throwFile, throwLine)
 			}
 			vm.push(ex.val)
 			vm.pc = int(tf.catchPos)
@@ -937,36 +900,8 @@ func (vm *vm) handleThrow(arg interface{}) *Exception {
 // In all other cases exceptions must be thrown using panic().
 func (vm *vm) throw(v interface{}) {
 	if ex := vm.handleThrow(v); ex != nil {
-		if vm.debugMode && vm.debugger != nil && !vm.debugger.inEvalContext {
-			currentFile := ""
-			if vm.prg != nil && vm.prg.src != nil {
-				currentFile = vm.prg.src.Name()
-			}
-			if currentFile != "<debugger-eval>" {
-				// Save the exception stack frames in the debugger BEFORE they're lost.
-				// handleThrow has already unwound vm.callStack, so CaptureCallStack()
-				// will return empty after this point. ex.stack has the original frames.
-				vm.debugger.SetLastExceptionStack(ex.stack)
-
-				// Extract the throw-site location from the exception's stack trace.
-				// handleThrow has already unwound vm.prg/vm.pc so we cannot use
-				// the debugger's Filename()/Line() — they'd point to the wrong place.
-				var throwFile string
-				var throwLine int
-				if len(ex.stack) > 0 {
-					pos := ex.stack[0].Position()
-					throwFile = normalizeFilename(pos.Filename)
-					throwLine = pos.Line
-				}
-				if debugActivate {
-					fmt.Printf("[EXCEPTION-TRACE] vm.throw: calling BreakOnException from throw(), throwFile=%s, throwLine=%d, exception=%q\n",
-						throwFile, throwLine, ex.val.String())
-				}
-				vm.debugger.BreakOnException(ex.val, false, throwFile, throwLine)
-				if debugActivate {
-					fmt.Printf("[EXCEPTION-TRACE] vm.throw: BreakOnException returned, about to panic\n")
-				}
-			}
+		if vm.dbgHooks != nil {
+			vm.dbgHooks.onUncaughtException(vm, ex)
 		}
 		panic(ex)
 	}
@@ -1002,84 +937,14 @@ func (vm *vm) runTryInner() (ex *Exception) {
 	defer func() {
 		if x := recover(); x != nil {
 			ex = vm.handleThrow(x)
-			if ex != nil && vm.debugMode && vm.debugger != nil {
-				// Save exception stack frames (may already be set by vm.throw,
-				// but also save here for exceptions caught only by runTryInner).
-				if len(ex.stack) > 0 {
-					vm.debugger.SetLastExceptionStack(ex.stack)
-				}
-				if debugActivate {
-					fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: recovered exception=%q, pendingUncaughtException=%v, inEvalContext=%v\n",
-						ex.val.String(), vm.debugger.pendingUncaughtException != nil, vm.debugger.inEvalContext)
-				}
-
-				if !vm.debugger.inEvalContext && vm.debugger.pendingUncaughtException == nil {
-					// Extract throw-site from the exception stack trace
-					var throwFile string
-					var throwLine int
-					if len(ex.stack) > 0 {
-						pos := ex.stack[0].Position()
-						throwFile = normalizeFilename(pos.Filename)
-						throwLine = pos.Line
-					}
-					if debugActivate {
-						fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: calling BreakOnException (no pending yet, throwFile=%s, throwLine=%d)\n",
-							throwFile, throwLine)
-					}
-					vm.debugger.BreakOnException(ex.val, false, throwFile, throwLine)
-				} else if debugActivate {
-					fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: SKIPPED BreakOnException (pending=%v, inEval=%v)\n",
-						vm.debugger.pendingUncaughtException != nil, vm.debugger.inEvalContext)
-				}
-
-				vm.debugger.uncaughtExceptionExit = !vm.debugger.inEvalContext
-
-				if debugActivate {
-					fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: closing vmDoneCh, vmExited=true\n")
-				}
-				// CRITICAL: Do NOT mark the VM as exited when the exception
-				// originated inside a debugger eval (evaluateComplexExpression).
-				// Eval exceptions (e.g., ReferenceError for a variable preview)
-				// are caught by eval's own recovery handler and must not poison
-				// the real VM's lifecycle state.  Closing vmDoneCh here causes
-				// Continue() to think the VM terminated, breaking the entire
-				// debug session.
-				if !vm.debugger.inEvalContext {
-					vm.debugger.vmExited = true
-					if vm.debugger.vmDoneCh != nil {
-						select {
-						case <-vm.debugger.vmDoneCh:
-						default:
-							close(vm.debugger.vmDoneCh)
-						}
-					}
-					vm.debugger.next = false
-					vm.debugger.stepIn = false
-					GetGlobalCoordinator().ClearGlobalStepState()
-					if GetGlobalCoordinator().IsMultiVUDebug() {
-						GetGlobalCoordinator().ClearVUStepState(vm.debugger.vuID)
-					}
-				} else if debugActivate {
-					fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: SKIPPED vmExited/vmDoneCh (inEvalContext=true)\n")
-				}
-
-				if !vm.debugger.inEvalContext && vm.debugger.exceptionWaitCh != nil {
-					if debugActivate {
-						fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: BLOCKING on exceptionWaitCh — waiting for IDE user to dismiss\n")
-					}
-					<-vm.debugger.exceptionWaitCh
-					if debugActivate {
-						fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: exceptionWaitCh RELEASED — VM continuing exit\n")
-					}
-				} else if debugActivate {
-					fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: exceptionWaitCh is nil — NOT blocking (breakOnUncaughtExceptions likely disabled)\n")
-				}
+			if ex != nil && vm.dbgHooks != nil {
+				vm.dbgHooks.onRunTryInnerException(vm, ex)
 			}
 		}
 	}()
 
-	if vm.debugMode {
-		vm.debug()
+	if vm.dbgHooks != nil {
+		vm.dbgHooks.runDebug()
 	} else {
 		vm.run()
 	}
@@ -1433,15 +1298,14 @@ func (e export) exec(vm *vm) {
 		stash = stash.outer
 	}
 	e.callback(vm, func() Value {
-		if vm != nil && vm.debugMode {
+		if vm != nil && vm.dbgHooks != nil {
 			v := stash.getByIdx(idx)
 			if v == nil {
 				return _undefined
 			}
 			return v
-		} else {
-			return stash.getByIdx(idx)
 		}
+		return stash.getByIdx(idx)
 	})
 	vm.pc++
 }
@@ -1462,8 +1326,7 @@ func (e exportLex) exec(vm *vm) {
 	e.callback(vm, func() Value {
 		v := stash.getByIdx(idx)
 		if v == nil {
-			if vm != nil && vm.debugMode {
-				// In debug mode, return undefined instead of panicking for uninitialized variables
+			if vm != nil && vm.dbgHooks != nil {
 				return _undefined
 			}
 			panic(errAccessBeforeInit)
@@ -2096,8 +1959,8 @@ var debugger _debugger
 
 func (_debugger) exec(vm *vm) {
 	vm.pc++
-	if vm.debugMode && !vm.debugger.active { // this jumps over debugger statements
-		vm.debugger.activate(DebuggerStatementActivation, vm.debugger.Filename(), vm.debugger.Line())
+	if vm.dbgHooks != nil {
+		vm.dbgHooks.onDebuggerStatement(vm)
 	}
 }
 
@@ -2626,6 +2489,7 @@ type putProp unistring.String
 
 func (p putProp) exec(vm *vm) {
 	vm.r.toObject(vm.stack[vm.sp-2]).self._putProp(unistring.String(p), vm.stack[vm.sp-1], true, true, true)
+
 	vm.sp--
 	vm.pc++
 }
@@ -2848,12 +2712,8 @@ type getPropCallee unistring.String
 
 func (g getPropCallee) exec(vm *vm) {
 	v := vm.stack[vm.sp-1]
-	n := unistring.String(g)
-	if v == nil {
-		vm.throw(vm.r.NewTypeError("Cannot read property '%s' of undefined or null", n))
-		return
-	}
 	obj := v.baseObject(vm.r)
+	n := unistring.String(g)
 	if obj == nil {
 		vm.throw(vm.r.NewTypeError("Cannot read property '%s' of undefined or null", n))
 		return
@@ -3362,23 +3222,6 @@ func (g loadStashLex) exec(vm *vm) {
 
 	v := stash.getByIdx(idx)
 	if v == nil {
-		if debugCompiler {
-			srcName := ""
-			if vm.prg != nil && vm.prg.src != nil {
-				srcName = vm.prg.src.Name()
-			}
-			if debugCompiler {
-				fmt.Printf("[LOADSTASHLEX-TDZ] level=%d, idx=%d, stashLen=%d, pc=%d, src=%s\n",
-				level, idx, len(stash.values), vm.pc, srcName)
-			}
-			if stash.names != nil {
-				for name, sidx := range stash.names {
-					if debugCompiler {
-						fmt.Printf("[LOADSTASHLEX-TDZ]   stash name=%s idx=%d\n", name, sidx)
-					}
-				}
-			}
-		}
 		vm.throw(errAccessBeforeInit)
 		return
 	}
@@ -3452,14 +3295,8 @@ func (g *loadMixedLex) exec(vm *vm) {
 	if stash != nil {
 		v := stash.getByIdx(idx)
 		if v == nil {
-			if vm != nil && vm.debugMode {
-				// In debug mode, return undefined instead of throwing TDZ error
-				// This handles function parameters and variables not yet initialized
-				v = _undefined
-			} else {
-				vm.throw(errAccessBeforeInit)
-				return
-			}
+			vm.throw(errAccessBeforeInit)
+			return
 		}
 		vm.push(v)
 	}
@@ -3599,14 +3436,13 @@ type resolveMixed struct {
 	strict bool
 }
 
-func newStashRef(typ varType, name unistring.String, v *[]Value, idx int, vm *vm) ref {
+func newStashRef(typ varType, name unistring.String, v *[]Value, idx int) ref {
 	switch typ {
 	case varTypeVar:
 		return &stashRef{
 			n:   name,
 			v:   v,
 			idx: idx,
-			vm:  vm,
 		}
 	case varTypeLet:
 		return &stashRefLex{
@@ -3614,7 +3450,6 @@ func newStashRef(typ varType, name unistring.String, v *[]Value, idx int, vm *vm
 				n:   name,
 				v:   v,
 				idx: idx,
-				vm:  vm,
 			},
 		}
 	case varTypeConst, varTypeStrictConst:
@@ -3624,7 +3459,6 @@ func newStashRef(typ varType, name unistring.String, v *[]Value, idx int, vm *vm
 					n:   name,
 					v:   v,
 					idx: idx,
-					vm:  vm,
 				},
 			},
 			strictConst: typ == varTypeStrictConst,
@@ -3647,7 +3481,7 @@ func (r *resolveMixed) exec(vm *vm) {
 	}
 
 	if stash != nil {
-		ref = newStashRef(r.typ, r.name, &stash.values, int(idx), vm)
+		ref = newStashRef(r.typ, r.name, &stash.values, int(idx))
 		goto end
 	}
 
@@ -3690,7 +3524,7 @@ func (r *resolveMixedStack) exec(vm *vm) {
 		idx = vm.sb - r.idx
 	}
 
-	ref = newStashRef(r.typ, r.name, (*[]Value)(&vm.stack), idx, vm)
+	ref = newStashRef(r.typ, r.name, (*[]Value)(&vm.stack), idx)
 
 end:
 	vm.refStack = append(vm.refStack, ref)
@@ -3709,7 +3543,7 @@ func (r *resolveMixedStack1) exec(vm *vm) {
 		stash = stash.outer
 	}
 
-	ref = newStashRef(r.typ, r.name, (*[]Value)(&vm.stack), vm.sb+r.idx, vm)
+	ref = newStashRef(r.typ, r.name, (*[]Value)(&vm.stack), vm.sb+r.idx)
 
 end:
 	vm.refStack = append(vm.refStack, ref)
@@ -3973,54 +3807,13 @@ func (numargs call) exec(vm *vm) {
 	v := vm.stack[vm.sp-n-1] // callee
 	obj := vm.toCallee(v)
 
-	// DEBUG: Log when calling a non-function object in debug mode
-	if vm.debugMode {
-		if _, ok := obj.self.assertCallable(); !ok {
-			posFile := ""
-			posLine := 0
-			if vm.prg != nil && vm.prg.src != nil {
-				pos := vm.prg.src.Position(vm.prg.sourceOffset(vm.pc))
-				posFile = pos.Filename
-				posLine = pos.Line
-			}
-			if debugVM {
-				fmt.Printf("[CALL-DEBUG] About to call non-function: %s (%T) at %s:%d (pc=%d, numargs=%d)\n",
-				obj.String(), obj.self, posFile, posLine, vm.pc, n)
-			}
-			// Print the bytecode around the call site
-			if vm.prg != nil {
-				start := vm.pc - 5
-				if start < 0 {
-					start = 0
-				}
-				end := vm.pc + 3
-				if end > len(vm.prg.code) {
-					end = len(vm.prg.code)
-				}
-				for i := start; i < end; i++ {
-					marker := " "
-					if i == vm.pc {
-						marker = ">"
-					}
-					if debugVM {
-						fmt.Printf("[CALL-DEBUG] %s [%d] %T\n", marker, i, vm.prg.code[i])
-					}
-				}
-			}
-		}
-	}
-
 	obj.self.vmCall(vm, n)
 }
 
 func (vm *vm) clearStack() {
 	sp := vm.sp
 	if sp > len(vm.stack) {
-		// Clamp sp to prevent out-of-range panic - this indicates a VM bug
-		if debugVM {
-			fmt.Printf("[VM] ⚠️ clearStack: sp=%d > len(stack)=%d, clamping to stack length\n", sp, len(vm.stack))
-		}
-		sp = len(vm.stack)
+		time.Sleep(time.Second)
 	}
 	stackTail := vm.stack[sp:]
 	for i := range stackTail {
@@ -4033,42 +3826,16 @@ type enterBlock struct {
 	names     map[unistring.String]uint32
 	stashSize uint32
 	stackSize uint32
-	needStash bool // set by compiler in debug mode for empty scopes
+	needStash bool // debug mode: force stash creation even when stashSize==0
 }
 
 func (e *enterBlock) exec(vm *vm) {
-	// Create stash if we have either stash size or names to track
-	if e.stashSize > 0 || len(e.names) > 0 {
-		if vm != nil && vm.debugMode {
-			if e.stashSize > 0 || len(e.names) > 0 {
-				vm.newStash()
-				if e.stashSize > 0 {
-					vm.stash.values = make([]Value, e.stashSize)
-				}
-				if len(e.names) > 0 {
-					// Create a copy of the names map
-					vm.stash.names = make(map[unistring.String]uint32, len(e.names))
-					for k, v := range e.names {
-						vm.stash.names[k] = v
-					}
-				}
-			}
-		} else {
-			if e.stashSize > 0 {
-				vm.newStash()
-				vm.stash.values = make([]Value, e.stashSize)
-				if len(e.names) > 0 {
-					vm.stash.names = e.names
-				}
-			}
-		}
-	} else if e.needStash {
-		// In debug mode, the compiler counts ALL scopes as stash
-		// levels (via sc.c.debug in finaliseVarAlloc level loop). The runtime must
-		// create a stash for every scope to match, even empty ones. Without this,
-		// loadStashLex reads from the wrong stash level.
-		// Only applies to code compiled in debug mode (needStash is set by compiler).
+	if e.stashSize > 0 || e.needStash {
 		vm.newStash()
+		vm.stash.values = make([]Value, e.stashSize)
+		if len(e.names) > 0 {
+			vm.stash.names = e.names
+		}
 	}
 	ss := int(e.stackSize)
 	vm.stack.expand(vm.sp + ss - 1)
@@ -4090,15 +3857,7 @@ func (e *enterCatchBlock) exec(vm *vm) {
 	vm.newStash()
 	vm.stash.values = make([]Value, e.stashSize)
 	if len(e.names) > 0 {
-		if vm != nil && vm.debugMode {
-			// Create a copy of the names map instead of sharing it
-			vm.stash.names = make(map[unistring.String]uint32, len(e.names))
-			for k, v := range e.names {
-				vm.stash.names[k] = v
-			}
-		} else {
-			vm.stash.names = e.names
-		}
+		vm.stash.names = e.names
 	}
 	vm.sp--
 	vm.stash.values[0] = vm.stack[vm.sp]
@@ -4152,7 +3911,6 @@ func (e *enterFunc) exec(vm *vm) {
 	// this <- sb
 	// <local stack vars...>
 	// <- sp
-
 	sp := vm.sp
 	vm.sb = sp - vm.args - 1
 	vm.newStash()
@@ -4167,17 +3925,10 @@ func (e *enterFunc) exec(vm *vm) {
 			}
 			stash.names = m
 		} else {
-			if vm != nil && vm.debugMode {
-				// Create a copy of the names map instead of sharing it
-				vm.stash.names = make(map[unistring.String]uint32, len(e.names))
-				for k, v := range e.names {
-					vm.stash.names[k] = v
-				}
-			} else {
-				vm.stash.names = e.names
-			}
+			stash.names = e.names
 		}
 	}
+
 	ss := int(e.stackSize)
 	ea := 0
 	if e.argsToStash {
@@ -4213,21 +3964,6 @@ func (e *enterFunc) exec(vm *vm) {
 		vv[i] = nil
 	}
 	vm.sp = sp + ss
-
-	// DEBUG FIX: In debug mode, the compiler moves the " this" binding to stash
-	// (allInStash=true rewrites loadStack→loadStash). But enterFunc only copies
-	// args to stash (when argsToStash=true), NOT 'this' (which lives at vm.sb).
-	// Without this, class methods see 'this' as undefined because the stash slot
-	// is never initialized.
-	if vm.debugMode && e.names != nil {
-		if thisIdx, ok := e.names[unistring.String(thisBindingName)]; ok {
-			idx := thisIdx & 0x00FFFFFF
-			if int(idx) < len(stash.values) && stash.values[idx] == nil {
-				stash.initByIdx(idx, vm.stack[vm.sb])
-			}
-		}
-	}
-
 	vm.pc++
 }
 
@@ -4258,16 +3994,7 @@ func (e *enterFunc1) exec(vm *vm) {
 			}
 			stash.names = m
 		} else {
-			if vm != nil && vm.debugMode {
-				// Create a copy of the names map instead of sharing it
-				m := make(map[unistring.String]uint32, len(e.names))
-				for name, idx := range e.names {
-					m[name] = idx
-				}
-				stash.names = m
-			} else {
-				stash.names = e.names
-			}
+			stash.names = e.names
 		}
 	}
 	offset := vm.args - int(e.argsToCopy)
@@ -4287,16 +4014,6 @@ func (e *enterFunc1) exec(vm *vm) {
 		}
 	}
 
-	// DEBUG FIX: Same as enterFunc — copy 'this' from stack to stash in debug mode.
-	if vm.debugMode && e.names != nil {
-		if thisIdx, ok := e.names[unistring.String(thisBindingName)]; ok {
-			idx := thisIdx & 0x00FFFFFF
-			if int(idx) < len(stash.values) && stash.values[idx] == nil {
-				stash.initByIdx(idx, vm.stack[vm.sb])
-			}
-		}
-	}
-
 	vm.pc++
 }
 
@@ -4304,7 +4021,6 @@ func (e *enterFunc1) exec(vm *vm) {
 // scope. When used in conjunction with enterFunc1 adjustStack is set to true which
 // causes the arguments to be removed from the stack.
 type enterFuncBody struct {
-	names map[unistring.String]uint32
 	enterBlock
 	funcType    funcType
 	extensible  bool
@@ -4317,7 +4033,6 @@ func (e *enterFuncBody) exec(vm *vm) {
 		stash := vm.stash
 		stash.funcType = e.funcType
 		stash.values = make([]Value, e.stashSize)
-
 		if len(e.names) > 0 {
 			if e.extensible {
 				m := make(map[unistring.String]uint32, len(e.names))
@@ -4326,19 +4041,10 @@ func (e *enterFuncBody) exec(vm *vm) {
 				}
 				stash.names = m
 			} else {
-				if vm != nil && vm.debugMode {
-					m := make(map[unistring.String]uint32, len(e.names))
-					for name, idx := range e.names {
-						m[name] = idx
-					}
-					stash.names = m
-				} else {
-					stash.names = e.names
-				}
+				stash.names = e.names
 			}
 		}
 	}
-
 	sp := vm.sp
 	if e.adjustStack {
 		sp -= vm.args
@@ -4352,18 +4058,6 @@ func (e *enterFuncBody) exec(vm *vm) {
 		}
 	}
 	vm.sp = nsp
-
-	// DEBUG FIX: Same as enterFunc — copy 'this' from stack to stash in debug mode.
-	if vm.debugMode && e.names != nil {
-		stash := vm.stash
-		if thisIdx, ok := e.names[unistring.String(thisBindingName)]; ok {
-			idx := thisIdx & 0x00FFFFFF
-			if int(idx) < len(stash.values) && stash.values[idx] == nil {
-				stash.initByIdx(idx, vm.stack[vm.sb])
-			}
-		}
-	}
-
 	vm.pc++
 }
 
@@ -5838,11 +5532,7 @@ func (_createArgsRestStash) exec(vm *vm) {
 type concatStrings int
 
 func (n concatStrings) exec(vm *vm) {
-	low := vm.sp - int(n)
-	if low < 0 || low > vm.sp || vm.sp > len(vm.stack) {
-		panic(referenceError(fmt.Sprintf("internal: concatStrings stack underflow (sp=%d, n=%d, stackLen=%d)", vm.sp, int(n), len(vm.stack))))
-	}
-	strs := vm.stack[low:vm.sp]
+	strs := vm.stack[vm.sp-int(n) : vm.sp]
 	length := 0
 	allAscii := true
 	for i, s := range strs {
