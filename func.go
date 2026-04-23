@@ -325,6 +325,22 @@ func (f *classFuncObject) _initFields(instance *Object) {
 	}
 	if f.initFields != nil {
 		vm := f.val.runtime.vm
+		if vm.debugMode && vm.debugger != nil && debugVM {
+			funcName := ""
+			if f.initFields.funcName != "" {
+				funcName = string(f.initFields.funcName)
+			}
+			srcName := ""
+			if f.initFields.src != nil {
+				srcName = f.initFields.src.Name()
+			}
+			entryLine := 0
+			if f.initFields.src != nil && len(f.initFields.code) > 0 {
+				entryLine = f.initFields.src.Position(f.initFields.sourceOffset(0)).Line
+			}
+			fmt.Printf("[CLASS-INITFIELDS] Entering _initFields: func=%q, file=%s, entryLine=%d, codeLen=%d, stepIn=%v, next=%v, lastBPLine=%d\n",
+				funcName, srcName, entryLine, len(f.initFields.code), vm.debugger.stepIn, vm.debugger.next, vm.debugger.lastBreakpoint.line)
+		}
 		vm.pushCtx()
 		vm.prg = f.initFields
 		vm.stash = f.stash
@@ -390,6 +406,23 @@ func (f *classFuncObject) _initFields(instance *Object) {
 func (f *classFuncObject) construct(args []Value, newTarget *Object) *Object {
 	if newTarget == nil {
 		newTarget = f.val
+	}
+	vm := f.val.runtime.vm
+	if vm.debugMode && vm.debugger != nil && debugVM {
+		prgName := "<nil>"
+		prgFile := ""
+		prgEntryLine := 0
+		if f.prg != nil {
+			prgName = string(f.prg.funcName)
+			if f.prg.src != nil {
+				prgFile = f.prg.src.Name()
+				if len(f.prg.code) > 0 {
+					prgEntryLine = f.prg.src.Position(f.prg.sourceOffset(0)).Line
+				}
+			}
+		}
+		fmt.Printf("[CLASS-CONSTRUCT] Entering construct: prg=%q, file=%s, entryLine=%d, derived=%v, stepIn=%v, next=%v, lastBPLine=%d\n",
+			prgName, prgFile, prgEntryLine, f.derived, vm.debugger.stepIn, vm.debugger.next, vm.debugger.lastBreakpoint.line)
 	}
 	if f.prg == nil {
 		instance := f.createInstance(args, newTarget)

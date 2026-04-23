@@ -1041,6 +1041,8 @@ type Debugger struct {
 	stepInLastPC                int      // last PC whose source-mapped line == stepInStartLine; stepIn skips sub-expressions across depth changes
 	stepInLastPCPrg             *Program // the program stepInLastPC was computed for; guard is invalid in any other program
 	stepInStartLine             int // the line where the current stepIn operation began
+	stepInSkipEntryLine         int // when entering a new function via stepIn, skip all PCs on this line (the function declaration line)
+	stepInSkipEntryPrg          *Program // the program the entry line skip is for
 	stepOverMissCount           int // safety counter: instructions with startLine=0 and no valid currentLine
 	suppressedInheritedLine     int // line to suppress after detecting inherited position from skipped if-body
 	suppressedInheritedFile     string // file for the suppressed line (to avoid cross-file suppression)
@@ -3709,13 +3711,6 @@ func (dbg *Debugger) breakpoint() bool {
 		if !found && srcMapFile != "" && srcMapFile != normalizedFilename {
 			found = globalBreakpoints.HasBreakpoint(srcMapFile, line)
 		}
-		// TEMP DEBUG: Log first few global BP checks
-		if dbg.breakpointCheckCount <= 10 {
-			if debugBreakpoint {
-				fmt.Printf("[BP-TRACE-MATCH] vuID=%d, normFile=%q, srcMap=%q, line=%d, found=%v\n",
-				dbg.vuID, normalizedFilename, srcMapFile, line, found)
-			}
-		}
 	}
 
 	if found && dbg.initPhase {
@@ -5719,6 +5714,13 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 	if dbg.vm == nil {
 		return nil
 	}
+	// CRITICAL: Only run getter evaluation when the debugger is paused.
+	// If the VM is running (active=false), saving/restoring VM state races
+	// with the executing goroutine and causes nil pointer panics or stack
+	// corruption.
+	if !dbg.active {
+		return nil
+	}
 	// Track this operation so we can check vmResuming in the deferred restore.
 	// If the VM resumes while we're running, we skip the restore to avoid
 	// corrupting the VM's live state.
@@ -6528,6 +6530,14 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 			err = fmt.Errorf("error getting value: %v", r)
 		}
 	}()
+
+	// CRITICAL: Only allow variable resolution when the debugger is paused.
+	// If the VM is running (active=false), accessing vm.stash/sb/pc races with
+	// the executing goroutine and can cause nil pointer panics, wrong values,
+	// or stack corruption that kills the VU init.
+	if !dbg.active {
+		return nil, fmt.Errorf("cannot access variables: VM is not paused")
+	}
 
 	isLifecycleEntry := dbg.vm.sb < 0 && dbg.vm.pc == 0
 	if dbg.vm.sb < 0 && !isLifecycleEntry {
