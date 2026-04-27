@@ -139,13 +139,24 @@ func (vm *vm) debug() {
 						// instead of inline snapshot logic (was duplicated between vm.go and debugger.go).
 						vm.debugger.ensureInitBPSnapshot()
 
-						wasHitDuringInit := vm.debugger.wasHitDuringInit(normalizedFilename, currentLine)
+						// FIX: Use source-mapped filename for init-BP dedup, not the bundle filename.
+						// In bundled TypeScript, normalizedFilename is the bundle file (e.g., LoadTests.ts).
+						// Multiple original files (CcsApi.ts, Stores.ts) share that name, so using it
+						// causes cross-file line-number collisions: a breakpoint at line 15 in CcsApi.ts
+						// hit during init would suppress a breakpoint at line 15 in Stores.ts.
+						// The source-mapped filename (cachedSrcMapFile) is the ORIGINAL file, making
+						// the dedup key unique per original source file.
+						initCheckFile := normalizedFilename
+						if vm.debugger.cachedSrcMapFile != "" {
+							initCheckFile = vm.debugger.cachedSrcMapFile
+						}
+						wasHitDuringInit := vm.debugger.wasHitDuringInit(initCheckFile, currentLine)
 
 						if wasHitDuringInit {
 							skipBreakpoints = true
 							if vmDebugEnabled || vm.debugger.enableDebugLogging {
-								fmt.Printf("[VM-INIT-CHECK] Skipping init breakpoint at line %d for '%s' (snapshotDone=%v, snapshotSize=%d)\n",
-									currentLine, normalizedFilename, vm.debugger.initBPSnapshotDone, len(vm.debugger.initBPSnapshot))
+								fmt.Printf("[VM-INIT-CHECK] Skipping init breakpoint at line %d for '%s' (srcMap='%s', snapshotDone=%v, snapshotSize=%d)\n",
+									currentLine, normalizedFilename, initCheckFile, vm.debugger.initBPSnapshotDone, len(vm.debugger.initBPSnapshot))
 							}
 						}
 					}
@@ -302,11 +313,28 @@ func (vm *vm) debug() {
 				hasBreakpoint := false
 				if !skipBreakpoints {
 					hasBreakpoint = vm.debugger.breakpoint()
-				} else if vm.debugger.breakpointCheckCount < 3 {
-					vm.debugger.breakpointCheckCount++
-					if debugVM {
-						fmt.Printf("[BP-TRACE] SKIPPED breakpoint() call: skipBreakpoints=true, initPhase=%v, initComplete=%v, normFile=%q\n",
-						vm.debugger.initPhase, vm.debugger.initComplete, vm.debugger.cachedNormFile)
+					// DIAGNOSTIC: Log when breakpoint found during init
+					if hasBreakpoint && vm.debugger.initPhase {
+						fmt.Printf("[VM-INIT-BP] ✅ breakpoint() returned true during init at line %d, file=%q, skipBreakpoints=%v, active=%v, hasConnection=%v\n",
+							vm.debugger.Line(), vm.debugger.cachedNormFile, skipBreakpoints, vm.debugger.active, vm.debugger.HasConnection())
+					}
+				} else {
+					// DIAGNOSTIC: Always log when skipBreakpoints=true for a line that has a registered breakpoint
+					currentLine := vm.debugger.Line()
+					normFile := vm.debugger.cachedNormFile
+					srcMap := vm.debugger.cachedSrcMapFile
+					hasBPGlobal := GetGlobalBreakpoints().HasBreakpoint(normFile, currentLine) ||
+						(srcMap != "" && srcMap != normFile && GetGlobalBreakpoints().HasBreakpoint(srcMap, currentLine))
+					if hasBPGlobal {
+						fmt.Printf("[BP-SKIP-INIT] ⚠️ skipBreakpoints=true BLOCKED breakpoint at line %d, file=%q, srcMap=%q, initPhase=%v, initComplete=%v, vuID=%d\n",
+							currentLine, normFile, srcMap, vm.debugger.initPhase, vm.debugger.initComplete, vm.debugger.vuID)
+					}
+					if vm.debugger.breakpointCheckCount < 3 {
+						vm.debugger.breakpointCheckCount++
+						if debugVM {
+							fmt.Printf("[BP-TRACE] SKIPPED breakpoint() call: skipBreakpoints=true, initPhase=%v, initComplete=%v, normFile=%q\n",
+								vm.debugger.initPhase, vm.debugger.initComplete, vm.debugger.cachedNormFile)
+						}
 					}
 				}
 
@@ -1107,46 +1135,49 @@ func (vm *vm) debug() {
 						breakReason = "breakpoint"
 					}
 
-					// Also suppress if this line was already identified as inherited
-					if suppressedByInheritedLine {
-						shouldBreak = false
-						breakReason = "suppressed-inherited-line"
-					}
-
-					// FIX: Skip breakpoints/steps at ANY instruction whose source position
-					// was inherited from code inside a skipped block (if-body, else-body,
-					// loop body, etc.).
+					// CRITICAL FIX: For explicit breakpoints (hasBreakpoint=true), do NOT
+					// suppress via inherited-position heuristics. The user explicitly set a
+					// breakpoint at this line — it MUST fire when the VM reaches any instruction
+					// mapped to that line. This matches Node.js/V8 debugger semantics.
 					//
-					// When the compiler emits bytecodes, instructions without explicit source
-					// positions inherit the position of the last instruction that had one.
-					// If the last compiled statement is inside an if-body, instructions emitted
-					// AFTER that body (implicit returns, next statements, etc.) inherit the
-					// source line of that last body statement.
+					// The inherited-position suppression (suppressedByInheritedLine and the
+					// forward-jump heuristic) are still applied for step operations (stepIn,
+					// next) where false stops at inherited positions are confusing. But for
+					// explicit breakpoints, the user's intent takes priority.
 					//
-					// When the if-condition is false, the conditional jump skips the body and
-					// lands on these inherited-position instructions. If the user has a
-					// breakpoint on that inherited line (or is stepping), the debugger falsely
-					// pauses — the IDE shows "I'm at line X inside the if-body" even though
-					// the body was never entered.
-					//
-					// Detection: current PC was reached via a forward jump (gap between
-					// lastExecPC and currentPC > 1), AND the bytecode immediately before the
-					// current PC maps to the same source line (confirming position inheritance
-					// from the skipped block's last compiled instruction).
-					//
-					// This does NOT affect code reached sequentially (lastExecPC + 1 == currentPC),
-					// so explicit statements on the same line are not suppressed.
-					if shouldBreak && currentPC > 0 && lastExecPC >= 0 && currentPC > lastExecPC+1 && vm.prg.src != nil {
-						prevInstrLine := vm.prg.src.Position(vm.prg.sourceOffset(currentPC - 1)).Line
-						if prevInstrLine == currentLine {
+					// Previously, these checks would suppress breakpoints during init phase
+					// (module-level code) where forward jumps from import/require calls and
+					// class constructors are common, causing breakpoints at lines like
+					// `const x = value` to never fire.
+					if !hasBreakpoint {
+						// Only apply inherited-position suppression when there's no explicit breakpoint
+						if suppressedByInheritedLine {
 							shouldBreak = false
-							breakReason = "inherited-pos-after-jump"
-							vm.debugger.suppressedInheritedLine = currentLine
-							vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
-							if debugVM {
-								fmt.Printf("[VM-BP-SKIP] Skipping break at line %d (PC=%d): reached via forward jump from lastExecPC=%d, prev bytecode (PC=%d) has same source line (inherited position)\n",
-									currentLine, currentPC, lastExecPC, currentPC-1)
+							breakReason = "suppressed-inherited-line"
+						}
+
+						// Inherited position check: detect forward jumps that land on instructions
+						// with inherited source positions from skipped blocks.
+						if shouldBreak && currentPC > 0 && lastExecPC >= 0 && currentPC > lastExecPC+1 && vm.prg.src != nil {
+							prevInstrLine := vm.prg.src.Position(vm.prg.sourceOffset(currentPC - 1)).Line
+							if prevInstrLine == currentLine {
+								shouldBreak = false
+								breakReason = "inherited-pos-after-jump"
+								vm.debugger.suppressedInheritedLine = currentLine
+								vm.debugger.suppressedInheritedFile = normalizedCurrentFilename
+								if debugVM {
+									fmt.Printf("[VM-BP-SKIP] Skipping break at line %d (PC=%d): reached via forward jump from lastExecPC=%d, prev bytecode (PC=%d) has same source line (inherited position)\n",
+										currentLine, currentPC, lastExecPC, currentPC-1)
+								}
 							}
+						}
+					} else if suppressedByInheritedLine {
+						// Clear the suppression — explicit breakpoint overrides inherited-position suppression
+						vm.debugger.suppressedInheritedLine = 0
+						vm.debugger.suppressedInheritedFile = ""
+						if debugVM {
+							fmt.Printf("[VM-BP-OVERRIDE] Explicit breakpoint at line %d overrides inherited-position suppression (PC=%d, lastExecPC=%d)\n",
+								currentLine, currentPC, lastExecPC)
 						}
 					}
 					// DIAGNOSTIC: Log when breakpoint fires at a line that was reached via forward jump
@@ -1184,6 +1215,12 @@ func (vm *vm) debug() {
 								shouldBreak = false
 							}
 						}
+					}
+
+					// DIAGNOSTIC: Always log when a breakpoint was found but won't cause a break
+					if hasBreakpoint && !shouldBreak {
+						fmt.Printf("[BP-NO-BREAK] ⚠️ breakpoint found but shouldBreak=false: line=%d, file=%q, reason=%q, prevLine=%d, prevFile=%q, active=%v, vuID=%d\n",
+							currentLine, normalizedCurrentFilename, breakReason, prevLine, prevFilename, vm.debugger.active, vm.debugger.vuID)
 					}
 
 						if shouldBreak {
@@ -1245,6 +1282,14 @@ func (vm *vm) debug() {
 						vm.debugger.lastBreakpoint.line = currentLine
 						vm.debugger.lastBreakpoint.pc = currentPC
 						vm.debugger.lastBreakpoint.stackDepth = currentStackDepth
+
+						// DIAGNOSTIC: Always log when debugger will pause
+						phase := "default"
+						if vm.debugger.initPhase {
+							phase = "init"
+						}
+						fmt.Printf("[VM-WILL-BREAK] 🛑 PAUSING at %s:%d (PC=%d, reason=%s, phase=%s, vuID=%d, hasBreakpoint=%v)\n",
+							currentFilename, currentLine, currentPC, breakReason, phase, vm.debugger.vuID, hasBreakpoint)
 
 						// CRITICAL FIX: Capture step flags BEFORE clearing them.
 						// This allows activate() to know whether we broke due to a step command.

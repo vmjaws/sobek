@@ -18,6 +18,10 @@ import (
 	"github.com/grafana/sobek/unistring"
 )
 
+// DebuggerVersion identifies the current debugger build.
+// Bump this on every meaningful change so log output confirms the running version.
+const DebuggerVersion = "0.5.0-20260427"
+
 // Debug logging flags controlled by environment variables
 // Set these env vars to "1" or "true" to enable verbose logging for specific areas
 var (
@@ -124,6 +128,11 @@ type GlobalDebugCoordinator struct {
 	// perVUStepState holds per-VU step state in multi-VU mode. In single-VU
 	// mode, the global fields (globalStepNext, etc.) are used instead.
 	perVUStepState map[uint64]*vuStepState
+
+	// globalStoppedCh is notified by activate() whenever ANY debugger pauses.
+	// doContinue() in the DAP layer listens on this as a cross-VU fallback
+	// to detect breakpoints on VUs other than the one Continue() was called on.
+	globalStoppedCh chan DebuggerActivation
 }
 
 // vuStepState holds step operation state scoped to a single VU.
@@ -171,6 +180,7 @@ func (gdc *GlobalDebugCoordinator) resetLocked() {
 	gdc.activeDebuggers = make(map[uint64]*Debugger)
 	gdc.perVUActivationCh = make(map[uint64]chan chan DebuggerActivation)
 	gdc.perVUStepState = make(map[uint64]*vuStepState)
+	gdc.globalStoppedCh = make(chan DebuggerActivation, 1)
 	atomic.StoreUint32(&gdc.hasAnyStepState, 0)
 	// NOTE: multiVUDebug/multiVUDebugAtomic are NOT reset here — they're set
 	// once at startup and must survive across lifecycle phase resets.
@@ -365,6 +375,40 @@ func (gdc *GlobalDebugCoordinator) GetActiveDebugger() *Debugger {
 
 func (gdc *GlobalDebugCoordinator) ActivationChannel() chan chan DebuggerActivation {
 	return gdc.activationCh
+}
+
+// GlobalStoppedChannel returns the channel that is notified whenever any
+// debugger's activate() fires (breakpoint/step hit). The DAP layer listens
+// on this as a cross-VU fallback so it always detects stops regardless of
+// which VU's debugger Continue() was called on.
+func (gdc *GlobalDebugCoordinator) GlobalStoppedChannel() <-chan DebuggerActivation {
+	return gdc.globalStoppedCh
+}
+
+// NotifyGlobalStopped sends an activation to the global stopped channel.
+// Called by activate() after the debugger has paused. Non-blocking — if the
+// channel is full (previous notification not consumed), the old entry is
+// drained first.
+func (gdc *GlobalDebugCoordinator) NotifyGlobalStopped(activation DebuggerActivation) {
+	select {
+	case <-gdc.globalStoppedCh:
+	default:
+	}
+	select {
+	case gdc.globalStoppedCh <- activation:
+	default:
+	}
+}
+
+// DrainGlobalStopped removes any stale entry from the global stopped channel.
+// Called after the handshake Continue() to prevent the stale activation from
+// winning the select race against the real step result.
+func (gdc *GlobalDebugCoordinator) DrainGlobalStopped() {
+	select {
+	case <-gdc.globalStoppedCh:
+		// drained stale entry
+	default:
+	}
 }
 
 // DrainActivationChannel removes any stale entries from the global activation
@@ -1048,7 +1092,11 @@ type Debugger struct {
 	suppressedInheritedFile     string // file for the suppressed line (to avoid cross-file suppression)
 	steppingFilename            string
 	enableDebugLogging          bool
-	breakpointCheckCount        int // TEMP: counter for debug logging
+	breakpointCheckCount        int // TEMP: counter for unique line transitions logged
+	bpCallLogCount              int // TEMP: counter for BP-ENTRY logs
+	bpCallLogLastLine           int // TEMP: last line logged for BP-ENTRY dedup
+	lastBPTraceLine             int    // last line logged in BP-TRACE (dedup)
+	lastBPTraceFile             string // last file logged in BP-TRACE (dedup)
 	skipPhaseEntryBreak         bool
 	suppressStepInheritance     bool // true during _initFields to prevent global step state from re-enabling step flags
 	lifecycleTransition         bool
@@ -1273,6 +1321,7 @@ type watchExpr struct {
 }
 
 func newDebugger(vm *vm) *Debugger {
+	fmt.Printf("[DEBUGGER] Creating new debugger (version=%s)\n", DebuggerVersion)
 	inheritConnection := false
 	globalInitialized := globalDebugCoordinator.IsInitialized()
 	if globalInitialized {
@@ -1519,6 +1568,19 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 	savedCallDepth := dbg.callStackDepth()
 
 	epoch := globalDebugCoordinator.NextGlobalEpoch()
+
+	// CRITICAL: Notify the global stopped channel so that doContinue() in the
+	// DAP layer can detect this stop even when Continue() was called on a
+	// different VU's debugger. This is the cross-VU notification path.
+	if globalDebugCoordinator.IsInitialized() {
+		globalDebugCoordinator.NotifyGlobalStopped(DebuggerActivation{
+			Filename: filename,
+			Line:     line,
+			Reason:   reason,
+			Epoch:    epoch,
+			VUID:     dbg.vuID,
+		})
+	}
 
 	var ch chan DebuggerActivation
 
@@ -2298,13 +2360,26 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 			// This ensures Continue() finds the debugger that is actually waiting,
 			// regardless of which VU it belongs to.
 			sent := false
-			// Only attempt cross-VU channel sends on the first iteration.
-			// After that, our currentCh is already in the target channel —
-			// re-sending would drain the previous entry and replace it,
-			// wasting CPU and flooding logs with "cross-VU fallback" messages.
-			if !crossVUSent {
+			// FIX: Re-attempt cross-VU sends when a NEW active debugger appears.
+			// Previously, crossVUSent=true after the first iteration prevented
+			// re-sending, even if the target debugger didn't exist yet (e.g.,
+			// VU1 hasn't hit its breakpoint when we first try). Now we track
+			// the last targeted debugger and re-send when a different one appears.
 			if isMultiVU {
 				activeDbg := globalDebugCoordinator.GetActiveDebugger()
+				// Re-send if: first time, OR a new active debugger appeared since last attempt
+				needSend := !crossVUSent
+				if !needSend && activeDbg != nil && activeDbg != dbg && activeDbg.IsActive() {
+					// A new debugger became active — re-attempt cross-VU routing
+					needSend = true
+					// Recreate currentCh so the new target gets a fresh channel
+					dbg.currentCh = make(chan DebuggerActivation)
+					if debugContinue {
+						fmt.Printf("[DEBUGGER-CONTINUE] New active debugger detected (vuID=%d), re-attempting cross-VU routing (ch=%p)\n",
+							activeDbg.GetVUID(), dbg.currentCh)
+					}
+				}
+				if needSend {
 				if activeDbg != nil && activeDbg != dbg && activeDbg.IsActive() {
 					targetVUID := activeDbg.GetVUID()
 					targetActivationCh := activeDbg.ActivationCh()
@@ -2340,13 +2415,12 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 						}
 					}
 				}
-			}
 			// Try 3: global activation channel (cross-VU lifecycle fallback)
 			// After a lifecycle transition (init→default), no active debugger
 			// may exist yet (no VU has hit a breakpoint). The global channel
 			// is listened on by ALL VUs' activate(), so the first one to hit
 			// a breakpoint will pick this up.
-			if !sent && isMultiVU {
+			if !sent {
 				globalCh := globalDebugCoordinator.ActivationChannel()
 				// Drain any stale entry first (buffered 1 channel)
 				select {
@@ -2366,9 +2440,6 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 			if !sent {
 				select {
 				case <-vuActivationCh:
-					// if debugContinue {
-					// 	fmt.Printf("[DEBUGGER-CONTINUE] Drained stale entry from coordinator channel (multiVU=%v, vuID=%d)\n", isMultiVU, dbg.vuID)
-					// }
 				default:
 				}
 				select {
@@ -2383,7 +2454,8 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 				}
 			}
 			crossVUSent = true
-			} // end if !crossVUSent
+				} // end if needSend
+			} // end if isMultiVU
 			if activation, ok, _ := waitForActivation("global", true); ok {
 				return activation
 			}
@@ -2717,6 +2789,21 @@ func (dbg *Debugger) SetInitPhase(inInit bool) {
 
 	if debugInit {
 		fmt.Printf("[DEBUGGER] Init phase set to: %v\n", inInit)
+	}
+
+	if inInit && !wasInInit {
+		// DIAGNOSTIC: Dump all registered breakpoints to help trace filename mismatches
+		allBPs := globalBreakpoints.GetAllBreakpoints()
+		fmt.Printf("[DEBUGGER-INIT-START] Init phase starting. Global breakpoints (%d files):\n", len(allBPs))
+		for file, lines := range allBPs {
+			fmt.Printf("[DEBUGGER-INIT-START]   file=%q, lines=%v\n", file, lines)
+		}
+		dbg.breakpointMutex.RLock()
+		fmt.Printf("[DEBUGGER-INIT-START] Local breakpoints (%d files):\n", len(dbg.breakpoints))
+		for file, lines := range dbg.breakpoints {
+			fmt.Printf("[DEBUGGER-INIT-START]   file=%q, lines=%v\n", file, lines)
+		}
+		dbg.breakpointMutex.RUnlock()
 	}
 
 	if inInit && !wasInInit && dbg.initFilename == "" {
@@ -3637,13 +3724,47 @@ func (dbg *Debugger) breakpoint() bool {
 	normalizedFilename := dbg.cachedNormFile
 	line := dbg.Line()
 
-	// TEMP DEBUG: Log the first 5 breakpoint checks to diagnose filename matching
-	if dbg.breakpointCheckCount < 5 {
+	// DIAGNOSTIC: Log EVERY call to breakpoint() for the specific file that has breakpoints.
+	// Only log distinct lines to avoid flooding on repeated line=2 import bytecodes.
+	if strings.HasSuffix(normalizedFilename, "LoadTests.ts") {
+		if dbg.bpCallLogLastLine != line {
+			dbg.bpCallLogLastLine = line
+			if dbg.bpCallLogCount < 50 {
+				dbg.bpCallLogCount++
+				fmt.Printf("[BP-ENTRY] breakpoint() called: file=%q, line=%d, initPhase=%v, initComplete=%v, vuID=%d, hasLocal=%v, hasGlobal=%v, suppress=%v, active=%v\n",
+					normalizedFilename, line, dbg.initPhase, dbg.initComplete, dbg.vuID, dbg.hasLocalBPs, dbg.hasGlobalBPs, dbg.suppressDebugger, dbg.active)
+			}
+		}
+	}
+
+	// DIAGNOSTIC: Always log when breakpoint() is called for a file+line that has a registered BP.
+	// This is NOT gated by bpTraceLimit — it only fires for actual breakpoint lines.
+	if dbg.hasGlobalBPs {
+		srcMap := dbg.cachedSrcMapFile
+		checkFile := normalizedFilename
+		if srcMap != "" {
+			checkFile = srcMap
+		}
+		if globalBreakpoints.HasBreakpoint(checkFile, line) || globalBreakpoints.HasBreakpoint(normalizedFilename, line) {
+			fmt.Printf("[BP-CHECK-HIT] breakpoint() checking REGISTERED BP line: file=%q, srcMap=%q, line=%d, initPhase=%v, initComplete=%v, suppress=%v, vuID=%d, active=%v\n",
+				normalizedFilename, srcMap, line, dbg.initPhase, dbg.initComplete, dbg.suppressDebugger, dbg.vuID, dbg.active)
+		}
+	}
+
+	// TEMP DEBUG: Log breakpoint checks on LINE TRANSITIONS to diagnose filename matching.
+	// Instead of logging every check (which floods with repeated line=2 during init),
+	// only log when the line number changes. This ensures we see all unique lines checked
+	// without exhausting the trace limit on repeated import-resolution bytecodes.
+	bpTraceLimit := 200
+	lineChanged := dbg.lastBPTraceLine != line || dbg.lastBPTraceFile != normalizedFilename
+	if lineChanged && dbg.breakpointCheckCount < bpTraceLimit {
 		dbg.breakpointCheckCount++
+		dbg.lastBPTraceLine = line
+		dbg.lastBPTraceFile = normalizedFilename
 		srcMapFile := dbg.cachedSrcMapFile
 		if debugBreakpoint {
-			fmt.Printf("[BP-TRACE] vuID=%d, normFile=%q, srcMapFile=%q, line=%d, hasLocal=%v, hasGlobal=%v, globalCount=%d\n",
-			dbg.vuID, normalizedFilename, srcMapFile, line, dbg.hasLocalBPs, dbg.hasGlobalBPs, globalBreakpoints.Count())
+			fmt.Printf("[BP-TRACE] vuID=%d, normFile=%q, srcMapFile=%q, line=%d, hasLocal=%v, hasGlobal=%v, globalCount=%d, initPhase=%v\n",
+			dbg.vuID, normalizedFilename, srcMapFile, line, dbg.hasLocalBPs, dbg.hasGlobalBPs, globalBreakpoints.Count(), dbg.initPhase)
 		}
 	}
 
@@ -3667,7 +3788,15 @@ func (dbg *Debugger) breakpoint() bool {
 		// because module-level init code runs inside a Go callback wrapper (bundle.go
 		// call(nil)) that pushes a call frame — callStackDepth >= 1 even at module level.
 		dbg.ensureInitBPSnapshot()
-		if dbg.wasHitDuringInit(normalizedFilename, line) {
+		// FIX: Use source-mapped filename for the dedup check, not the bundle filename.
+		// This matches the recording side (RecordInitBreakpoint) which also uses srcMapFile.
+		initCheckFile := normalizedFilename
+		if dbg.cachedSrcMapFile != "" {
+			initCheckFile = dbg.cachedSrcMapFile
+		}
+		if dbg.wasHitDuringInit(initCheckFile, line) {
+			fmt.Printf("[BP-DEDUP] ⛔ Init dedup suppressed: file=%q, initCheckFile=%q, line=%d, vuID=%d\n",
+				normalizedFilename, initCheckFile, line, dbg.vuID)
 			return false
 		}
 	}
@@ -3714,11 +3843,37 @@ func (dbg *Debugger) breakpoint() bool {
 		}
 	}
 
+
+	// DIAGNOSTIC: Always log when a breakpoint is found (or when we're at a line with a
+	// global breakpoint but didn't find it via the normal lookup — filename mismatch diagnosis).
 	if found && dbg.initPhase {
-		globalInitTracker.RecordInitBreakpoint(normalizedFilename, line)
+		// Use source-mapped filename for init-BP recording when available.
+		// In bundled TypeScript, normalizedFilename is the bundle file — using it
+		// causes cross-file collisions (e.g., CcsApi.ts line 15 suppresses
+		// Stores.ts line 15 because both share the same bundle filename).
+		initRecordFile := normalizedFilename
+		if srcMapFile != "" {
+			initRecordFile = srcMapFile
+		}
+		globalInitTracker.RecordInitBreakpoint(initRecordFile, line)
+		fmt.Printf("[BP-INIT-HIT] ✅ Init breakpoint found: file=%q, srcMapFile=%q, initRecordFile=%q, line=%d, vuID=%d, active=%v, hasConnection=%v\n",
+			normalizedFilename, srcMapFile, initRecordFile, line, dbg.vuID, dbg.active, dbg.HasConnection())
+	}
+	if !found && dbg.initPhase && dbg.hasGlobalBPs {
+		// Check if ANY global breakpoint exists at this line (regardless of filename)
+		// to diagnose filename mismatches
+		gbr := globalBreakpoints.GetAllBreakpoints()
+		for bpFile, bpLines := range gbr {
+			for _, bpLine := range bpLines {
+				if bpLine == line {
+					fmt.Printf("[BP-INIT-MISS] ⚠️ Global BP exists at line %d in file=%q, but not found for normFile=%q, srcMapFile=%q (vuID=%d, initPhase=%v)\n",
+						line, bpFile, normalizedFilename, srcMapFile, dbg.vuID, dbg.initPhase)
+				}
+			}
+		}
 	}
 
-	if found && dbg.enableDebugLogging && isNewLine {
+	if found && (debugBreakpoint || dbg.enableDebugLogging) && isNewLine {
 		willStop := true
 		skipReason := ""
 		if dbg.next {
@@ -3737,7 +3892,7 @@ func (dbg *Debugger) breakpoint() bool {
 		}
 		if willStop {
 			if debugBreakpoint {
-				fmt.Printf("[BREAKPOINT-CHECK] ✅✅ BREAKPOINT HIT at line %d in '%s' - will activate debugger\n", line, dbg.cachedFilename)
+				fmt.Printf("[BREAKPOINT-CHECK] ✅✅ BREAKPOINT HIT at line %d in '%s' (initPhase=%v) - will activate debugger\n", line, dbg.cachedFilename, dbg.initPhase)
 			}
 		} else {
 			if debugBreakpoint {
@@ -3746,7 +3901,25 @@ func (dbg *Debugger) breakpoint() bool {
 		}
 	}
 
+	if found {
+		dbg.logBreakpointFound(line, normalizedFilename, srcMapFile)
+	}
+
 	return found
+}
+
+// DIAGNOSTIC: logBreakpointFound is called whenever breakpoint() returns true.
+// This is always-on (not gated by debugBreakpoint) to trace breakpoint activation
+// issues across k6 stages (init, setup, default, teardown).
+func (dbg *Debugger) logBreakpointFound(line int, normalizedFilename, srcMapFile string) {
+	phase := "default"
+	if dbg.initPhase {
+		phase = "init"
+	} else if dbg.initComplete {
+		phase = "post-init"
+	}
+	fmt.Printf("[BP-FOUND] ✅ breakpoint() found match: file=%q, srcMap=%q, line=%d, phase=%s, vuID=%d, active=%v, next=%v, stepIn=%v, suppress=%v, depth=%d\n",
+		normalizedFilename, srcMapFile, line, phase, dbg.vuID, dbg.active, dbg.next, dbg.stepIn, dbg.suppressDebugger, dbg.callStackDepth())
 }
 
 func (dbg *Debugger) getLastLine() int {

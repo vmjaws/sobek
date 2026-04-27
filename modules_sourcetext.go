@@ -23,21 +23,41 @@ type SourceTextModuleInstance struct {
 }
 
 func (s *SourceTextModuleInstance) ExecuteModule(rt *Runtime, res, rej func(interface{}) error) (CyclicModuleInstance, error) {
-	// If the debugger is active, suppress it during module body execution.
-	// The module body must run synchronously to completion (for non-TLA modules)
-	// so the promise resolves. If the debugger pauses mid-execution, the promise
-	// stays Pending and we panic at the state check below.
-	// User breakpoints in module-level code will still be hit when the module's
-	// exported functions are called (setup, default, teardown).
-	if rt.vm.debugMode && rt.vm.debugger != nil && !rt.vm.debugger.suppressDebugger {
-		rt.vm.debugger.suppressDebugger = true
-		rt.vm.debugger.suppressDebugDepth++
-		defer func() {
-			rt.vm.debugger.suppressDebugDepth--
-			if rt.vm.debugger.suppressDebugDepth == 0 {
-				rt.vm.debugger.suppressDebugger = false
+	// Determine module name for logging
+	moduleName := "<unknown>"
+	if s.moduleRecord != nil && s.moduleRecord.p != nil && s.moduleRecord.p.src != nil {
+		moduleName = s.moduleRecord.p.src.Name()
+	}
+
+	if rt.vm.debugMode && rt.vm.debugger != nil {
+		initAlreadyCompleted := GetGlobalInitTracker().HasAnyInitCompleted()
+		isInitPhase := rt.vm.debugger.initPhase
+		vuID := rt.vm.debugger.vuID
+		alreadySuppressed := rt.vm.debugger.suppressDebugger
+		hasNext := rt.vm.debugger.next
+		hasStepIn := rt.vm.debugger.stepIn
+
+		fmt.Printf("[EXEC-MODULE] module=%q, vuID=%d, initPhase=%v, initAlreadyCompleted=%v, suppressDebugger=%v, next=%v, stepIn=%v, suppressDepth=%d\n",
+			moduleName, vuID, isInitPhase, initAlreadyCompleted, alreadySuppressed, hasNext, hasStepIn, rt.vm.debugger.suppressDebugDepth)
+
+		if !alreadySuppressed {
+			if initAlreadyCompleted {
+				fmt.Printf("[EXEC-MODULE] ⛔ SUPPRESSING debugger for module %q (init already completed, this is a re-init)\n", moduleName)
+				rt.vm.debugger.suppressDebugger = true
+				rt.vm.debugger.suppressDebugDepth++
+				defer func() {
+					rt.vm.debugger.suppressDebugDepth--
+					if rt.vm.debugger.suppressDebugDepth == 0 {
+						rt.vm.debugger.suppressDebugger = false
+					}
+					fmt.Printf("[EXEC-MODULE] ✅ UNSUPPRESSED debugger after module %q (suppressDepth=%d)\n", moduleName, rt.vm.debugger.suppressDebugDepth)
+				}()
+			} else {
+				fmt.Printf("[EXEC-MODULE] ✅ ALLOWING debugger for module %q (first init, breakpoints can fire)\n", moduleName)
 			}
-		}()
+		} else {
+			fmt.Printf("[EXEC-MODULE] ⏭️ Already suppressed for module %q, skipping suppression logic\n", moduleName)
+		}
 	}
 
 	promiseP := s.pcap.promise.self.(*Promise)
@@ -726,7 +746,34 @@ func (module *SourceTextModuleRecord) ResolveExport(exportName string, resolvese
 }
 
 func (module *SourceTextModuleRecord) Instantiate(rt *Runtime) (CyclicModuleInstance, error) {
-	// fmt.Println("Instantiate", module.p.src.Name())
+	moduleName := "<unknown>"
+	if module.p != nil && module.p.src != nil {
+		moduleName = module.p.src.Name()
+	}
+	if rt.vm.debugMode && rt.vm.debugger != nil {
+		fmt.Printf("[INSTANTIATE-MODULE] module=%q, vuID=%d, initPhase=%v, suppressDebugger=%v, next=%v, stepIn=%v\n",
+			moduleName, rt.vm.debugger.vuID, rt.vm.debugger.initPhase, rt.vm.debugger.suppressDebugger, rt.vm.debugger.next, rt.vm.debugger.stepIn)
+	}
+
+	// Suppress the debugger during Instantiate when init has already completed.
+	// Instantiate runs RunProgram which goes through vm.debug(). If stale step
+	// state (next=true) was inherited from the previous phase, it causes the VM
+	// to stop inside module setup code (e.g. CcsApi.ts), blocking the entire
+	// VU 0 re-init for setup/teardown.
+	if rt.vm.debugMode && rt.vm.debugger != nil && !rt.vm.debugger.suppressDebugger {
+		if GetGlobalInitTracker().HasAnyInitCompleted() {
+			fmt.Printf("[INSTANTIATE-MODULE] ⛔ SUPPRESSING debugger for Instantiate %q (init already completed)\n", moduleName)
+			rt.vm.debugger.suppressDebugger = true
+			rt.vm.debugger.suppressDebugDepth++
+			defer func() {
+				rt.vm.debugger.suppressDebugDepth--
+				if rt.vm.debugger.suppressDebugDepth == 0 {
+					rt.vm.debugger.suppressDebugger = false
+				}
+			}()
+		}
+	}
+
 	mi := &SourceTextModuleInstance{
 		moduleRecord:  module,
 		exportGetters: make(map[string]func() Value),
