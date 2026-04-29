@@ -108,6 +108,11 @@ type compiler struct {
 	// so the debugger pauses at '}' after a return (like Node.js/V8).
 	funcClosingBracePos file.Idx
 
+	// debugScopeEndPCs tracks ending PCs for block scopes (debug mode only).
+	// Populated by markScopeEndPC (called from popScope when c.debug is true).
+	// Used by collectAllDebugSymbols for accurate block-scope PC ranges.
+	debugScopeEndPCs map[*scope]int
+
 	codeScratchpad []instruction
 
 	stringCache map[unistring.String]Value
@@ -421,6 +426,9 @@ func (c *compiler) newBlockScope() {
 }
 
 func (c *compiler) popScope() {
+	if c.debug {
+		c.markScopeEndPC()
+	}
 	c.scope = c.scope.outer
 }
 
@@ -1209,7 +1217,10 @@ func (c *compiler) compileLocalExportEntry(entry exportEntry) {
 	exportName := unistring.NewFromString(entry.localName)
 	module := c.module
 	callback := func(vm *vm, getter func() Value) {
-		vm.r.modules[module].(*SourceTextModuleInstance).exportGetters[exportName.String()] = getter
+		stmi := vm.r.modules[module].(*SourceTextModuleInstance)
+		stmi.exportGettersMu.Lock()
+		stmi.exportGetters[exportName.String()] = getter
+		stmi.exportGettersMu.Unlock()
 	}
 
 	if entry.lex || !c.scope.boundNames[exportName].isVar {
@@ -1238,9 +1249,12 @@ func (c *compiler) compileIndirectExportEntry(entry exportEntry) {
 	module := c.module
 	c.emit(exportIndirect{callback: func(vm *vm) {
 		m := vm.r.modules[module]
-		m.(*SourceTextModuleInstance).exportGetters[exportName] = func() Value {
+		stmi := m.(*SourceTextModuleInstance)
+		stmi.exportGettersMu.Lock()
+		stmi.exportGetters[exportName] = func() Value {
 			return vm.r.modules[b.Module].GetBindingValue(importName)
 		}
+		stmi.exportGettersMu.Unlock()
 	}})
 }
 

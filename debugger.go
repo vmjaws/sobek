@@ -1321,7 +1321,9 @@ type watchExpr struct {
 }
 
 func newDebugger(vm *vm) *Debugger {
-	fmt.Printf("[DEBUGGER] Creating new debugger (version=%s)\n", DebuggerVersion)
+	if debugActivate || debugAll {
+		fmt.Printf("[DEBUGGER] Creating new debugger (version=%s)\n", DebuggerVersion)
+	}
 	inheritConnection := false
 	globalInitialized := globalDebugCoordinator.IsInitialized()
 	if globalInitialized {
@@ -2792,18 +2794,20 @@ func (dbg *Debugger) SetInitPhase(inInit bool) {
 	}
 
 	if inInit && !wasInInit {
-		// DIAGNOSTIC: Dump all registered breakpoints to help trace filename mismatches
-		allBPs := globalBreakpoints.GetAllBreakpoints()
-		fmt.Printf("[DEBUGGER-INIT-START] Init phase starting. Global breakpoints (%d files):\n", len(allBPs))
-		for file, lines := range allBPs {
-			fmt.Printf("[DEBUGGER-INIT-START]   file=%q, lines=%v\n", file, lines)
+		if debugInit || debugAll {
+			// DIAGNOSTIC: Dump all registered breakpoints to help trace filename mismatches
+			allBPs := globalBreakpoints.GetAllBreakpoints()
+			fmt.Printf("[DEBUGGER-INIT-START] Init phase starting. Global breakpoints (%d files):\n", len(allBPs))
+			for file, lines := range allBPs {
+				fmt.Printf("[DEBUGGER-INIT-START]   file=%q, lines=%v\n", file, lines)
+			}
+			dbg.breakpointMutex.RLock()
+			fmt.Printf("[DEBUGGER-INIT-START] Local breakpoints (%d files):\n", len(dbg.breakpoints))
+			for file, lines := range dbg.breakpoints {
+				fmt.Printf("[DEBUGGER-INIT-START]   file=%q, lines=%v\n", file, lines)
+			}
+			dbg.breakpointMutex.RUnlock()
 		}
-		dbg.breakpointMutex.RLock()
-		fmt.Printf("[DEBUGGER-INIT-START] Local breakpoints (%d files):\n", len(dbg.breakpoints))
-		for file, lines := range dbg.breakpoints {
-			fmt.Printf("[DEBUGGER-INIT-START]   file=%q, lines=%v\n", file, lines)
-		}
-		dbg.breakpointMutex.RUnlock()
 	}
 
 	if inInit && !wasInInit && dbg.initFilename == "" {
@@ -2998,6 +3002,30 @@ func (dbg *Debugger) GetCurrentBreakpointInfo() (string, int, int, bool) {
 		dbg.breakpointMutex.RUnlock()
 	}
 	return filename, line, id, true
+}
+
+// GetCurrentFuncName returns the name of the function currently being executed.
+// Returns "" for module-level code (init phase).
+func (dbg *Debugger) GetCurrentFuncName() string {
+	if dbg.vm == nil || dbg.vm.prg == nil {
+		return ""
+	}
+	return string(dbg.vm.prg.funcName)
+}
+
+// ReleasePendingChannel closes pendingCh and currentCh so that activate()
+// (which is blocked on <-ch) can return and the VM resumes execution.
+// Called when the DAP layer detects a stale activation and needs to let
+// the old VM continue before switching to a different debugger.
+func (dbg *Debugger) ReleasePendingChannel() {
+	if dbg.pendingCh != nil {
+		safeCloseActivationCh(dbg.pendingCh)
+		dbg.pendingCh = nil
+	}
+	if dbg.currentCh != nil {
+		safeCloseActivationCh(dbg.currentCh)
+		dbg.currentCh = nil
+	}
 }
 
 func (dbg *Debugger) GetActivationEpoch() uint64 {
@@ -3246,6 +3274,28 @@ func (dbg *Debugger) Next() error {
 		if dbg.vm != nil && dbg.vm.prg != nil && !dbg.vmResuming.Load() {
 			dbg.stepOverLastPC = dbg.vm.prg.lastPCForLine(startLine, dbg.lastBreakpoint.pc, steppingFilename)
 			dbg.stepOverLastPCPrg = dbg.vm.prg
+			// LOOP GUARD: If the computed range [breakpointPC .. stepOverLastPC]
+			// contains a backward jump instruction, it spans a loop body
+			// (for/while/do-while). The sub-expression skip must be disabled
+			// so that step-over stops at the first line inside the loop body,
+			// matching Node.js/V8 debugger behaviour.
+			// Also: when stepOverLastPC <= breakpointPC, there are NO sub-expressions
+			// ahead to skip (e.g., loop update/back-edge on 2nd+ iteration).
+			if dbg.stepOverLastPC > dbg.lastBreakpoint.pc {
+				if dbg.vm.prg.hasBackwardJumpBetween(dbg.lastBreakpoint.pc, dbg.stepOverLastPC) {
+					if debugContinue {
+						fmt.Printf("[NEXT] Loop detected in PC range [%d..%d] for line %d — disabling sub-expression skip\n",
+							dbg.lastBreakpoint.pc, dbg.stepOverLastPC, startLine)
+					}
+					dbg.stepOverLastPC = -1
+					dbg.stepOverLastPCPrg = nil
+				}
+			} else {
+				// stepOverLastPC <= breakpointPC: no sub-expressions ahead.
+				// Disable skip so step-over re-enters loop body on next iteration.
+				dbg.stepOverLastPC = -1
+				dbg.stepOverLastPCPrg = nil
+			}
 		} else {
 			dbg.stepOverLastPC = -1
 			dbg.stepOverLastPCPrg = nil
@@ -3726,7 +3776,7 @@ func (dbg *Debugger) breakpoint() bool {
 
 	// DIAGNOSTIC: Log EVERY call to breakpoint() for the specific file that has breakpoints.
 	// Only log distinct lines to avoid flooding on repeated line=2 import bytecodes.
-	if strings.HasSuffix(normalizedFilename, "LoadTests.ts") {
+	if (debugBreakpoint || debugAll) && strings.HasSuffix(normalizedFilename, "LoadTests.ts") {
 		if dbg.bpCallLogLastLine != line {
 			dbg.bpCallLogLastLine = line
 			if dbg.bpCallLogCount < 50 {
@@ -3739,7 +3789,7 @@ func (dbg *Debugger) breakpoint() bool {
 
 	// DIAGNOSTIC: Always log when breakpoint() is called for a file+line that has a registered BP.
 	// This is NOT gated by bpTraceLimit — it only fires for actual breakpoint lines.
-	if dbg.hasGlobalBPs {
+	if (debugBreakpoint || debugAll) && dbg.hasGlobalBPs {
 		srcMap := dbg.cachedSrcMapFile
 		checkFile := normalizedFilename
 		if srcMap != "" {
@@ -3795,8 +3845,10 @@ func (dbg *Debugger) breakpoint() bool {
 			initCheckFile = dbg.cachedSrcMapFile
 		}
 		if dbg.wasHitDuringInit(initCheckFile, line) {
-			fmt.Printf("[BP-DEDUP] ⛔ Init dedup suppressed: file=%q, initCheckFile=%q, line=%d, vuID=%d\n",
-				normalizedFilename, initCheckFile, line, dbg.vuID)
+			if debugBreakpoint || debugAll {
+				fmt.Printf("[BP-DEDUP] ⛔ Init dedup suppressed: file=%q, initCheckFile=%q, line=%d, vuID=%d\n",
+					normalizedFilename, initCheckFile, line, dbg.vuID)
+			}
 			return false
 		}
 	}
@@ -3856,10 +3908,12 @@ func (dbg *Debugger) breakpoint() bool {
 			initRecordFile = srcMapFile
 		}
 		globalInitTracker.RecordInitBreakpoint(initRecordFile, line)
-		fmt.Printf("[BP-INIT-HIT] ✅ Init breakpoint found: file=%q, srcMapFile=%q, initRecordFile=%q, line=%d, vuID=%d, active=%v, hasConnection=%v\n",
-			normalizedFilename, srcMapFile, initRecordFile, line, dbg.vuID, dbg.active, dbg.HasConnection())
+		if debugBreakpoint || debugAll {
+			fmt.Printf("[BP-INIT-HIT] ✅ Init breakpoint found: file=%q, srcMapFile=%q, initRecordFile=%q, line=%d, vuID=%d, active=%v, hasConnection=%v\n",
+				normalizedFilename, srcMapFile, initRecordFile, line, dbg.vuID, dbg.active, dbg.HasConnection())
+		}
 	}
-	if !found && dbg.initPhase && dbg.hasGlobalBPs {
+	if !found && dbg.initPhase && dbg.hasGlobalBPs && (debugBreakpoint || debugAll) {
 		// Check if ANY global breakpoint exists at this line (regardless of filename)
 		// to diagnose filename mismatches
 		gbr := globalBreakpoints.GetAllBreakpoints()
@@ -3912,6 +3966,9 @@ func (dbg *Debugger) breakpoint() bool {
 // This is always-on (not gated by debugBreakpoint) to trace breakpoint activation
 // issues across k6 stages (init, setup, default, teardown).
 func (dbg *Debugger) logBreakpointFound(line int, normalizedFilename, srcMapFile string) {
+	if !(debugBreakpoint || debugAll) {
+		return
+	}
 	phase := "default"
 	if dbg.initPhase {
 		phase = "init"
@@ -4097,6 +4154,18 @@ func (dbg *Debugger) StepIn() error {
 			dbg.stepInStartLine = startLine
 			dbg.stepInLastPC = dbg.vm.prg.lastPCForLine(startLine, dbg.lastBreakpoint.pc, steppingFilename)
 			dbg.stepInLastPCPrg = dbg.vm.prg
+			// LOOP GUARD: same as step-over — disable sub-expression skip
+			// if the range spans a loop body (contains a backward jump),
+			// OR if there are no sub-expressions ahead (lastPC <= breakpointPC).
+			if dbg.stepInLastPC > dbg.lastBreakpoint.pc {
+				if dbg.vm.prg.hasBackwardJumpBetween(dbg.lastBreakpoint.pc, dbg.stepInLastPC) {
+					dbg.stepInLastPC = -1
+					dbg.stepInLastPCPrg = nil
+				}
+			} else {
+				dbg.stepInLastPC = -1
+				dbg.stepInLastPCPrg = nil
+			}
 		} else {
 			dbg.stepInStartLine = 0
 			dbg.stepInLastPC = -1
@@ -5684,6 +5753,29 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 
 		// Save context — pushCtx saves prg, stash, pc, sb, args (NOT sp).
 		vm.pushCtx()
+		// CRITICAL: Defer the restore so it runs on ALL exit paths —
+		// normal return, vmResuming early return, AND panics caught by
+		// the recover defer above. Without this, an early return (e.g.,
+		// vmResuming at line ~5736) skips popCtx + sp restore, leaving
+		// the VM with a corrupted call stack and sp. On resume, getProp
+		// or similar opcodes hit "index out of range" because sp points
+		// past the stack.
+		ctxPushed := true
+		defer func() {
+			if !ctxPushed {
+				return
+			}
+			// Guard against popCtx panicking (empty callStack).
+			func() {
+				defer func() { recover() }()
+				vm.popCtx()
+			}()
+			vm.sp = savedSP
+			vm.result = savedResult
+			if savedStackRegion != nil && savedSP+len(savedStackRegion) <= len(vm.stack) {
+				copy(vm.stack[savedSP:savedSP+len(savedStackRegion)], savedStackRegion)
+			}
+		}()
 
 		// Get the function object from the current frame (like runtime.eval direct mode)
 		funcObj := Value(_undefined)
@@ -5707,27 +5799,23 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		ex := vm.runTry()
 		retval := vm.result
 
-		// If the VM has resumed while we were running, do NOT restore
-		// stale state — the VM goroutine is already executing.
+		// Mark context as handled — the defer will still run but
+		// we do the popCtx/restore here for the normal path so we
+		// can capture retval correctly.
+		ctxPushed = false
+
+		// If the VM has resumed while we were running, do NOT use
+		// the result — but sp/ctx are already restored by the defer.
 		if dbg.vmResuming.Load() {
 			evalErr = fmt.Errorf("evaluation aborted: VM resumed")
 			return
 		}
 
 		vm.popCtx()
-		// Restore sp to its pre-eval value. This is safe because the eval
-		// pushed exactly 2 values (funcObj + nil) onto the main stack, and
-		// those must be removed. But if an exception occurred, handleThrow
-		// may have already adjusted sp unpredictably — using the saved value
-		// guarantees the main program resumes with its original stack intact.
 		vm.sp = savedSP
 		vm.result = savedResult
 
-		// Restore the stack region that the eval may have overwritten.
-		// This is critical for mid-expression pauses where intermediate
-		// values are live on the stack (e.g., after loadStash pushed a
-		// value but before the next instruction consumed it).
-		if savedStackRegion != nil {
+		if savedStackRegion != nil && savedSP+len(savedStackRegion) <= len(vm.stack) {
 			copy(vm.stack[savedSP:savedSP+len(savedStackRegion)], savedStackRegion)
 		}
 
@@ -6120,6 +6208,26 @@ func (dbg *Debugger) getValueFromLocation(varLoc VarLocation) (Value, error) {
 
 func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 	locals := make(map[string]Value, 16) // PERF: pre-allocate; will grow if needed
+
+	// ── Exception break: use saved throw-site state ──────────────────────
+	// When paused on an exception, handleThrow has already unwound vm.stash,
+	// vm.sb, and vm.prg. The throw-site state was saved in exceptionStash/
+	// exceptionSB/exceptionPrg. Use buildPausedVarSnapshot which already
+	// handles this — it checks exceptionBreakActive and walks exceptionStash.
+	// This matches how getValue/Evaluate works (which the user reports as
+	// working), ensuring the Variables panel shows the same data as hover.
+	if dbg.exceptionBreakActive && dbg.exceptionStash != nil {
+		snap := dbg.buildPausedVarSnapshot()
+		for k, v := range snap {
+			if v != nil && isIdentifierLike(k) && !globalBuiltinKeys[k] && !globalUnsafeKeys[k] {
+				locals[k] = v
+			}
+		}
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] GetLocalVariables: exception break — collected %d variables from snapshot\n", len(locals))
+		}
+		return locals, nil
+	}
 
 	if !dbg.active || dbg.vm.prg == nil {
 		if dbg.vm.prg == nil {
@@ -6522,7 +6630,69 @@ func (dbg *Debugger) CaptureGlobalNames() {
 
 func (dbg *Debugger) GetGlobalVariables() map[string]Value {
 	globals := make(map[string]Value)
-	if dbg.vm == nil || dbg.vm.prg == nil {
+	if dbg.vm == nil {
+		return globals
+	}
+
+	// ── Exception break: use saved throw-site state ──────────────────────
+	// When paused on an exception, vm.prg/vm.stash may be unwound.
+	// Use exceptionStash to walk the stash chain from the throw site.
+	if dbg.exceptionBreakActive && dbg.exceptionStash != nil {
+		stashToWalk := dbg.exceptionStash
+		prgToUse := dbg.exceptionPrg
+		skipLevel0 := prgToUse != nil && prgToUse.funcName != ""
+		stashLevel := 0
+		for s := stashToWalk; s != nil; s = s.outer {
+			if (stashLevel > 0 || !skipLevel0) && s.names != nil {
+				for name, idx := range s.names {
+					nameStr := name.String()
+					if !isIdentifierLike(nameStr) || nameStr == "" {
+						continue
+					}
+					if _, exists := globals[nameStr]; exists {
+						continue
+					}
+					if s.outer == nil && globalBuiltinKeys[nameStr] {
+						continue
+					}
+					actualIdx := idx & uint32(maskIndex)
+					if int(actualIdx) >= 0 && int(actualIdx) < len(s.values) {
+						val := s.values[actualIdx]
+						if val != nil && !isNullValue(val) {
+							globals[nameStr] = val
+						}
+					}
+				}
+			}
+			stashLevel++
+		}
+		// Also check the global object
+		if dbg.vm.r != nil {
+			if globalObj := dbg.vm.r.globalObject; globalObj != nil {
+				for _, keyStr := range safeStringKeys(globalObj) {
+					if !isIdentifierLike(keyStr) || keyStr == "" {
+						continue
+					}
+					if _, exists := globals[keyStr]; exists {
+						continue
+					}
+					if globalBuiltinKeys[keyStr] || globalUnsafeKeys[keyStr] {
+						continue
+					}
+					keyUniStr := unistring.String(keyStr)
+					if v := safeGetGlobalProperty(globalObj, keyUniStr); v != nil && !isNullValue(v) {
+						globals[keyStr] = v
+					}
+				}
+			}
+		}
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] GetGlobalVariables: exception break — collected %d global variables from exception stash\n", len(globals))
+		}
+		return globals
+	}
+
+	if dbg.vm.prg == nil {
 		return globals
 	}
 	if !dbg.globalsCaptured && !dbg.initPhase {
@@ -6626,6 +6796,7 @@ func (dbg *Debugger) GetAllStashVariables() map[string]Value {
 		moduleCount := 0
 		for _, mi := range dbg.vm.r.modules {
 			if stmi, ok := mi.(*SourceTextModuleInstance); ok && stmi.exportGetters != nil {
+				stmi.exportGettersMu.RLock()
 				for name, getter := range stmi.exportGetters {
 					if _, exists := vars[name]; exists {
 						continue
@@ -6646,6 +6817,7 @@ func (dbg *Debugger) GetAllStashVariables() map[string]Value {
 						// }
 					}
 				}
+				stmi.exportGettersMu.RUnlock()
 				moduleCount++
 			}
 		}
@@ -6754,10 +6926,17 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 	// If the VM is running (active=false), accessing vm.stash/sb/pc races with
 	// the executing goroutine and can cause nil pointer panics, wrong values,
 	// or stack corruption that kills the VU init.
-	// EXCEPTION: When the VM just returned from a nested debug loop (e.g., _ret
+	// EXCEPTION 1: When the VM just returned from a nested debug loop (e.g., _ret
 	// at the end of a constructor), active may be briefly false while the outer
 	// loop hasn't broken yet. Allow access if the VM appears to be in a stable
 	// state (stash and prg are valid).
+	// EXCEPTION 2: When paused on an exception, the VM state may be unwound
+	// (prg=nil, stash=nil, sb<0) but the exception stash is still valid.
+	// Allow access — buildPausedVarSnapshot handles this via exceptionStash.
+	if dbg.exceptionBreakActive && dbg.exceptionStash != nil {
+		// Skip all VM state checks — use the exception snapshot path below
+		goto resolveVar
+	}
 	if !dbg.active {
 		if dbg.vm.prg == nil || dbg.vm.stash == nil {
 			return nil, fmt.Errorf("cannot access variables: VM is not paused")
@@ -6765,6 +6944,7 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 		// VM state looks valid — allow access despite active=false
 	}
 
+	{
 	isLifecycleEntry := dbg.vm.sb < 0 && dbg.vm.pc == 0
 	if dbg.vm.sb < 0 && !isLifecycleEntry {
 		return nil, fmt.Errorf("cannot access variables during context transition (vm.sb=%d)", dbg.vm.sb)
@@ -6772,6 +6952,9 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 	if dbg.vm.stash == nil && !isLifecycleEntry {
 		return nil, fmt.Errorf("variable '%s' not accessible (no execution context)", varName)
 	}
+	}
+
+resolveVar:
 
 	// FAST PATH: resolve "this" directly.
 	// Try stash FIRST — " this" (with space) in the stash is more reliable
@@ -6782,7 +6965,11 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 		// instead of iterating all names and calling n.String() + TrimSpace().
 		thisKey := unistring.String(thisBindingName)
 		stashDepth := 0
-		for s := dbg.vm.stash; s != nil; s = s.outer {
+		startStash := dbg.vm.stash
+		if dbg.exceptionBreakActive && dbg.exceptionStash != nil {
+			startStash = dbg.exceptionStash
+		}
+		for s := startStash; s != nil; s = s.outer {
 			if s.names == nil {
 				stashDepth++
 				continue
@@ -6888,7 +7075,11 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 	}
 
 	stashLevel := 0
-	for s := dbg.vm.stash; s != nil; s = s.outer {
+	stashStart := dbg.vm.stash
+	if dbg.exceptionBreakActive && dbg.exceptionStash != nil {
+		stashStart = dbg.exceptionStash
+	}
+	for s := stashStart; s != nil; s = s.outer {
 		if s.names != nil {
 			if idx, exists := s.names[name]; exists {
 				actualIdx := idx & uint32(maskIndex)
@@ -6994,7 +7185,10 @@ func (dbg *Debugger) getValue(varName string) (val Value, err error) {
 	if dbg.vm.r != nil && dbg.vm.r.modules != nil {
 		for _, mi := range dbg.vm.r.modules {
 			if stmi, ok := mi.(*SourceTextModuleInstance); ok && stmi.exportGetters != nil {
-				if getter, exists := stmi.exportGetters[varName]; exists {
+				stmi.exportGettersMu.RLock()
+				getter, exists := stmi.exportGetters[varName]
+				stmi.exportGettersMu.RUnlock()
+				if exists {
 					func() {
 						defer func() {
 							if r := recover(); r != nil {

@@ -8,6 +8,31 @@ import (
 	"sort"
 )
 
+// debugScopeEndPCs tracks the ending PC for each scope during compilation.
+// Only populated in debug mode (via markScopeEndPC called from popScope).
+// Used by collectAllDebugSymbols to produce accurate PC ranges for
+// block-scoped variables, preventing them from appearing at PCs where
+// their stash has been popped by leaveBlock.
+
+// markScopeEndPC records the current code length as the ending PC for
+// the scope being popped. Called from popScope when c.debug is true.
+func (c *compiler) markScopeEndPC() {
+	if c.debugScopeEndPCs == nil {
+		c.debugScopeEndPCs = make(map[*scope]int)
+	}
+	if _, exists := c.debugScopeEndPCs[c.scope]; !exists {
+		c.debugScopeEndPCs[c.scope] = len(c.p.code)
+	}
+}
+
+// getScopeEndPC returns the ending PC for a scope, or 0 if not recorded.
+func (s *scope) getScopeEndPC() int {
+	if s.c == nil || s.c.debugScopeEndPCs == nil {
+		return 0
+	}
+	return s.c.debugScopeEndPCs[s]
+}
+
 type DebugSymbols struct {
 	// Range-based variable scope storage. Each entry covers a [StartPC, EndPC]
 	// range with its visible variables. Sorted by StartPC for binary search.
@@ -108,26 +133,188 @@ func (p *Program) lastPCForLine(line int, startPC int, filename string) int {
 	if filterByFile {
 		filename = normalizeFilename(filename)
 	}
-	lastPC := -1
-	for i := len(p.srcMap) - 1; i >= 0; i-- {
-		entry := p.srcMap[i]
-		if entry.pc < startPC {
-			break // no need to scan before start
+
+	// Find the srcMap index corresponding to startPC (or the first entry after it).
+	startIdx := -1
+	for i, entry := range p.srcMap {
+		if entry.pc >= startPC {
+			startIdx = i
+			break
 		}
+	}
+	if startIdx < 0 {
+		return -1
+	}
+
+	// Scan forward from startPC. When we encounter a gap (entries on different
+	// source lines between two occurrences of the target line), we must decide
+	// whether to continue past the gap or stop:
+	//
+	//   LOOP PATTERNS (stop at the gap):
+	//   • for(init; test; update): init+test → jneP(forward) → body → update → jump(backward)
+	//   • while(test):             test → jneP(forward) → body → jump(backward)
+	//   • for(init; ; update):     init → body → update → jump(backward)  [no test]
+	//   • while(true):             body → jump(backward)                  [const test]
+	//   Detection: (a) conditional forward jump in the first block, OR
+	//              (b) backward unconditional jump in the second block after the gap.
+	//
+	//   MULTI-LINE CALL (continue past the gap):
+	//   • foo(\n arg1,\n arg2\n):  load_foo → args → call_foo
+	//   No conditional forward jump in first block, no backward jump in second block.
+	//
+	//   DO-WHILE: condition line appears only once (at the bottom), no gap issue.
+	//
+	lastPC := -1
+	sawMatch := false  // true once we've seen at least one target-line entry
+	inGap := false     // true while scanning entries on different lines after a block
+	gapHasLoopHeader := false // first block ends with conditional forward jump
+
+	for i := startIdx; i < len(p.srcMap); i++ {
+		entry := p.srcMap[i]
 		pos := p.src.Position(entry.srcPos)
-		if pos.Line == line {
-			// When a filename filter is active, skip entries from other files.
-			if filterByFile && pos.Filename != "" {
-				if normalizeFilename(pos.Filename) != filename {
-					continue
-				}
+
+		// Skip entries from other files when filtering.
+		if filterByFile && pos.Filename != "" {
+			if normalizeFilename(pos.Filename) != filename {
+				continue
 			}
+		}
+
+		if pos.Line == line {
+			if inGap {
+				// We're seeing the target line again after a gap.
+				// CASE 1: The first block had a conditional forward jump → loop header, stop.
+				if gapHasLoopHeader {
+					break
+				}
+				// CASE 2: Check if this second block contains a backward jump.
+				// Peek ahead through the remaining entries on the target line.
+				if p.hasBackwardJumpInBlock(i, line, filterByFile, filename) {
+					break
+				}
+				// CASE 3: No loop signals → multi-line expression, continue.
+				inGap = false
+			}
+			sawMatch = true
 			if entry.pc > lastPC {
 				lastPC = entry.pc
+			}
+		} else if sawMatch && !inGap {
+			// First entry on a different line after a contiguous block.
+			inGap = true
+			gapStartPC := entry.pc
+			gapHasLoopHeader = p.hasConditionalForwardJumpInRange(startPC, gapStartPC-1)
+			if gapHasLoopHeader {
+				break // early exit — no need to scan the gap
 			}
 		}
 	}
 	return lastPC
+}
+
+// hasConditionalForwardJumpInRange checks whether any instruction in
+// [fromPC, toPC] is a conditional jump with a positive (forward) offset.
+// This is the signature of a loop header: the condition test emits
+// a conditional forward jump to skip the loop body when the test is false.
+// Also detects enumNext/iterNext (for-in/for-of loop headers) which jump
+// forward when the iterator is exhausted.
+func (p *Program) hasConditionalForwardJumpInRange(fromPC, toPC int) bool {
+	for pc := fromPC; pc <= toPC && pc < len(p.code); pc++ {
+		switch j := p.code[pc].(type) {
+		case jneP:
+			if int32(j) > 0 {
+				return true
+			}
+		case jeqP:
+			if int32(j) > 0 {
+				return true
+			}
+		case jne:
+			if int32(j) > 0 {
+				return true
+			}
+		case jeq:
+			if int32(j) > 0 {
+				return true
+			}
+		case enumNext:
+			// for-in loop header: jumps forward when enumerator is exhausted
+			if int32(j) > 0 {
+				return true
+			}
+		case iterNext:
+			// for-of loop header: jumps forward when iterator is done
+			if int32(j) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasBackwardJumpInBlock checks whether any srcMap entry starting at index
+// startIdx that maps to the given target line has a backward unconditional
+// jump instruction. This detects loop back-edges in constructs like
+// for(;;) and while(true) where no conditional forward jump exists.
+func (p *Program) hasBackwardJumpInBlock(startIdx int, targetLine int, filterByFile bool, filename string) bool {
+	for i := startIdx; i < len(p.srcMap); i++ {
+		entry := p.srcMap[i]
+		pos := p.src.Position(entry.srcPos)
+		if filterByFile && pos.Filename != "" {
+			if normalizeFilename(pos.Filename) != filename {
+				continue
+			}
+		}
+		if pos.Line != targetLine {
+			break // left the block
+		}
+		if entry.pc >= 0 && entry.pc < len(p.code) {
+			if j, ok := p.code[entry.pc].(jump); ok && int32(j) < 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasBackwardJumpBetween scans all bytecodes in [fromPC, toPC] and returns
+// true if any instruction is a backward jump (unconditional or conditional
+// with a negative offset). This detects loop bodies: the backward jump at
+// the end of a for/while loop is the loop's back-edge. If the range
+// [fromPC, toPC] contains such a jump, the range spans a loop body and
+// should NOT be used for the sub-expression skip.
+func (p *Program) hasBackwardJumpBetween(fromPC, toPC int) bool {
+	if fromPC < 0 {
+		fromPC = 0
+	}
+	if toPC >= len(p.code) {
+		toPC = len(p.code) - 1
+	}
+	for pc := fromPC; pc <= toPC; pc++ {
+		switch j := p.code[pc].(type) {
+		case jump:
+			if int32(j) < 0 {
+				return true
+			}
+		case jneP:
+			if int32(j) < 0 {
+				return true
+			}
+		case jeqP:
+			if int32(j) < 0 {
+				return true
+			}
+		case jne:
+			if int32(j) < 0 {
+				return true
+			}
+		case jeq:
+			if int32(j) < 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 
@@ -208,31 +395,33 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 
 			// Find PC range where this variable is accessible.
 			//
-			// In debug mode, for block-scoped variables (let/const inside
-			// try/catch/for/if), we extend the range to cover the ENTIRE
-			// enclosing function — not just the block scope. This matches
-			// Chrome DevTools behaviour: all function-local variables are
-			// visible at every PC inside the function, regardless of which
-			// block they were declared in. Without this, a `let` inside a
-			// try block would be invisible at any breakpoint outside it,
-			// while a `const` at the function top level would be visible.
+			// Use the ACTUAL scope boundaries: [s.base, s.endPC).
+			// For function scopes, endPC defaults to len(code) (set by
+			// popScope or fallback below), covering the entire function.
+			// For block scopes (for/try/if/catch), endPC is set by
+			// popScope to the PC where leaveBlock pops the stash.
+			//
+			// Previously, block-scope ranges were widened to the entire
+			// enclosing function "to match Chrome DevTools". But this
+			// caused variables from inactive block scopes (popped by
+			// leaveBlock) to appear in LookupVarsAtPC, then FAIL in
+			// getValueFromLocation because their stash no longer exists.
+			// The stash-chain fallback then found the variables were
+			// truly gone and left them as _undefined — polluting the
+			// locals panel with dozens of false entries and hiding the
+			// variables the user actually cares about.
+			//
+			// With accurate ranges:
+			// - Block-scoped variables (let/const in for/try/if) are
+			//   visible only when their block stash is active.
+			// - Function-scoped variables remain visible everywhere in
+			//   the function (their scope naturally spans the whole fn).
+			// - The stash-chain fallback still picks up any named
+			//   variables from outer scopes that debug symbols miss.
 			scopeStart := s.base
-			scopeEnd := len(s.c.p.code)
-
-			// In debug mode, widen scopeStart to the enclosing function's
-			// base so block-scoped bindings are visible everywhere in the
-			// function. This is a debugger-only change — runtime semantics
-			// are unaffected (the stash walk still determines the actual
-			// value availability at runtime).
-			if s.c.debug && !s.isFunction() {
-				for p := s.outer; p != nil; p = p.outer {
-					if p.base < scopeStart {
-						scopeStart = p.base
-					}
-					if p.isFunction() {
-						break
-					}
-				}
+			scopeEnd := s.getScopeEndPC()
+			if scopeEnd == 0 {
+				scopeEnd = len(s.c.p.code) // fallback for function scopes
 			}
 
 			minPC := scopeEnd

@@ -684,12 +684,20 @@ L:
 }
 
 func (c *compiler) compileBreak(label *ast.Identifier, idx file.Idx) {
+	// Add srcMap entry so the debugger can stop on break statements.
+	// Without this, the emitted leaveBlock+jump instructions inherit the
+	// source position of the preceding statement, making the break line
+	// invisible to the debugger.
+	c.p.addSrcMap(int(idx) - 1)
 	block := c.emitBlockExitCode(label, idx, true)
 	block.breaks = append(block.breaks, len(c.p.code))
 	c.emit(nil)
 }
 
 func (c *compiler) compileContinue(label *ast.Identifier, idx file.Idx) {
+	// Add srcMap entry so the debugger can stop on continue statements.
+	// Same reasoning as compileBreak above.
+	c.p.addSrcMap(int(idx) - 1)
 	block := c.emitBlockExitCode(label, idx, false)
 	block.conts = append(block.conts, len(c.p.code))
 	c.emit(nil)

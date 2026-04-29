@@ -314,7 +314,7 @@ func (vm *vm) debug() {
 				if !skipBreakpoints {
 					hasBreakpoint = vm.debugger.breakpoint()
 					// DIAGNOSTIC: Log when breakpoint found during init
-					if hasBreakpoint && vm.debugger.initPhase {
+					if hasBreakpoint && vm.debugger.initPhase && (debugBreakpoint || debugAll) {
 						fmt.Printf("[VM-INIT-BP] ✅ breakpoint() returned true during init at line %d, file=%q, skipBreakpoints=%v, active=%v, hasConnection=%v\n",
 							vm.debugger.Line(), vm.debugger.cachedNormFile, skipBreakpoints, vm.debugger.active, vm.debugger.HasConnection())
 					}
@@ -325,7 +325,7 @@ func (vm *vm) debug() {
 					srcMap := vm.debugger.cachedSrcMapFile
 					hasBPGlobal := GetGlobalBreakpoints().HasBreakpoint(normFile, currentLine) ||
 						(srcMap != "" && srcMap != normFile && GetGlobalBreakpoints().HasBreakpoint(srcMap, currentLine))
-					if hasBPGlobal {
+                                        if hasBPGlobal && (debugBreakpoint || debugAll) {
 						fmt.Printf("[BP-SKIP-INIT] ⚠️ skipBreakpoints=true BLOCKED breakpoint at line %d, file=%q, srcMap=%q, initPhase=%v, initComplete=%v, vuID=%d\n",
 							currentLine, normFile, srcMap, vm.debugger.initPhase, vm.debugger.initComplete, vm.debugger.vuID)
 					}
@@ -584,7 +584,14 @@ func (vm *vm) debug() {
 						isControlFlowOnly := false
 						if currentPC >= 0 && currentPC < len(vm.prg.code) {
 							switch vm.prg.code[currentPC].(type) {
-							case jump, *leaveBlock, *enterCatchBlock, leaveTry, enterFinally, *yieldMarker:
+							// NOTE: 'jump' is intentionally NOT listed here.
+							// User-written continue/break statements compile to jump
+							// instructions that the debugger must stop on. Compiler-generated
+							// jumps (end-of-if-body, loop back-edge, iteration-scope skips)
+							// share the source line of their enclosing statement, so
+							// lineChanged=false prevents false stops on them. Try-catch exit
+							// jumps are handled by the lastExecPC checks below.
+							case *leaveBlock, *enterCatchBlock, leaveTry, enterFinally, *yieldMarker:
 								isControlFlowOnly = true
 							// Class definition setup instructions: the bytecodes between
 							// enterBlock and the finalizing leaveBlock for a class literal
@@ -751,6 +758,10 @@ func (vm *vm) debug() {
 							startPC := vm.debugger.lastBreakpoint.pc
 							startLine := vm.debugger.lastBreakpoint.line
 							lastPC := vm.prg.lastPCForLine(startLine, startPC, vm.debugger.lastBreakpoint.filename)
+							// LOOP GUARD: disable sub-expression skip if range spans a loop body
+							if lastPC > startPC && vm.prg.hasBackwardJumpBetween(startPC, lastPC) {
+								lastPC = -1
+							}
 								if lastPC >= 0 && currentPC <= lastPC && currentPC > lastExecPC {
 									shouldBreak = false
 									breakReason = "stepIn-skip-subexpr"
@@ -910,10 +921,17 @@ func (vm *vm) debug() {
 						// Without this check, step-over falsely stops inside non-executing catch blocks.
 						// NOTE: The gate must NOT be vm.debugger.active — active=true only when paused,
 						// so it's always false during the instruction loop. Check the PC directly.
+						//
+						// NOTE: 'jump' is intentionally NOT listed here.
+						// User-written continue/break statements compile to jump instructions
+						// that the debugger must stop on. Compiler-generated jumps share the
+						// source line of their enclosing statement (lineChanged=false prevents
+						// false stops). Try-catch exit jumps are handled by the lastExecPC
+						// checks below.
 						isControlFlowOnly := false
 						if currentPC >= 0 && currentPC < len(vm.prg.code) {
 							switch vm.prg.code[currentPC].(type) {
-							case jump, *leaveBlock, *enterCatchBlock, leaveTry, enterFinally, *yieldMarker:
+							case *leaveBlock, *enterCatchBlock, leaveTry, enterFinally, *yieldMarker:
 								isControlFlowOnly = true
 							// Class definition setup — same as step-in (see comment there).
 							case *newClass, *newDerivedClass, *newStaticFieldInit, *initStaticElements,
@@ -1217,8 +1235,8 @@ func (vm *vm) debug() {
 						}
 					}
 
-					// DIAGNOSTIC: Always log when a breakpoint was found but won't cause a break
-					if hasBreakpoint && !shouldBreak {
+					// DIAGNOSTIC: Log when a breakpoint was found but won't cause a break
+					if hasBreakpoint && !shouldBreak && (debugBreakpoint || debugAll) {
 						fmt.Printf("[BP-NO-BREAK] ⚠️ breakpoint found but shouldBreak=false: line=%d, file=%q, reason=%q, prevLine=%d, prevFile=%q, active=%v, vuID=%d\n",
 							currentLine, normalizedCurrentFilename, breakReason, prevLine, prevFilename, vm.debugger.active, vm.debugger.vuID)
 					}
@@ -1283,13 +1301,15 @@ func (vm *vm) debug() {
 						vm.debugger.lastBreakpoint.pc = currentPC
 						vm.debugger.lastBreakpoint.stackDepth = currentStackDepth
 
-						// DIAGNOSTIC: Always log when debugger will pause
-						phase := "default"
-						if vm.debugger.initPhase {
-							phase = "init"
+						// DIAGNOSTIC: Log when debugger will pause
+						if debugVM || debugAll {
+							phase := "default"
+							if vm.debugger.initPhase {
+								phase = "init"
+							}
+							fmt.Printf("[VM-WILL-BREAK] 🛑 PAUSING at %s:%d (PC=%d, reason=%s, phase=%s, vuID=%d, hasBreakpoint=%v)\n",
+								currentFilename, currentLine, currentPC, breakReason, phase, vm.debugger.vuID, hasBreakpoint)
 						}
-						fmt.Printf("[VM-WILL-BREAK] 🛑 PAUSING at %s:%d (PC=%d, reason=%s, phase=%s, vuID=%d, hasBreakpoint=%v)\n",
-							currentFilename, currentLine, currentPC, breakReason, phase, vm.debugger.vuID, hasBreakpoint)
 
 						// CRITICAL FIX: Capture step flags BEFORE clearing them.
 						// This allows activate() to know whether we broke due to a step command.

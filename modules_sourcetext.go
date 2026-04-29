@@ -17,9 +17,10 @@ var (
 type SourceTextModuleInstance struct {
 	moduleRecord *SourceTextModuleRecord
 	// TODO figure out omething less idiotic
-	exportGetters map[string]func() Value
-	pcap          *promiseCapability
-	asyncPromise  *Promise
+	exportGetters   map[string]func() Value
+	exportGettersMu sync.RWMutex // protects exportGetters from concurrent map access
+	pcap            *promiseCapability
+	asyncPromise    *Promise
 }
 
 func (s *SourceTextModuleInstance) ExecuteModule(rt *Runtime, res, rej func(interface{}) error) (CyclicModuleInstance, error) {
@@ -37,12 +38,16 @@ func (s *SourceTextModuleInstance) ExecuteModule(rt *Runtime, res, rej func(inte
 		hasNext := rt.vm.debugger.next
 		hasStepIn := rt.vm.debugger.stepIn
 
-		fmt.Printf("[EXEC-MODULE] module=%q, vuID=%d, initPhase=%v, initAlreadyCompleted=%v, suppressDebugger=%v, next=%v, stepIn=%v, suppressDepth=%d\n",
-			moduleName, vuID, isInitPhase, initAlreadyCompleted, alreadySuppressed, hasNext, hasStepIn, rt.vm.debugger.suppressDebugDepth)
+		if debugInit || debugAll {
+			fmt.Printf("[EXEC-MODULE] module=%q, vuID=%d, initPhase=%v, initAlreadyCompleted=%v, suppressDebugger=%v, next=%v, stepIn=%v, suppressDepth=%d\n",
+				moduleName, vuID, isInitPhase, initAlreadyCompleted, alreadySuppressed, hasNext, hasStepIn, rt.vm.debugger.suppressDebugDepth)
+		}
 
 		if !alreadySuppressed {
 			if initAlreadyCompleted {
-				fmt.Printf("[EXEC-MODULE] ⛔ SUPPRESSING debugger for module %q (init already completed, this is a re-init)\n", moduleName)
+				if debugInit || debugAll {
+					fmt.Printf("[EXEC-MODULE] ⛔ SUPPRESSING debugger for module %q (init already completed, this is a re-init)\n", moduleName)
+				}
 				rt.vm.debugger.suppressDebugger = true
 				rt.vm.debugger.suppressDebugDepth++
 				defer func() {
@@ -50,13 +55,19 @@ func (s *SourceTextModuleInstance) ExecuteModule(rt *Runtime, res, rej func(inte
 					if rt.vm.debugger.suppressDebugDepth == 0 {
 						rt.vm.debugger.suppressDebugger = false
 					}
-					fmt.Printf("[EXEC-MODULE] ✅ UNSUPPRESSED debugger after module %q (suppressDepth=%d)\n", moduleName, rt.vm.debugger.suppressDebugDepth)
+					if debugInit || debugAll {
+						fmt.Printf("[EXEC-MODULE] ✅ UNSUPPRESSED debugger after module %q (suppressDepth=%d)\n", moduleName, rt.vm.debugger.suppressDebugDepth)
+					}
 				}()
 			} else {
-				fmt.Printf("[EXEC-MODULE] ✅ ALLOWING debugger for module %q (first init, breakpoints can fire)\n", moduleName)
+				if debugInit || debugAll {
+					fmt.Printf("[EXEC-MODULE] ✅ ALLOWING debugger for module %q (first init, breakpoints can fire)\n", moduleName)
+				}
 			}
 		} else {
-			fmt.Printf("[EXEC-MODULE] ⏭️ Already suppressed for module %q, skipping suppression logic\n", moduleName)
+			if debugInit || debugAll {
+				fmt.Printf("[EXEC-MODULE] ⏭️ Already suppressed for module %q, skipping suppression logic\n", moduleName)
+			}
 		}
 	}
 
@@ -115,7 +126,9 @@ func (s *SourceTextModuleInstance) GetBindingValue(name string) Value {
 	// 		fmt.Printf("[DEBUG-SOBEK] GetBindingValue(%s): available key: %q\n", name, k)
 	// 	}
 	// }
+	s.exportGettersMu.RLock()
 	getter, ok := s.exportGetters[name]
+	s.exportGettersMu.RUnlock()
 	// if debugCompiler {
 	// 	fmt.Printf("[DEBUG-SOBEK] GetBindingValue(%s): getter found=%v\n", name, ok)
 	// }
@@ -751,8 +764,10 @@ func (module *SourceTextModuleRecord) Instantiate(rt *Runtime) (CyclicModuleInst
 		moduleName = module.p.src.Name()
 	}
 	if rt.vm.debugMode && rt.vm.debugger != nil {
-		fmt.Printf("[INSTANTIATE-MODULE] module=%q, vuID=%d, initPhase=%v, suppressDebugger=%v, next=%v, stepIn=%v\n",
-			moduleName, rt.vm.debugger.vuID, rt.vm.debugger.initPhase, rt.vm.debugger.suppressDebugger, rt.vm.debugger.next, rt.vm.debugger.stepIn)
+		if debugInit || debugAll {
+			fmt.Printf("[INSTANTIATE-MODULE] module=%q, vuID=%d, initPhase=%v, suppressDebugger=%v, next=%v, stepIn=%v\n",
+				moduleName, rt.vm.debugger.vuID, rt.vm.debugger.initPhase, rt.vm.debugger.suppressDebugger, rt.vm.debugger.next, rt.vm.debugger.stepIn)
+		}
 	}
 
 	// Suppress the debugger during Instantiate when init has already completed.
@@ -762,7 +777,9 @@ func (module *SourceTextModuleRecord) Instantiate(rt *Runtime) (CyclicModuleInst
 	// VU 0 re-init for setup/teardown.
 	if rt.vm.debugMode && rt.vm.debugger != nil && !rt.vm.debugger.suppressDebugger {
 		if GetGlobalInitTracker().HasAnyInitCompleted() {
-			fmt.Printf("[INSTANTIATE-MODULE] ⛔ SUPPRESSING debugger for Instantiate %q (init already completed)\n", moduleName)
+			if debugInit || debugAll {
+				fmt.Printf("[INSTANTIATE-MODULE] ⛔ SUPPRESSING debugger for Instantiate %q (init already completed)\n", moduleName)
+			}
 			rt.vm.debugger.suppressDebugger = true
 			rt.vm.debugger.suppressDebugDepth++
 			defer func() {
