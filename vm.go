@@ -806,6 +806,18 @@ func (vm *vm) pushTryFrame(catchPos, finallyPos int32) {
 }
 
 func (vm *vm) popTryFrame() {
+	// DEBUG SAFETY: In debug mode, evaluateComplexExpression and withSuppressedDebugger
+	// run eval code on the DAP goroutine while the VM goroutine is paused. If the
+	// VM resumes (Continue) while an eval is mid-execution, the eval's handleThrow
+	// can pop try frames that belong to the outer execution context, leaving the
+	// tryStack empty when the outer defer fires. Guard against this to prevent
+	// "slice bounds out of range [:-1]" panics that crash the entire k6 process.
+	if len(vm.tryStack) == 0 {
+		if vm.debugMode {
+			return // silently skip — the frame was already consumed
+		}
+		// In non-debug mode, this is a real bug — panic as before.
+	}
 	vm.tryStack = vm.tryStack[:len(vm.tryStack)-1]
 }
 

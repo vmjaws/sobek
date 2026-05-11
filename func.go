@@ -369,6 +369,9 @@ func (f *classFuncObject) _initFields(instance *Object) {
 
 		vm.sb = vm.sp
 		vm.push(instance)
+		if vm.debugMode {
+			prepareInitFieldsDebug(vm)
+		}
 		vm.pc = 0
 		ex := vm.runTry()
 		vm.popCtx()
@@ -812,6 +815,12 @@ type asyncRunner struct {
 	promiseCap *promiseCapability
 	f          *Object
 	vmCall     func(*vm, int)
+
+	// savedDebugState holds step state saved when an await suspends the
+	// generator while the debugger is stepping. Restored by onAsyncResume
+	// when the promise resolves. See async_dbg.go for details.
+	// Only used when vm.debugMode is true.
+	savedDebugState *asyncDebugState
 }
 
 func (ar *asyncRunner) onFulfilled(call FunctionCall) Value {
@@ -819,6 +828,11 @@ func (ar *asyncRunner) onFulfilled(call FunctionCall) Value {
 	defer func() {
 		ar.gen.vm.curAsyncRunner = nil
 	}()
+	// DEBUG: Restore saved step state from the await suspension point.
+	// This is a no-op when debugMode is false (savedDebugState will be nil).
+	if ar.gen.vm.debugMode {
+		onAsyncResume(ar)
+	}
 	arg := call.Argument(0)
 	res, resType, ex := ar.gen.next(arg)
 	ar.step(res, resType == resultNormal, ex)
@@ -830,6 +844,10 @@ func (ar *asyncRunner) onRejected(call FunctionCall) Value {
 	defer func() {
 		ar.gen.vm.curAsyncRunner = nil
 	}()
+	// DEBUG: Restore saved step state from the await suspension point.
+	if ar.gen.vm.debugMode {
+		onAsyncResume(ar)
+	}
 	reason := call.Argument(0)
 	res, resType, ex := ar.gen.nextThrow(reason)
 	ar.step(res, resType == resultNormal, ex)

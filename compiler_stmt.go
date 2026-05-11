@@ -1295,6 +1295,16 @@ func (c *compiler) compileSwitchStatement(v *ast.SwitchStatement, needResult boo
 		}
 		bb[0] = db
 		c.scope.bindings = bb
+
+		// In debug mode (or dynamic scope), all bindings go to stash (allInStash=true).
+		// The anonymous discriminant binding `db` is forced to stash[0], but the
+		// discriminant value is on the stack. Explicitly pop it into db's stash slot
+		// now, before any case test calls db.emitGet() → loadStashLex(0).
+		// In non-debug/non-dynamic mode, db stays on the stack and the
+		// enter.stackSize-- below accounts for the already-pushed discriminant.
+		if c.debug || c.scope.isDynamic() {
+			db.emitInitP()
+		}
 	}
 
 	c.compileFunctions(funcs)
@@ -1350,7 +1360,13 @@ func (c *compiler) compileSwitchStatement(v *ast.SwitchStatement, needResult boo
 	}
 	if enter != nil {
 		c.leaveScopeBlock(enter)
-		enter.stackSize--
+		// Only decrement stackSize when db lives on the stack (non-debug, non-dynamic).
+		// In debug or dynamic mode, db was placed in the stash and explicitly
+		// initialised via db.emitInitP() above; enter.stackSize is already 0 and
+		// decrementing a uint32(0) would wrap around to 4294967295.
+		if db != nil && !c.debug && !c.scope.isDynamic() {
+			enter.stackSize--
+		}
 		c.popScope()
 	}
 	c.leaveBlock()

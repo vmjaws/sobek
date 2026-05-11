@@ -845,8 +845,6 @@ func (vm *vm) debug() {
 						if !isUserFile && pcAdvanced && !vm.debugger.lifecycleTransition {
 							vm.debugger.stepIn = false
 							// DON'T clear next here - let step-over continue working after we return from non-user code
-							// vm.debugger.next = false
-							// vm.debugger.steppingFilename = ""
 						}
 					} else if vm.debugger.next {
 						// For step-over: break only if:
@@ -994,8 +992,6 @@ func (vm *vm) debug() {
 								// may inherit the source-map position of the last instruction in
 								// the skipped body. Detect: if the landing line matches any source
 								// line in the skipped PC range, it's an inherited/stale position.
-								// This does NOT affect else branches: else-body lines are distinct
-								// from if-body lines, so the landing line won't match.
 								if !isControlFlowOnly && currentPC > lastExecPC+1 && vm.prg.src != nil {
 									landingLine := currentLine
 									scanLimit := currentPC
@@ -1239,7 +1235,7 @@ func (vm *vm) debug() {
 					if hasBreakpoint && !shouldBreak && (debugBreakpoint || debugAll) {
 						fmt.Printf("[BP-NO-BREAK] ⚠️ breakpoint found but shouldBreak=false: line=%d, file=%q, reason=%q, prevLine=%d, prevFile=%q, active=%v, vuID=%d\n",
 							currentLine, normalizedCurrentFilename, breakReason, prevLine, prevFilename, vm.debugger.active, vm.debugger.vuID)
-					}
+										}
 
 						if shouldBreak {
 						// DIAGNOSTIC: Log ALL breaks with forward-jump info
@@ -1375,6 +1371,14 @@ func (vm *vm) debug() {
 		}
 		pc := vm.pc
 		if pc < 0 || pc >= len(vm.prg.code) {
+			// ASYNC STEP FIX: If the debug loop is exiting because of a negative PC
+			// (set by yieldMarker.exec for await), save the debugger's step state
+			// on the asyncRunner. This prevents intermediate microtasks from
+			// triggering false step pauses, and ensures the step resumes correctly
+			// when the promise resolves. See async_dbg.go for details.
+			if pc < 0 && vm.debugger != nil && (vm.debugger.stepIn || vm.debugger.next) {
+				onAsyncYield(vm)
+			}
 			break
 		}
 		// Track actual previous instruction PC for forward-jump detection.
@@ -1394,7 +1398,7 @@ func (vm *vm) debug() {
 		// 	fmt.Printf("[VM-EXEC] PC=%d, instr=%T, next=%v, stepIn=%v, suppress=%v, depth=%d\n",
 		// 		pc, vm.prg.code[pc], vm.debugger.next, vm.debugger.stepIn, vm.debugger.suppressDebugger, len(vm.callStack))
 		// }
-		vm.prg.code[pc].exec(vm)
+		execDebugSafe(vm, vm.prg.code[pc])
 		// Reset lastExecPC when program changes (call/return) to prevent
 		// cross-program PC contamination in the sub-expression skip.
 		if vm.prg != prevPrg {
@@ -1514,64 +1518,22 @@ func normalizeFilenameForMatch(f string) string {
 	return f
 }
 
-//	if vm.profTracker != nil && !vm.runWithProfiler() {
-//		return
-//	}
-//	count := 0
-//	interrupted := false
-//	for {
-//		if count == 0 {
-//			if atomic.LoadInt32(&globalProfiler.enabled) == 1 && !vm.runWithProfiler() {
-//				return
-//			}
-//			count = 100
-//		} else {
-//			count--
-//		}
-//		if interrupted = atomic.LoadUint32(&vm.interrupted) != 0; interrupted {
-//			break
-//		}
-//
-//		if vm.debugger != nil {
-//			if !vm.debugger.active && (vm.debugger.breakpoint() || vm.debugger.next) {
-//				if vm.debugger.lastBreakpoint.filename == vm.debugger.Filename() &&
-//					vm.debugger.lastBreakpoint.line == vm.debugger.Line() &&
-//					vm.debugger.callStackDepth() <= vm.debugger.lastBreakpoint.stackDepth {
-//					// Staying on same breakpoint, do nothing.
-//				} else {
-//					prevStackDepth := vm.debugger.lastBreakpoint.stackDepth
-//					vm.debugger.lastBreakpoint.filename = vm.debugger.Filename()
-//					vm.debugger.lastBreakpoint.line = vm.debugger.Line()
-//					vm.debugger.lastBreakpoint.stackDepth = vm.debugger.callStackDepth()
-//					if vm.debugger.lastBreakpoint.stackDepth >= prevStackDepth {
-//						vm.debugger.next = false
-//						vm.debugger.updateCurrentLine()
-//						vm.debugger.activate(BreakpointActivation, vm.debugger.Filename(), vm.debugger.currentLine)
-//					}
-//
-//				}
-//			} else {
-//				vm.debugger.lastBreakpoint.filename = ""
-//				vm.debugger.lastBreakpoint.line = -1
-//			}
-//			if vm.debugger != nil {
-//				vm.debugger.lastBreakpoint.stackDepth = vm.debugger.callStackDepth()
-//			}
-//		}
-//		pc := vm.pc
-//		if pc < 0 || pc >= len(vm.prg.code) {
-//			break
-//		}
-//		vm.prg.code[pc].exec(vm)
-//	}
-//
-//	if interrupted {
-//		vm.interruptLock.Lock()
-//		v := &InterruptedError{
-//			iface: vm.interruptVal,
-//		}
-//		v.stack = vm.captureStack(nil, 0)
-//		vm.interruptLock.Unlock()
-//		panic(v)
-//	}
-//}
+// execDebugSafe wraps instruction execution in debug mode. It provides a
+// safety net for Go-level panics (type assertions, nil pointers) by converting
+// them to proper JS *Exception panics that handleThrow can route through
+// try-catch. This prevents the debugger from crashing the process.
+func execDebugSafe(vm *vm, instr instruction) {
+	defer func() {
+		if r := recover(); r != nil {
+			if ex, ok := r.(*Exception); ok {
+				panic(ex)
+			}
+			ex := &Exception{
+				val: vm.r.NewTypeError("%v", r),
+			}
+			ex.stack = vm.captureStack(make([]StackFrame, 0, len(vm.callStack)+1), 0)
+			panic(ex)
+		}
+	}()
+	instr.exec(vm)
+}

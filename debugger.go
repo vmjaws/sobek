@@ -1052,6 +1052,24 @@ func GetGlobalBreakpoints() *GlobalBreakpointRegistry {
 	return globalBreakpoints
 }
 
+// HttpCallRecord stores data about a completed HTTP request/response.
+// Populated by the k6 HTTP module during execution (not just at pause time).
+type HttpCallRecord struct {
+	Method          string             `json:"method"`
+	URL             string             `json:"url"`
+	Status          int                `json:"status"`
+	StatusText      string             `json:"statusText"`
+	Duration        float64            `json:"duration"`
+	Proto           string             `json:"proto"`
+	RequestHeaders  map[string]string  `json:"requestHeaders,omitempty"`
+	RequestBody     string             `json:"requestBody,omitempty"`
+	ResponseHeaders map[string]string  `json:"responseHeaders,omitempty"`
+	ResponseBody    string             `json:"responseBody,omitempty"`
+	ContentType     string             `json:"contentType,omitempty"`
+	Size            int                `json:"size"`
+	Timings         map[string]float64 `json:"timings,omitempty"`
+}
+
 type Debugger struct {
 	vm   *vm
 	vuID uint64 // VU identifier — maps to DAP thread ID in multi-VU debug
@@ -1112,6 +1130,11 @@ type Debugger struct {
 	initFilename string
 
 	watchExpressions []watchExpr
+
+	// httpCallLog records HTTP responses as they happen (even without pausing).
+	// The k6 HTTP module pushes entries here; the DAP server drains them on each pause.
+	httpCallLog   []HttpCallRecord
+	httpCallLogMu sync.Mutex
 
 	// --- PERF: hot-path caches ---
 
@@ -1381,6 +1404,7 @@ const (
 	BreakpointActivation        ActivationReason = "breakpoint"
 	StepActivation              ActivationReason = "step"
 	ExceptionActivation         ActivationReason = "exception"
+	TerminatedActivation        ActivationReason = "terminated"
 )
 
 type DebuggerActivation struct {
@@ -1892,9 +1916,31 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 
 	// Signal that the VM is about to resume. In-progress eval/getter operations
 	// will see this flag and skip restoring stale VM state. New operations will
-	// be rejected immediately. We do NOT block/wait here because the IDE can
-	// keep sending evaluate requests indefinitely, which would stall the VM.
+	// be rejected immediately.
 	dbg.vmResuming.Store(true)
+
+	// CRITICAL: Wait for in-progress eval/getter operations to finish before
+	// resuming the VM. Without this, evaluateComplexExpression (running on the
+	// DAP goroutine) and the VM goroutine (resuming here) race on vm.tryStack,
+	// vm.callStack, vm.sp, etc. — causing "slice bounds out of range" panics
+	// that crash the entire k6 process.
+	//
+	// The timeout prevents indefinite stalls if the IDE keeps sending evaluate
+	// requests. 100ms is enough for any in-flight eval to see vmResuming and
+	// bail out, but short enough to not noticeably delay VM resume.
+	evalDone := make(chan struct{})
+	go func() {
+		dbg.evalWG.Wait()
+		close(evalDone)
+	}()
+	select {
+	case <-evalDone:
+		// All evals finished cleanly
+	case <-time.After(100 * time.Millisecond):
+		if debugActivate {
+			fmt.Printf("[DEBUGGER-ACTIVATE] ⚠️ Timeout waiting for eval operations to finish (100ms) — resuming anyway\n")
+		}
+	}
 
 	// Notify k6 that the VM is about to resume — restart iteration-duration timers.
 	if globalDebugCoordinator.IsInitialized() {
@@ -2320,6 +2366,57 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 		hasGlobalStepState = globalNext || globalStepIn
 
 		if localTimedOut {
+			// ── FIX: Detect test completion — all VMs exited, no receiver ──
+			// When the test finishes (all iterations done, summary printed),
+			// no VM is running to consume step state. Without this check,
+			// Continue() loops forever on "Timeout waiting for receiver".
+			// Check if ALL registered debuggers have their VMs exited.
+			allVMsExited := true
+			allDbgs := globalDebugCoordinator.GetAllDebuggers()
+			for _, d := range allDbgs {
+				if !d.vmExited {
+					select {
+					case <-d.vmDoneCh:
+						// vmDoneCh closed = VM exited
+					default:
+						allVMsExited = false
+					}
+				}
+			}
+			// Also treat as all-exited when no debuggers are registered at all
+			if allVMsExited && len(allDbgs) == 0 {
+				allVMsExited = true
+			}
+			// CRITICAL: Do NOT terminate if waitForFunctionEntry is set — a new
+			// lifecycle phase (setup/default/teardown) is about to start. The new
+			// VU hasn't been created yet so all current VMs appear exited, but the
+			// debugger must stay alive to catch the new VU's first breakpoint/step.
+			if allVMsExited && globalDebugCoordinator.HasWaitForFunctionEntry() {
+				allVMsExited = false
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] All VMs exited but waitForFunctionEntry is set — waiting for next lifecycle phase\n")
+				}
+			}
+			if allVMsExited {
+				// Clear stale global step state that no one will consume
+				if hasGlobalStepState {
+					if isMultiVU {
+						globalDebugCoordinator.ClearVUStepState(dbg.vuID)
+					} else {
+						globalDebugCoordinator.ClearGlobalStepState()
+					}
+				}
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] All VMs exited — returning terminated activation (vuID=%d, hadStepState=%v)\n", dbg.vuID, hasGlobalStepState)
+				}
+				return DebuggerActivation{
+					Reason:   TerminatedActivation,
+					Filename: dbg.Filename(),
+					Line:     dbg.Line(),
+					VUID:     dbg.vuID,
+				}
+			}
+
 			// ── FIX: Return pending uncaught exception immediately ─────────
 			// When the VM exited due to an uncaught exception while stepping,
 			// BreakOnException stored the activation info instead of calling
@@ -2566,6 +2663,17 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
 				}
 				hasGlobalStepState = globalNext || globalStepIn
+			case globalDebugCoordinator.ActivationChannel() <- dbg.currentCh:
+				// LIFECYCLE FIX: When the local VM exited (init ended) and
+				// waitForFunctionEntry is set, VU 0's activate() listens on
+				// the global activation channel. Send currentCh there so it
+				// can respond with the activation from the new lifecycle phase.
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Sent to global activation channel (lifecycle transition, vuID=%d)\n", dbg.vuID)
+				}
+				if activation, ok, _ := waitForActivation("global-lifecycle", true); ok {
+					return activation
+				}
 			case <-dbg.vmDoneCh:
 				if debugContinue {
 					fmt.Printf("[DEBUGGER-CONTINUE] VM exited (vmDoneCh) while waiting for receiver, switching to global-only\n")
@@ -3716,6 +3824,8 @@ func (dbg *Debugger) ClearLocalStepState() {
 	}
 }
 
+
+
 func (dbg *Debugger) Exec(expr string) (Value, error) {
 	if expr == "" {
 		return nil, errors.New("nothing to execute")
@@ -4647,11 +4757,14 @@ func isDotPropertyChain(s string) bool {
 		return false
 	}
 	for _, ch := range s {
-		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$' || ch == '.') {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$' || ch == '.' || ch == '?') {
 			return false
 		}
 	}
-	if s[0] == '.' || s[len(s)-1] == '.' || strings.Contains(s, "..") {
+	// Normalize: strip optional chaining operator for validation
+	normalized := strings.ReplaceAll(s, "?.", ".")
+	normalized = strings.TrimRight(normalized, "?")
+	if normalized[0] == '.' || normalized[len(normalized)-1] == '.' || strings.Contains(normalized, "..") {
 		return false
 	}
 	return true
@@ -5280,6 +5393,8 @@ func (dbg *Debugger) Evaluate(expr string) (Value, error) {
 	}
 
 	if isDotPropertyChain(expr) {
+		// Normalize optional chaining: "this.tokens?.backofficeAuth" → split on "."
+		// but track which segments had "?" (optional chaining)
 		parts := strings.Split(expr, ".")
 		root := parts[0]
 		rootVal, err := dbg.getValue(root)
@@ -5295,8 +5410,15 @@ func (dbg *Debugger) Evaluate(expr string) (Value, error) {
 				result := dbg.withSuppressedDebugger(func() Value {
 					val := rootVal
 					for _, prop := range parts[1:] {
+						// Handle optional chaining: strip trailing "?" from property name
+						optional := strings.HasSuffix(prop, "?")
+						prop = strings.TrimSuffix(prop, "?")
+
 						obj, ok := val.(*Object)
 						if !ok {
+							if optional {
+								return _undefined
+							}
 							return nil
 						}
 						propVal := obj.Get(prop)
@@ -5477,6 +5599,31 @@ func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
 	dbg.pausedVarSnapshot = snap
 	dbg.pausedVarSnapshotLine = currentLine
 	dbg.pausedVarSnapshotPC = currentPC
+
+	// ── Promise unwrapping ──────────────────────────────────────────────
+	// Unwrap settled Promises in the snapshot so the Variables panel and
+	// hover show resolved values instead of opaque Promise objects.
+	// This matches Node.js / Chrome DevTools behavior where variables
+	// holding fulfilled promises display their resolved value.
+	// Wrapped in func+recover for safety.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if dbg.enableDebugLogging {
+					fmt.Printf("[DEBUGGER] buildPausedVarSnapshot: promise unwrapping panicked: %v\n", r)
+				}
+			}
+		}()
+		for k, v := range snap {
+			if v != nil && IsPromise(v) {
+				unwrapped := UnwrapPromiseForDisplay(v)
+				if unwrapped != v {
+					snap[k] = unwrapped
+				}
+			}
+		}
+	}()
+
 	return snap
 }
 
@@ -6015,6 +6162,7 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 	savedResult := dbg.vm.result
 	savedCallStackLen := len(dbg.vm.callStack)
 	savedStackLen := len(dbg.vm.stack)
+	savedTryStackLen := len(dbg.vm.tryStack)
 
 	// CRITICAL: Save the stack values at and around sp. Getter execution can
 	// modify stack slots that contain the paused program's live intermediate
@@ -6073,6 +6221,14 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 		if len(dbg.vm.callStack) > savedCallStackLen {
 			dbg.vm.callStack = dbg.vm.callStack[:savedCallStackLen]
 		}
+		// CRITICAL: Restore tryStack to prevent try frame leaks from getter
+		// evaluation. If a getter pushed try frames (via vm.try or vm.runTry)
+		// and an exception consumed them, or if extra frames were left behind,
+		// truncate back to the saved length. This prevents the outer
+		// runWrapped.try.popTryFrame from operating on a corrupted stack.
+		if len(dbg.vm.tryStack) > savedTryStackLen {
+			dbg.vm.tryStack = dbg.vm.tryStack[:savedTryStackLen]
+		}
 		if len(dbg.vm.stack) > savedStackLen {
 			dbg.vm.stack = dbg.vm.stack[:savedStackLen]
 		} else if len(dbg.vm.stack) < savedStackLen {
@@ -6115,6 +6271,11 @@ func (dbg *Debugger) resolveIndirectValue(rawVal Value) Value {
 			if v != nil {
 				return v
 			}
+			// Getter returned nil — the exported variable is uninitialized.
+			// Return undefined instead of falling through to rawVal (the getter
+			// function itself), which would leak into the display layer and be
+			// suppressed as a "function" by the hover filter.
+			return _undefined
 		}
 		return rawVal
 	})
@@ -6550,6 +6711,21 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 		if dbg.exceptionBreakActive && dbg.lastException != nil {
 			locals["$exception"] = dbg.lastException
 		}
+
+		// ── Promise unwrapping ──────────────────────────────────────────
+		// Unwrap settled Promises so the Variables panel shows resolved
+		// values instead of opaque Promise objects (Node.js parity).
+		func() {
+			defer func() { recover() }()
+			for k, v := range locals {
+				if v != nil && IsPromise(v) {
+					if unwrapped := UnwrapPromiseForDisplay(v); unwrapped != v {
+						locals[k] = unwrapped
+					}
+				}
+			}
+		}()
+
 		return locals, nil
 	}
 
@@ -6589,6 +6765,18 @@ func (dbg *Debugger) GetLocalVariables() (map[string]Value, error) {
 	if dbg.exceptionBreakActive && dbg.lastException != nil {
 		locals["$exception"] = dbg.lastException
 	}
+
+	// ── Promise unwrapping (legacy path) ────────────────────────────────
+	func() {
+		defer func() { recover() }()
+		for k, v := range locals {
+			if v != nil && IsPromise(v) {
+				if unwrapped := UnwrapPromiseForDisplay(v); unwrapped != v {
+					locals[k] = unwrapped
+				}
+			}
+		}
+	}()
 
 	return locals, nil
 }
@@ -6655,42 +6843,46 @@ func (dbg *Debugger) GetGlobalVariables() map[string]Value {
 					if s.outer == nil && globalBuiltinKeys[nameStr] {
 						continue
 					}
-					actualIdx := idx & uint32(maskIndex)
-					if int(actualIdx) >= 0 && int(actualIdx) < len(s.values) {
-						val := s.values[actualIdx]
-						if val != nil && !isNullValue(val) {
-							globals[nameStr] = val
+				actualIdx := idx & uint32(maskIndex)
+				isIndirect := (idx & maskIndirect) != 0
+				if int(actualIdx) >= 0 && int(actualIdx) < len(s.values) {
+					val := s.values[actualIdx]
+					if val != nil && !isNullValue(val) {
+						if isIndirect && !lifecycleFunctionKeys[nameStr] {
+							val = dbg.resolveIndirectValue(val)
 						}
-					}
-				}
-			}
-			stashLevel++
-		}
-		// Also check the global object
-		if dbg.vm.r != nil {
-			if globalObj := dbg.vm.r.globalObject; globalObj != nil {
-				for _, keyStr := range safeStringKeys(globalObj) {
-					if !isIdentifierLike(keyStr) || keyStr == "" {
-						continue
-					}
-					if _, exists := globals[keyStr]; exists {
-						continue
-					}
-					if globalBuiltinKeys[keyStr] || globalUnsafeKeys[keyStr] {
-						continue
-					}
-					keyUniStr := unistring.String(keyStr)
-					if v := safeGetGlobalProperty(globalObj, keyUniStr); v != nil && !isNullValue(v) {
-						globals[keyStr] = v
+						globals[nameStr] = val
 					}
 				}
 			}
 		}
-		if dbg.enableDebugLogging {
-			fmt.Printf("[DEBUGGER] GetGlobalVariables: exception break — collected %d global variables from exception stash\n", len(globals))
-		}
-		return globals
+		stashLevel++
 	}
+	// Also check the global object
+	if dbg.vm.r != nil {
+		if globalObj := dbg.vm.r.globalObject; globalObj != nil {
+			for _, keyStr := range safeStringKeys(globalObj) {
+				if !isIdentifierLike(keyStr) || keyStr == "" {
+					continue
+				}
+				if _, exists := globals[keyStr]; exists {
+					continue
+				}
+				if globalBuiltinKeys[keyStr] || globalUnsafeKeys[keyStr] {
+					continue
+				}
+				keyUniStr := unistring.String(keyStr)
+				if v := safeGetGlobalProperty(globalObj, keyUniStr); v != nil && !isNullValue(v) {
+					globals[keyStr] = v
+				}
+			}
+		}
+	}
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] GetGlobalVariables: exception break — collected %d global variables from exception stash\n", len(globals))
+	}
+	return globals
+}
 
 	if dbg.vm.prg == nil {
 		return globals
@@ -6718,9 +6910,13 @@ func (dbg *Debugger) GetGlobalVariables() map[string]Value {
 					continue
 				}
 				actualIdx := idx & uint32(maskIndex)
+				isIndirect := (idx & maskIndirect) != 0
 				if int(actualIdx) >= 0 && int(actualIdx) < len(s.values) {
 					val := s.values[actualIdx]
 					if val != nil && !isNullValue(val) {
+						if isIndirect && !lifecycleFunctionKeys[nameStr] {
+							val = dbg.resolveIndirectValue(val)
+						}
 						if dbg.enableDebugLogging {
 							fmt.Printf("[DEBUGGER] GetGlobalVariables: captured %s from stash level %d (idx=%d)\n",
 								nameStr, stashLevel, actualIdx)
@@ -7543,11 +7739,22 @@ func (dbg *Debugger) BreakOnException(exceptionVal Value, caught bool, throwFile
 	// ── Caught exceptions ──────────────────────────────────────────────
 	if caught {
 		if !dbg.breakOnCaughtExceptions {
+			// Clear the pre-unwind stash saved by onThrowCaptureState so it
+			// doesn't leak into a subsequent uncaught exception.
+			dbg.exceptionStash = nil
+			dbg.exceptionPrg = nil
 			return false
 		}
 
 		dbg.lastException = exceptionVal
 		dbg.exceptionBreakActive = true
+		// Capture the stash chain at the throw site so that variable inspection
+		// (hover, watch, debug console) can resolve locals even after handleThrow
+		// unwinds vm.stash to the catch handler.
+		// NOTE: Only set if onThrowCaptureState hasn't already saved the pre-unwind stash.
+		if dbg.exceptionStash == nil {
+			dbg.exceptionStash = dbg.vm.stash
+		}
 
 		if dbg.enableDebugLogging || debugActivate {
 			fmt.Printf("[DEBUGGER] BreakOnException: caught exception=%q, pausing at throw site %s:%d\n",
@@ -7587,6 +7794,16 @@ func (dbg *Debugger) BreakOnException(exceptionVal Value, caught bool, throwFile
 	}
 
 	dbg.lastException = exceptionVal
+	// Capture the stash chain at the throw site so that when the pending
+	// exception is delivered (and exceptionBreakActive is set), variable
+	// inspection can still resolve locals from the throw context.
+	// NOTE: Only set exceptionStash if onThrowCaptureState hasn't already
+	// saved it (pre-unwind). By the time BreakOnException is called for
+	// uncaught exceptions, handleThrow has already unwound vm.stash — the
+	// pre-unwind stash saved in onThrowCaptureState is the correct one.
+	if dbg.exceptionStash == nil {
+		dbg.exceptionStash = dbg.vm.stash
+	}
 	dbg.pendingUncaughtException = &DebuggerActivation{
 		Reason:        ExceptionActivation,
 		Filename:      filename,
@@ -7605,6 +7822,25 @@ func (dbg *Debugger) BreakOnException(exceptionVal Value, caught bool, throwFile
 	return false
 }
 
+
+// RecordHttpCall adds a completed HTTP call to the debug log.
+// Called by the k6 HTTP module after each request completes.
+// Thread-safe — can be called from any goroutine during execution.
+func (dbg *Debugger) RecordHttpCall(record HttpCallRecord) {
+	dbg.httpCallLogMu.Lock()
+	dbg.httpCallLog = append(dbg.httpCallLog, record)
+	dbg.httpCallLogMu.Unlock()
+}
+
+// DrainHttpCallLog returns all recorded HTTP calls since the last drain and clears the log.
+// Called by the DAP server on each pause to send accumulated calls to the IDE.
+func (dbg *Debugger) DrainHttpCallLog() []HttpCallRecord {
+	dbg.httpCallLogMu.Lock()
+	calls := dbg.httpCallLog
+	dbg.httpCallLog = nil
+	dbg.httpCallLogMu.Unlock()
+	return calls
+}
 
 // IsExceptionBreak returns true if the debugger is currently paused due to an exception.
 func (dbg *Debugger) IsExceptionBreak() bool {

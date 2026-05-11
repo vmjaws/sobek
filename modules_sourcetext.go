@@ -44,7 +44,7 @@ func (s *SourceTextModuleInstance) ExecuteModule(rt *Runtime, res, rej func(inte
 		}
 
 		if !alreadySuppressed {
-			if initAlreadyCompleted {
+			if initAlreadyCompleted && isInitPhase {
 				if debugInit || debugAll {
 					fmt.Printf("[EXEC-MODULE] ⛔ SUPPRESSING debugger for module %q (init already completed, this is a re-init)\n", moduleName)
 				}

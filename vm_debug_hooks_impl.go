@@ -142,8 +142,20 @@ func (h *vmDebugHooksImpl) onRunTryInnerException(vm *vm, ex *Exception) {
 		vm.debugger.SetLastExceptionStack(ex.stack)
 	}
 	if debugActivate {
-		fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: recovered exception=%q, pendingUncaughtException=%v, inEvalContext=%v\n",
-			ex.val.String(), vm.debugger.pendingUncaughtException != nil, vm.debugger.inEvalContext)
+		fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: recovered exception=%q, pendingUncaughtException=%v, inEvalContext=%v, callStackDepth=%d\n",
+			ex.val.String(), vm.debugger.pendingUncaughtException != nil, vm.debugger.inEvalContext, len(vm.callStack))
+	}
+
+	// CRITICAL FIX: If there are outer call frames, this exception will propagate
+	// up to the caller (e.g., _initFields → construct → outer vm.debug loop).
+	// The outer level may have a JS try-catch that catches it. Do NOT treat it
+	// as uncaught at this point — let it propagate naturally. Only treat exceptions
+	// as uncaught when we're at the top-level call frame (no caller to propagate to).
+	if len(vm.callStack) > 0 {
+		if debugActivate {
+			fmt.Printf("[EXCEPTION-TRACE] runTryInner defer: SKIPPED BreakOnException — nested call frame (depth=%d), exception will propagate to outer level\n", len(vm.callStack))
+		}
+		return
 	}
 
 	if !vm.debugger.inEvalContext && vm.debugger.pendingUncaughtException == nil {
