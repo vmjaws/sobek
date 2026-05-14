@@ -828,13 +828,24 @@ func (ar *asyncRunner) onFulfilled(call FunctionCall) Value {
 	defer func() {
 		ar.gen.vm.curAsyncRunner = nil
 	}()
-	// DEBUG: Restore saved step state from the await suspension point.
-	// This is a no-op when debugMode is false (savedDebugState will be nil).
+	arg := call.Argument(0)
+	// Inline gen.next() so we can call onAsyncResume AFTER enterNext()
+	// restores the generator's VM context (vm.prg, vm.stash, vm.pc).
+	// If we restore step state before enterNext(), the debug loop sees the
+	// wrong vm.prg (from the promise reaction job context), the file-change
+	// check detects a mismatch, and clears stepIn — causing the debugger
+	// to skip the next line in the async function.
+	ar.gen.enterNext()
+	if arg != nil {
+		ar.gen.vm.push(arg)
+	}
+	// NOW restore step state — vm.prg is the generator's program
 	if ar.gen.vm.debugMode {
 		onAsyncResume(ar)
 	}
-	arg := call.Argument(0)
-	res, resType, ex := ar.gen.next(arg)
+	res, resType, ex := ar.gen.step()
+	ar.gen.vm.popTryFrame()
+	ar.gen.vm.popCtx()
 	ar.step(res, resType == resultNormal, ex)
 	return _undefined
 }
@@ -844,12 +855,22 @@ func (ar *asyncRunner) onRejected(call FunctionCall) Value {
 	defer func() {
 		ar.gen.vm.curAsyncRunner = nil
 	}()
-	// DEBUG: Restore saved step state from the await suspension point.
+	reason := call.Argument(0)
+	// Same fix as onFulfilled: restore step state AFTER enterNext()
+	ar.gen.enterNext()
 	if ar.gen.vm.debugMode {
 		onAsyncResume(ar)
 	}
-	reason := call.Argument(0)
-	res, resType, ex := ar.gen.nextThrow(reason)
+	ex := ar.gen.vm.handleThrow(reason)
+	if ex != nil {
+		ar.gen.vm.popTryFrame()
+		ar.gen.vm.popCtx()
+		ar.step(nil, false, ex)
+		return _undefined
+	}
+	res, resType, ex := ar.gen.step()
+	ar.gen.vm.popTryFrame()
+	ar.gen.vm.popCtx()
 	ar.step(res, resType == resultNormal, ex)
 	return _undefined
 }

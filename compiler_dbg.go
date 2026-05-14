@@ -128,6 +128,9 @@ func (p *Program) lastPCForLine(line int, startPC int, filename string) int {
 	if p.src == nil || len(p.srcMap) == 0 {
 		return -1
 	}
+	if startPC < 0 {
+		startPC = 0
+	}
 	// Normalize the filter filename once so comparisons are consistent.
 	filterByFile := filename != ""
 	if filterByFile {
@@ -219,6 +222,9 @@ func (p *Program) lastPCForLine(line int, startPC int, filename string) int {
 // Also detects enumNext/iterNext (for-in/for-of loop headers) which jump
 // forward when the iterator is exhausted.
 func (p *Program) hasConditionalForwardJumpInRange(fromPC, toPC int) bool {
+	if fromPC < 0 {
+		fromPC = 0
+	}
 	for pc := fromPC; pc <= toPC && pc < len(p.code); pc++ {
 		switch j := p.code[pc].(type) {
 		case jneP:

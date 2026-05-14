@@ -112,11 +112,37 @@ func onAsyncResume(ar *asyncRunner) {
 	dbg.stepIn = saved.stepIn
 	dbg.next = saved.next
 	dbg.steppingFilename = saved.steppingFilename
-	dbg.stepOverTargetDepth = saved.targetDepth
+	// CRITICAL FIX: When an async function resumes from a promise reaction,
+	// the VM call stack is much deeper than when the step was initiated (due to
+	// the job queue execution context: runWrapped → try → promiseReactionJob
+	// → callJobCallback → onFulfilled → gen.enterNext → pushCtx + context).
+	// The saved targetDepth is stale and unusable. If we were doing step-over
+	// (next=true), convert to stepIn so the debugger breaks on the next line
+	// regardless of call stack depth. This matches Chrome DevTools behavior
+	// where stepping over an await always pauses at the next line in the
+	// same function.
+	if saved.next && !saved.stepIn {
+		dbg.stepIn = true
+		dbg.next = false
+	}
+	dbg.stepOverTargetDepth = dbg.callStackDepth()
 	dbg.stepOverStartLine = saved.startLine
 	// Reset lastBreakpoint.pc so pcAdvanced is true on the first instruction
 	// after the await resumes. Without this, the debugger might skip the line.
 	dbg.lastBreakpoint.pc = -1
+	// Also reset lastBreakpoint.line to the await line so that lineChanged
+	// correctly detects the first new line after the await.
+	dbg.lastBreakpoint.line = saved.startLine
+	// Clear any inherited-position suppression from before the yield.
+	// After async resume, try-catch exit bytecodes around the await can
+	// trigger the inherited-position heuristic and suppress the break on
+	// the very next user line (e.g., line 120 after stepping over line 119).
+	dbg.suppressedInheritedLine = 0
+	dbg.suppressedInheritedFile = ""
+	// Signal the debug loop that we just resumed from an async await.
+	// The file-change check should update steppingFilename instead of
+	// clearing step flags, because the VM context may not match.
+	dbg.asyncResumeActive = true
 	if debugVM || dbg.enableDebugLogging {
 		fmt.Printf("[ASYNC-DBG] onAsyncResume: restored step state — stepIn=%v, next=%v, file=%s, depth=%d, line=%d\n",
 			saved.stepIn, saved.next, saved.steppingFilename, saved.targetDepth, saved.startLine)

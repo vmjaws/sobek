@@ -1126,6 +1126,14 @@ type Debugger struct {
 	vmResuming                  atomic.Bool    // set when VM is about to resume; prevents new evals from starting
 	hasConnection               bool
 
+	// EventLoopDrainer is an optional hook set by the host (k6) to drain the
+	// event loop queue during debug-console await evaluation. When set, the
+	// debugger calls this function in a polling loop while waiting for a
+	// Promise to settle. The function should process any pending callbacks
+	// in the event loop queue (without blocking) and return true if any
+	// callbacks were processed.
+	EventLoopDrainer func() bool
+
 	initPhase    bool
 	initFilename string
 
@@ -1277,6 +1285,13 @@ type Debugger struct {
 	suppressDebugger   bool
 	suppressDebugDepth int  // nesting depth of suppress calls; debugger active only when 0
 	inEvalContext      bool // true while evaluateComplexExpression is running
+
+	// asyncResumeActive is set true by onAsyncResume and cleared after the
+	// first instruction in the debug loop. It tells the file-change check
+	// to update steppingFilename instead of clearing step flags, because
+	// the generator resumed in a different execution context (promise
+	// reaction job) where the filename may not match.
+	asyncResumeActive bool
 
 	// inTestExecution is set true only while a Gherkin step function is being
 	// called by runPickleStep. When false, ALL breakpoint/stepping logic is
@@ -5354,6 +5369,31 @@ func stripTypeScriptSyntax(expr string) string {
 		}
 	}
 
+	// Strip trailing TypeScript optional parameter marker (?).
+	// When hovering on a TypeScript optional parameter like "businessContext?: string",
+	// the IDE may send "businessContext?" as the expression. Strip the trailing ?
+	// so it resolves as the plain identifier "businessContext".
+	// Only strip when ? is at the end after a word character (not ternary operator).
+	if len(expr) > 1 && expr[len(expr)-1] == '?' {
+		before := expr[len(expr)-2]
+		if (before >= 'a' && before <= 'z') || (before >= 'A' && before <= 'Z') ||
+			(before >= '0' && before <= '9') || before == '_' || before == '$' {
+			expr = expr[:len(expr)-1]
+		}
+	}
+
+	// Strip TypeScript type annotations from parameter-like expressions.
+	// e.g., "businessContext?: string" → "businessContext"
+	// e.g., "market?: string" → "market"
+	if strings.Contains(expr, ":") {
+		if idx := strings.Index(expr, ":"); idx > 0 {
+			candidate := strings.TrimRight(strings.TrimSpace(expr[:idx]), "?")
+			if isSimpleIdentifier(candidate) {
+				expr = candidate
+			}
+		}
+	}
+
 	return strings.TrimSpace(expr)
 }
 
@@ -5370,6 +5410,13 @@ func (dbg *Debugger) Evaluate(expr string) (Value, error) {
 	// Strip TypeScript syntax that the JS runtime can't parse.
 	// e.g., "(error as Error).message" → "(error).message"
 	expr = stripTypeScriptSyntax(expr)
+
+	// Strip spread operator (...) — when hovering over "...profile.options" or
+	// "...profile.options?.tags", the IDE sends the full text including the spread.
+	// The user wants to see the value being spread, not execute a spread expression.
+	if strings.HasPrefix(expr, "...") {
+		expr = expr[3:]
+	}
 
 	if isSimpleIdentifier(expr) {
 		val, err := dbg.getValue(expr)
@@ -5730,6 +5777,22 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 	// is correct without wrapping, (c) prototype methods are available,
 	// (d) no global pollution, (e) lexical bindings work correctly.
 
+	// ── Await support in debug console ─────────────────────────────────
+	// If the expression contains `await`, strip it and evaluate the inner
+	// expression directly. The function call will return a Promise; we then
+	// poll-wait for the Promise to settle (Go-backed k6 functions resolve
+	// promises via goroutines that call RegisterCallback → event loop).
+	// After it settles, unwrapPromiseResult extracts the resolved value.
+	// This matches Chrome DevTools / Node.js behavior where `await fetch(...)`
+	// works in the console.
+	containsAwait := containsAwaitKeyword(expr)
+	if containsAwait {
+		expr = stripAwaitKeyword(expr)
+		if dbg.enableDebugLogging {
+			fmt.Printf("[DEBUGGER] evaluateComplexExpression: stripped await, evaluating: %q\n", expr)
+		}
+	}
+
 	// Determine inGlobal: mirror runtime.eval()'s logic for direct eval.
 	// If there's any variable stash between the current scope and global,
 	// we're NOT in global scope.
@@ -5971,6 +6034,16 @@ func (dbg *Debugger) evaluateComplexExpression(expr string) (Value, error) {
 		} else {
 			result = retval
 		}
+
+		// ── Await support: poll for Promise settlement ────────────
+		// When the user's expression contained `await` (now stripped),
+		// the result is likely a Promise from a Go-backed k6 function.
+		// The Go goroutine resolving it runs concurrently. We poll for
+		// the Promise to settle, draining the job queue each iteration
+		// to process promise reactions.
+		if containsAwait && result != nil {
+			result = dbg.waitForPromiseSettlement(vm.r, result)
+		}
 	}()
 
 	if evalErr != nil {
@@ -5999,6 +6072,167 @@ func (dbg *Debugger) isCurrentScopeStrict() bool {
 		}
 	}
 	return false
+}
+
+// containsAwaitKeyword returns true if the expression contains a top-level
+// `await` keyword. It does a simple check for the word "await" preceded and
+// followed by non-identifier characters (or string boundaries). This avoids
+// false positives like variable names containing "await" (e.g., "awaiter").
+func containsAwaitKeyword(expr string) bool {
+	idx := 0
+	for {
+		pos := strings.Index(expr[idx:], "await")
+		if pos < 0 {
+			return false
+		}
+		pos += idx
+		// Check that "await" is not part of a larger identifier
+		if pos > 0 {
+			ch := expr[pos-1]
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$' {
+				idx = pos + 5
+				continue
+			}
+		}
+		end := pos + 5
+		if end < len(expr) {
+			ch := expr[end]
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$' {
+				idx = end
+				continue
+			}
+		}
+		return true
+	}
+}
+
+// stripAwaitKeyword removes all top-level `await` keywords from an expression.
+// "await authorizeBtn.textContent()" → "authorizeBtn.textContent()"
+// "await (await page.locator('x')).click()" → "(page.locator('x')).click()"
+// This allows the debug console to evaluate async expressions by calling
+// the function directly and then polling for the Promise to settle.
+func stripAwaitKeyword(expr string) string {
+	result := expr
+	for {
+		prev := result
+		idx := 0
+		var buf strings.Builder
+		for {
+			pos := strings.Index(result[idx:], "await")
+			if pos < 0 {
+				buf.WriteString(result[idx:])
+				break
+			}
+			absPos := idx + pos
+			// Check word boundaries
+			isWord := true
+			if absPos > 0 {
+				ch := result[absPos-1]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$' {
+					isWord = false
+				}
+			}
+			end := absPos + 5
+			if isWord && end < len(result) {
+				ch := result[end]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$' {
+					isWord = false
+				}
+			}
+			if isWord {
+				buf.WriteString(result[idx:absPos])
+				// Skip "await" and any following whitespace
+				idx = end
+				for idx < len(result) && (result[idx] == ' ' || result[idx] == '\t') {
+					idx++
+				}
+			} else {
+				buf.WriteString(result[idx : end])
+				idx = end
+			}
+		}
+		result = buf.String()
+		if result == prev {
+			break
+		}
+	}
+	return strings.TrimSpace(result)
+}
+
+// waitForPromiseSettlement polls a Promise value until it settles or times out.
+// Used by the debug console to support `await expr` — the expression is evaluated
+// without `await` (returning a Promise), then we poll for the Go goroutine that
+// resolves it to complete. Between polls, we drain the runtime's job queue so
+// promise reactions (resolve/reject callbacks) are processed.
+//
+// For non-Promise values, returns the value immediately.
+// Timeout: 30 seconds (matching k6 browser default timeout).
+func (dbg *Debugger) waitForPromiseSettlement(r *Runtime, val Value) Value {
+	if val == nil {
+		return val
+	}
+	obj, ok := val.(*Object)
+	if !ok {
+		return val
+	}
+	promise, ok := obj.self.(*Promise)
+	if !ok {
+		return val // not a Promise, return as-is
+	}
+
+	// Already settled?
+	if promise.State() != PromiseStatePending {
+		return val
+	}
+
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] waitForPromiseSettlement: polling for Promise to settle...\n")
+	}
+
+	// Poll with increasing backoff: 1ms, 2ms, 4ms, ..., up to 100ms
+	// Total timeout: 30 seconds
+	const maxWait = 30 * time.Second
+	deadline := time.Now().Add(maxWait)
+	sleepDuration := time.Millisecond
+
+	for time.Now().Before(deadline) {
+		// Step 1: Drain the host event loop (k6's event loop) to process
+		// RegisterCallback entries that resolve/reject the Promise.
+		if dbg.EventLoopDrainer != nil {
+			dbg.EventLoopDrainer()
+		}
+
+		// Step 2: Drain sobek's job queue (promise reaction microtasks)
+		for len(r.jobQueue) > 0 {
+			jobs := r.jobQueue
+			r.jobQueue = nil
+			for _, job := range jobs {
+				func() {
+					defer func() { recover() }()
+					job()
+				}()
+			}
+		}
+
+		// Check if the Promise settled
+		if promise.State() != PromiseStatePending {
+			if dbg.enableDebugLogging {
+				fmt.Printf("[DEBUGGER] waitForPromiseSettlement: Promise settled (state=%d)\n", promise.State())
+			}
+			return val
+		}
+
+		// Sleep before next poll
+		time.Sleep(sleepDuration)
+		if sleepDuration < 100*time.Millisecond {
+			sleepDuration *= 2
+		}
+	}
+
+	if dbg.enableDebugLogging {
+		fmt.Printf("[DEBUGGER] waitForPromiseSettlement: timeout after %v, Promise still pending\n", maxWait)
+	}
+	return val // return the still-pending Promise; unwrapPromiseResult will show "Promise <pending>"
 }
 
 // getCurrentThis returns the 'this' value for the current stack frame.

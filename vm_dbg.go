@@ -412,6 +412,21 @@ func (vm *vm) debug() {
 
 					normalizedSteppingFilename := normalizeFilename(steppingFilename)
 
+					// Clear asyncResumeActive after we actually break (not after one instruction).
+					// It needs to survive until we reach a real user line to bypass
+					// inherited-position suppression from try-catch exit bytecodes.
+					justResumedFromAsync := vm.debugger.asyncResumeActive
+					if vm.debugger.asyncResumeActive {
+						// DON'T clear here — clear when we actually break (see break handler below).
+						// Update steppingFilename to match the current file
+						// so subsequent instructions don't trigger file-change.
+						if normalizedCurrentFilename != normalizedSteppingFilename && normalizedSteppingFilename != "" {
+							vm.debugger.steppingFilename = currentFilename
+							steppingFilename = currentFilename
+							normalizedSteppingFilename = normalizedCurrentFilename
+						}
+					}
+
 					// CRITICAL FIX: Skip debugging for internal eval code (like summary wrapper)
 					// The <eval> filename indicates runtime-generated code that shouldn't be debugged
 					if normalizedCurrentFilename == "<eval>" || strings.HasPrefix(normalizedCurrentFilename, "<eval>") {
@@ -610,7 +625,12 @@ func (vm *vm) debug() {
 						// Same forward-jump detection as step-over (see comments there).
 						// NOTE: Use lastExecPC (the actual last executed instruction's PC),
 						// NOT prevPC (which is the last BREAKPOINT PC and may be stale).
-						if !isControlFlowOnly && lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
+						// ASYNC RESUME FIX: Skip these heuristics entirely when we just
+						// resumed from an async await. The try-catch cleanup bytecodes
+						// around the await produce forward jumps that falsely trigger
+						// inherited-position suppression, causing the debugger to skip
+						// the line right after the await (e.g., line 120 → 126).
+						if !isControlFlowOnly && !justResumedFromAsync && lastExecPC >= 0 && lastExecPC < len(vm.prg.code) {
 							switch vm.prg.code[lastExecPC].(type) {
 							case leaveTry, enterFinally:
 								isControlFlowOnly = true
@@ -715,7 +735,8 @@ func (vm *vm) debug() {
 						}
 
 						// FIX: Also check inherited position for step-in (same as step-over).
-						if shouldBreak && currentPC > 0 && lastExecPC >= 0 && currentPC > lastExecPC+1 && vm.prg.src != nil {
+						// ASYNC RESUME FIX: Skip when just resumed from async — same reason as above.
+						if shouldBreak && !justResumedFromAsync && currentPC > 0 && lastExecPC >= 0 && currentPC > lastExecPC+1 && vm.prg.src != nil {
 							prevInstrLine := vm.prg.src.Position(vm.prg.sourceOffset(currentPC - 1)).Line
 							if prevInstrLine == currentLine {
 								shouldBreak = false
@@ -757,6 +778,9 @@ func (vm *vm) debug() {
 							if currentStackDepth <= startDepth {
 							startPC := vm.debugger.lastBreakpoint.pc
 							startLine := vm.debugger.lastBreakpoint.line
+							// Skip sub-expression logic when startPC is invalid (e.g., after async resume
+							// sets lastBreakpoint.pc = -1 to force pcAdvanced = true).
+							if startPC >= 0 {
 							lastPC := vm.prg.lastPCForLine(startLine, startPC, vm.debugger.lastBreakpoint.filename)
 							// LOOP GUARD: disable sub-expression skip if range spans a loop body
 							if lastPC > startPC && vm.prg.hasBackwardJumpBetween(startPC, lastPC) {
@@ -766,6 +790,7 @@ func (vm *vm) debug() {
 									shouldBreak = false
 									breakReason = "stepIn-skip-subexpr"
 								}
+							}
 							}
 							// Guard 2: stepInLastPC — skip until we pass the initiation line's
 							// last bytecode. This handles the case where argument evaluation
@@ -842,7 +867,7 @@ func (vm *vm) debug() {
 						// CRITICAL FIX: Don't clear stepIn if this is a lifecycle transition
 						// During lifecycle transitions (setup->teardown->handleSummary), we want to preserve stepIn
 						// until we reach the first line of the user's function
-						if !isUserFile && pcAdvanced && !vm.debugger.lifecycleTransition {
+						if !isUserFile && pcAdvanced && !vm.debugger.lifecycleTransition && !justResumedFromAsync {
 							vm.debugger.stepIn = false
 							// DON'T clear next here - let step-over continue working after we return from non-user code
 						}
@@ -1327,6 +1352,7 @@ func (vm *vm) debug() {
 						vm.debugger.continuing = false    // Clear continuing flag when we break
 						vm.debugger.suppressedInheritedLine = 0 // Clear inherited-line suppression
 						vm.debugger.suppressedInheritedFile = ""
+						vm.debugger.asyncResumeActive = false // Clear async resume flag when we break
 						// NOTE: Do NOT clear global step state here! The activate() function reads and
 						// clears it after applying it. Clearing here would race with activate() and
 						// cause the global step state (e.g., set by EnableStepIn() for lifecycle transitions)
