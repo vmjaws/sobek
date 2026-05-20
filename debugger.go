@@ -1057,6 +1057,7 @@ func GetGlobalBreakpoints() *GlobalBreakpointRegistry {
 type HttpCallRecord struct {
 	Method          string             `json:"method"`
 	URL             string             `json:"url"`
+	Name            string             `json:"name,omitempty"`
 	Status          int                `json:"status"`
 	StatusText      string             `json:"statusText"`
 	Duration        float64            `json:"duration"`
@@ -1068,6 +1069,10 @@ type HttpCallRecord struct {
 	ContentType     string             `json:"contentType,omitempty"`
 	Size            int                `json:"size"`
 	Timings         map[string]float64 `json:"timings,omitempty"`
+	SourceFile      string             `json:"sourceFile,omitempty"`
+	SourceLine      int                `json:"sourceLine,omitempty"`
+	CallerFile      string             `json:"callerFile,omitempty"`  // outermost user-level frame (e.g. test script)
+	CallerLine      int                `json:"callerLine,omitempty"`
 }
 
 type Debugger struct {

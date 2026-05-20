@@ -85,3 +85,38 @@ func (r *Runtime) RunScriptWithoutDebug(name, src string) (Value, error) {
 	return r.RunProgram(p)
 }
 
+// SourceLineText returns the source code text of the line where this stack frame points.
+// Returns empty string if source is not available.
+func (f *StackFrame) SourceLineText() string {
+	if f.prg == nil || f.prg.src == nil {
+		return ""
+	}
+	src := f.prg.src.Source()
+	if src == "" {
+		return ""
+	}
+	pos := f.Position()
+	if pos.Line <= 0 {
+		return ""
+	}
+	lines := splitLines(src)
+	if pos.Line > len(lines) {
+		return ""
+	}
+	return lines[pos.Line-1]
+}
+
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	if start <= len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
