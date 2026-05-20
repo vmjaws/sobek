@@ -30,8 +30,8 @@ const (
 	maskDeletable = 1 << 29
 	maskStrict    = maskDeletable
 	maskIndirect  = 1 << 28
-
-	maskTyp = maskConst | maskVar | maskDeletable | maskIndirect
+	maskTyp       = maskConst | maskVar | maskDeletable | maskIndirect
+	maskIndex     = 0x0FFFFFFF
 )
 
 type varType byte
@@ -75,6 +75,13 @@ type Program struct {
 	srcMap   []srcMapItem
 
 	scriptOrModule interface{}
+
+	// only populated when compiling with debug flag
+	debugSymbols *DebugSymbols
+
+	// stmtPCs records PCs where new statements begin (sorted).
+	// Only populated in debug mode.
+	stmtPCs []int
 }
 
 type compiler struct {
@@ -89,8 +96,12 @@ type compiler struct {
 
 	enumGetExpr compiledEnumGetExpr
 
-	evalVM *vm // VM used to evaluate constant expressions
-	ctxVM  *vm // VM in which an eval() code is compiled
+	debug  bool // enable debug mode
+	evalVM *vm  // VM used to evaluate constant expressions
+	ctxVM  *vm  // VM in which an eval() code is compiled
+
+	funcClosingBracePos file.Idx
+	debugScopeEndPCs    map[*scope]int
 
 	codeScratchpad []instruction
 
@@ -349,7 +360,7 @@ func (c *compiler) leaveScopeBlock(enter *enterBlock) {
 	c.updateEnterBlock(enter)
 	leave := &leaveBlock{
 		stackSize: enter.stackSize,
-		popStash:  enter.stashSize > 0,
+		popStash:  enter.stashSize > 0 || enter.needStash,
 	}
 	c.emit(leave)
 	for _, pc := range c.block.breaks {
@@ -405,6 +416,9 @@ func (c *compiler) newBlockScope() {
 }
 
 func (c *compiler) popScope() {
+	if c.debug {
+		c.markScopeEndPC()
+	}
 	c.scope = c.scope.outer
 }
 
@@ -431,9 +445,10 @@ func (c *compiler) emitLiteralValue(v Value) {
 	c.emit(loadVal{v})
 }
 
-func newCompiler() *compiler {
+func newCompiler(debug bool) *compiler {
 	c := &compiler{
-		p: &Program{},
+		p:     &Program{},
+		debug: debug,
 	}
 
 	c.enumGetExpr.init(c, file.Idx(0))
@@ -496,6 +511,7 @@ func (p *Program) addSrcMap(srcPos int) {
 	}
 	p.srcMap = append(p.srcMap, srcMapItem{pc: len(p.code), srcPos: srcPos})
 }
+
 
 func (s *scope) lookupName(name unistring.String) (binding *binding, noDynamics bool) {
 	noDynamics = true
@@ -639,21 +655,53 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 		argsInStash = f.argsInStash
 	}
 	stackIdx, stashIdx := 0, 0
-	allInStash := s.isDynamic()
+	allInStash := s.isDynamic() || s.c.debug
+
+	if s.c.debug {
+		if allInStash && s.isFunction() && !argsInStash {
+			hasArgs := false
+			for _, b := range s.bindings {
+				if b.isArg {
+					hasArgs = true
+					break
+				}
+			}
+			if hasArgs {
+				s.moveArgsToStash()
+				argsInStash = true
+			}
+		}
+	}
+
 	var derivedCtor bool
 	if fs := s.nearestThis(); fs != nil && fs.funcType == funcDerivedCtor {
 		derivedCtor = true
 	}
+
+	// Initialize debug symbols ONCE before processing bindings
+	if s.c.debug && s.c.p.debugSymbols == nil {
+		s.c.p.debugSymbols = &DebugSymbols{
+			lineToPCs: make(map[int][]int),
+		}
+	}
+
 	for i, b := range s.bindings {
 		var this bool
 		if b.name == thisBindingName {
 			this = true
 		}
 		if allInStash || b.inStash {
+			if s.c.debug {
+				b.inStash = true
+				s.needStash = true
+			}
+
 			for scope, aps := range b.accessPoints {
 				var level uint32
 				for sc := scope; sc != nil && sc != s; sc = sc.outer {
 					if sc.needStash || sc.isDynamic() {
+						level++
+					} else if s.c.debug && len(sc.bindings) > 0 {
 						level++
 					}
 				}
@@ -852,6 +900,12 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 			}
 		}
 	}
+
+	// Collect debug symbols for ALL bindings AFTER they've been processed
+	if s.c.debug {
+		s.collectAllDebugSymbols(stackOffset, stashIdx, stackIdx)
+	}
+
 	for _, nested := range s.nested {
 		nested.finaliseVarAlloc(stackIdx + stackOffset)
 	}
@@ -903,8 +957,36 @@ func (s *scope) makeNamesMap() map[unistring.String]uint32 {
 		return nil
 	}
 	names := make(map[unistring.String]uint32, l)
-	for i, b := range s.bindings {
-		idx := uint32(i)
+
+	allInStash := s.isDynamic() || s.c.debug
+	stashIdx := uint32(0)
+	stackIdx := uint32(0)
+
+	for _, b := range s.bindings {
+		if b.name == thisBindingName {
+			if allInStash || b.inStash {
+				if s.c.debug {
+					names[b.name] = stashIdx
+				}
+				stashIdx++
+			} else {
+				if s.c.debug {
+					names[b.name] = stackIdx
+				}
+				stackIdx++
+			}
+			continue
+		}
+
+		var idx uint32
+		if allInStash || b.inStash {
+			idx = stashIdx
+			stashIdx++
+		} else {
+			idx = stackIdx
+			stackIdx++
+		}
+
 		if b.isConst {
 			idx |= maskConst
 			if b.isStrict {
@@ -918,6 +1000,10 @@ func (s *scope) makeNamesMap() map[unistring.String]uint32 {
 			idx |= maskIndirect
 		}
 		names[b.name] = idx
+	}
+
+	if len(names) == 0 {
+		return nil
 	}
 	return names
 }
@@ -976,6 +1062,7 @@ func (c *compiler) compileModule(module *SourceTextModuleRecord) {
 	}
 	var enter *enterBlock
 	c.emit(&enterFuncBody{
+		enterBlock:  enterBlock{names: c.scope.makeNamesMap()},
 		funcType:    funcModule,
 		extensible:  true,
 		adjustStack: true,
@@ -1088,7 +1175,10 @@ func (c *compiler) compileLocalExportEntry(entry exportEntry) {
 	exportName := unistring.NewFromString(entry.localName)
 	module := c.module
 	callback := func(vm *vm, getter func() Value) {
-		vm.r.modules[module].(*SourceTextModuleInstance).exportGetters[exportName.String()] = getter
+		stmi := vm.r.modules[module].(*SourceTextModuleInstance)
+		stmi.exportGettersMu.Lock()
+		stmi.exportGetters[exportName.String()] = getter
+		stmi.exportGettersMu.Unlock()
 	}
 
 	if entry.lex || !c.scope.boundNames[exportName].isVar {
@@ -1117,9 +1207,12 @@ func (c *compiler) compileIndirectExportEntry(entry exportEntry) {
 	module := c.module
 	c.emit(exportIndirect{callback: func(vm *vm) {
 		m := vm.r.modules[module]
-		m.(*SourceTextModuleInstance).exportGetters[exportName] = func() Value {
+		stmi := m.(*SourceTextModuleInstance)
+		stmi.exportGettersMu.Lock()
+		stmi.exportGetters[exportName] = func() Value {
 			return vm.r.modules[b.Module].GetBindingValue(importName)
 		}
+		stmi.exportGettersMu.Unlock()
 	}})
 }
 

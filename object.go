@@ -247,8 +247,13 @@ func (o *primitiveValueObject) exportType() reflect.Type {
 }
 
 type FunctionCall struct {
-	This      Value
-	Arguments []Value
+	This       Value
+	Arguments  []Value
+	Name       string
+	Line       int
+	File       string
+	StackDepth int
+	ReturnPC   int
 }
 
 type ConstructorCall struct {

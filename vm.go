@@ -127,6 +127,7 @@ type stashRef struct {
 	n   unistring.String
 	v   *[]Value
 	idx int
+	vm  *vm
 }
 
 func (r *stashRef) get() Value {
@@ -182,6 +183,9 @@ type stashRefLex struct {
 func (r *stashRefLex) get() Value {
 	v := (*r.v)[r.idx]
 	if v == nil {
+		if r.vm != nil && r.vm.dbgHooks != nil {
+			return r.vm.dbgHooks.stashRefLexRelaxed()
+		}
 		panic(errAccessBeforeInit)
 	}
 	return v
@@ -385,6 +389,9 @@ type vm struct {
 	curAsyncRunner *asyncRunner
 
 	profTracker *profTracker
+	debugger    *Debugger
+	debugMode   bool
+	dbgHooks    debugHooks
 }
 
 type instruction interface {
@@ -481,6 +488,9 @@ func (s *stash) initByIdx(idx uint32, v Value) {
 	if s.obj != nil {
 		panic("Attempt to init by idx into an object scope")
 	}
+	if s.vm != nil && s.vm.dbgHooks != nil {
+		s.vm.dbgHooks.stashInitGrow(s, idx)
+	}
 	s.values[idx] = v
 }
 
@@ -493,6 +503,15 @@ func (s *stash) initByName(name unistring.String, v Value) {
 }
 
 func (s *stash) getByIdx(idx uint32) Value {
+	if int(idx) >= len(s.values) {
+		if s.vm != nil && s.vm.dbgHooks != nil {
+			v, handled := s.vm.dbgHooks.stashGetSafe(s, idx)
+			if handled {
+				return v
+			}
+		}
+		return nil
+	}
 	return s.values[idx]
 }
 
@@ -506,10 +525,14 @@ func (s *stash) getByName(name unistring.String) (v Value, exists bool) {
 	if idx, exists := s.names[name]; exists {
 		v := s.values[idx&^maskTyp]
 		if v == nil {
-			if idx&maskVar == 0 {
-				panic(errAccessBeforeInit)
+			if s.vm != nil && s.vm.dbgHooks != nil {
+				v = s.vm.dbgHooks.stashGetByNameRelaxed(s, idx&^maskTyp)
 			} else {
-				v = _undefined
+				if idx&maskVar == 0 {
+					panic(errAccessBeforeInit)
+				} else {
+					v = _undefined
+				}
 			}
 		} else if idx&maskIndirect != 0 {
 			var f func(*vm) Value
@@ -540,6 +563,7 @@ func (s *stash) getRefByName(name unistring.String, strict bool) ref {
 							n:   name,
 							v:   &s.values,
 							idx: int(idx &^ maskTyp),
+							vm:  s.vm,
 						},
 					}
 				} else {
@@ -549,6 +573,7 @@ func (s *stash) getRefByName(name unistring.String, strict bool) ref {
 								n:   name,
 								v:   &s.values,
 								idx: int(idx &^ maskTyp),
+								vm:  s.vm,
 							},
 						},
 						strictConst: strict || (idx&maskStrict != 0),
@@ -559,6 +584,7 @@ func (s *stash) getRefByName(name unistring.String, strict bool) ref {
 					n:   name,
 					v:   &s.values,
 					idx: int(idx &^ maskTyp),
+					vm:  s.vm,
 				}
 			}
 		}
@@ -613,6 +639,9 @@ func (vm *vm) init() {
 }
 
 func (vm *vm) halted() bool {
+	if vm.prg == nil {
+		return true
+	}
 	pc := vm.pc
 	return pc < 0 || pc >= len(vm.prg.code)
 }
@@ -636,7 +665,7 @@ func (vm *vm) run() {
 			break
 		}
 		pc := vm.pc
-		if pc < 0 || pc >= len(vm.prg.code) {
+		if vm.prg == nil || pc < 0 || pc >= len(vm.prg.code) {
 			break
 		}
 		vm.prg.code[pc].exec(vm)
@@ -669,7 +698,7 @@ func (vm *vm) runWithProfiler() bool {
 			return true
 		}
 		pc := vm.pc
-		if pc < 0 || pc >= len(vm.prg.code) {
+		if vm.prg == nil || pc < 0 || pc >= len(vm.prg.code) {
 			break
 		}
 		vm.prg.code[pc].exec(vm)
@@ -778,6 +807,11 @@ func (vm *vm) pushTryFrame(catchPos, finallyPos int32) {
 }
 
 func (vm *vm) popTryFrame() {
+	if len(vm.tryStack) == 0 {
+		if vm.debugMode {
+			return
+		}
+	}
 	vm.tryStack = vm.tryStack[:len(vm.tryStack)-1]
 }
 
@@ -806,6 +840,22 @@ func (vm *vm) restoreStacks(iterLen, refLen uint32) (ex *Exception) {
 
 func (vm *vm) handleThrow(arg interface{}) *Exception {
 	ex := vm.exceptionFromValue(arg)
+	// Debugger: capture throw-site location BEFORE unwinding
+	var throwFile string
+	var throwLine int
+	if vm.dbgHooks != nil && vm.debugger != nil && ex != nil && len(ex.stack) > 0 {
+		frame := &ex.stack[0]
+		pos := frame.Position()
+		throwFile = normalizeFilename(pos.Filename)
+		throwLine = pos.Line
+		if throwFile == "" && vm.prg != nil && vm.prg.src != nil {
+			pos = vm.prg.src.Position(vm.prg.sourceOffset(vm.pc))
+			throwFile = normalizeFilename(pos.Filename)
+			throwLine = pos.Line
+		}
+		vm.dbgHooks.onThrowCaptureState(vm, ex)
+	}
+
 	for len(vm.tryStack) > 0 {
 		tf := &vm.tryStack[len(vm.tryStack)-1]
 		if tf.catchPos == -1 && tf.finallyPos == -1 || ex == nil && tf.catchPos != tryPanicMarker {
@@ -829,6 +879,9 @@ func (vm *vm) handleThrow(arg interface{}) *Exception {
 
 		if tf.catchPos >= 0 {
 			// exception is caught
+			if vm.dbgHooks != nil && ex != nil {
+				vm.dbgHooks.onCaughtException(vm, ex, throwFile, throwLine)
+			}
 			vm.push(ex.val)
 			vm.pc = int(tf.catchPos)
 			tf.catchPos = -1
@@ -853,6 +906,9 @@ func (vm *vm) handleThrow(arg interface{}) *Exception {
 // In all other cases exceptions must be thrown using panic().
 func (vm *vm) throw(v interface{}) {
 	if ex := vm.handleThrow(v); ex != nil {
+		if vm.dbgHooks != nil {
+			vm.dbgHooks.onUncaughtException(vm, ex)
+		}
 		panic(ex)
 	}
 }
@@ -887,10 +943,17 @@ func (vm *vm) runTryInner() (ex *Exception) {
 	defer func() {
 		if x := recover(); x != nil {
 			ex = vm.handleThrow(x)
+			if ex != nil && vm.dbgHooks != nil {
+				vm.dbgHooks.onRunTryInnerException(vm, ex)
+			}
 		}
 	}()
 
-	vm.run()
+	if vm.dbgHooks != nil {
+		vm.dbgHooks.runDebug()
+	} else {
+		vm.run()
+	}
 	return
 }
 
@@ -1241,6 +1304,13 @@ func (e export) exec(vm *vm) {
 		stash = stash.outer
 	}
 	e.callback(vm, func() Value {
+		if vm != nil && vm.dbgHooks != nil {
+			v := stash.getByIdx(idx)
+			if v == nil {
+				return _undefined
+			}
+			return v
+		}
 		return stash.getByIdx(idx)
 	})
 	vm.pc++
@@ -1262,6 +1332,9 @@ func (e exportLex) exec(vm *vm) {
 	e.callback(vm, func() Value {
 		v := stash.getByIdx(idx)
 		if v == nil {
+			if vm != nil && vm.dbgHooks != nil {
+				return _undefined
+			}
 			panic(errAccessBeforeInit)
 		}
 		return v
@@ -1884,6 +1957,17 @@ func (_shr) exec(vm *vm) {
 	vm.stack[vm.sp-2] = intToValue(int64(toUint32(left) >> (toUint32(right) & 0x1F)))
 	vm.sp--
 	vm.pc++
+}
+
+type _debugger struct{}
+
+var debugger _debugger
+
+func (_debugger) exec(vm *vm) {
+	vm.pc++
+	if vm.dbgHooks != nil {
+		vm.dbgHooks.onDebuggerStatement(vm)
+	}
 }
 
 type jump int32
@@ -3748,10 +3832,11 @@ type enterBlock struct {
 	names     map[unistring.String]uint32
 	stashSize uint32
 	stackSize uint32
+	needStash bool
 }
 
 func (e *enterBlock) exec(vm *vm) {
-	if e.stashSize > 0 {
+	if e.stashSize > 0 || e.needStash {
 		vm.newStash()
 		vm.stash.values = make([]Value, e.stashSize)
 		if len(e.names) > 0 {

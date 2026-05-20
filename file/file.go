@@ -136,6 +136,11 @@ func (fl *File) SetSourceMap(m *sourcemap.Consumer) {
 	fl.sourceMap = m
 }
 
+// SourceMap returns the source map consumer, or nil if none is set.
+func (fl *File) SourceMap() *sourcemap.Consumer {
+	return fl.sourceMap
+}
+
 func (fl *File) Position(offset int) Position {
 	var line int
 	var lineOffsets []int

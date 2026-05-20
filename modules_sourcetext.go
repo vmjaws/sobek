@@ -17,9 +17,10 @@ var (
 type SourceTextModuleInstance struct {
 	moduleRecord *SourceTextModuleRecord
 	// TODO figure out omething less idiotic
-	exportGetters map[string]func() Value
-	pcap          *promiseCapability
-	asyncPromise  *Promise
+	exportGetters   map[string]func() Value
+	exportGettersMu sync.RWMutex
+	pcap            *promiseCapability
+	asyncPromise    *Promise
 }
 
 func (s *SourceTextModuleInstance) ExecuteModule(rt *Runtime, res, rej func(interface{}) error) (CyclicModuleInstance, error) {
@@ -69,8 +70,10 @@ func (s *SourceTextModuleInstance) ExecuteModule(rt *Runtime, res, rej func(inte
 }
 
 func (s *SourceTextModuleInstance) GetBindingValue(name string) Value {
+	s.exportGettersMu.RLock()
 	getter, ok := s.exportGetters[name]
-	if !ok { // let's not panic in case somebody asks for a binding that isn't exported
+	s.exportGettersMu.RUnlock()
+	if !ok {
 		return nil
 	}
 	return getter()
@@ -91,6 +94,8 @@ type SourceTextModuleRecord struct {
 	localExportEntries    []exportEntry
 	indirectExportEntries []exportEntry
 	starExportEntries     []exportEntry
+
+	debug bool
 
 	hostResolveImportedModule HostResolveImportedModuleFunc
 
@@ -404,7 +409,17 @@ func ParseModule(name, sourceText string, resolveModule HostResolveImportedModul
 	return ModuleFromAST(body, resolveModule)
 }
 
+// ModuleFromAST constructs a module record without debug symbols.
 func ModuleFromAST(body *ast.Program, resolveModule HostResolveImportedModuleFunc) (*SourceTextModuleRecord, error) {
+	return moduleFromAST(body, resolveModule, false)
+}
+
+// ModuleFromASTDebug constructs a module record with debug symbols enabled.
+func ModuleFromASTDebug(body *ast.Program, resolveModule HostResolveImportedModuleFunc) (*SourceTextModuleRecord, error) {
+	return moduleFromAST(body, resolveModule, true)
+}
+
+func moduleFromAST(body *ast.Program, resolveModule HostResolveImportedModuleFunc, debug bool) (*SourceTextModuleRecord, error) {
 	requestedModules := requestedModulesFromAst(body.Body)
 	importEntries, err := importEntriesFromAst(body.ImportEntries)
 	if err != nil {
@@ -459,6 +474,7 @@ func ModuleFromAST(body *ast.Program, resolveModule HostResolveImportedModuleFun
 		localExportEntries:    localExportEntries,
 		indirectExportEntries: indirectExportEntries,
 		starExportEntries:     starExportEntries,
+		debug:                 debug,
 
 		hostResolveImportedModule: resolveModule,
 		once:                      &sync.Once{},
@@ -568,7 +584,7 @@ func (module *SourceTextModuleRecord) handleAsyncGeteExportNames(
 
 func (module *SourceTextModuleRecord) InitializeEnvironment() (err error) {
 	module.once.Do(func() {
-		c := newCompiler()
+		c := newCompiler(module.debug)
 		defer func() {
 			if x := recover(); x != nil {
 				switch x1 := x.(type) {
@@ -691,7 +707,7 @@ func (module *SourceTextModuleRecord) Evaluate(rt *Runtime) *Promise {
 }
 
 func (module *SourceTextModuleRecord) Link() error {
-	c := newCompiler()
+	c := newCompiler(module.debug)
 	c.hostResolveImportedModule = module.hostResolveImportedModule
 	return c.CyclicModuleRecordConcreteLink(module)
 }

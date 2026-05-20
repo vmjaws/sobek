@@ -325,6 +325,39 @@ func (f *classFuncObject) _initFields(instance *Object) {
 	}
 	if f.initFields != nil {
 		vm := f.val.runtime.vm
+
+		// STEP-IN FIX: Suppress step-in/next during field initialization.
+		// Node.js/Chrome debuggers step into the constructor BODY, not field
+		// initializers. Save+clear step flags before running _initFields,
+		// restore after. Also set suppressStepInheritance to prevent the
+		// global coordinator from re-enabling step flags mid-execution.
+		var savedStepIn, savedNext bool
+		if vm.debugMode && vm.debugger != nil {
+			savedStepIn = vm.debugger.stepIn
+			savedNext = vm.debugger.next
+			if savedStepIn || savedNext {
+				if debugVM {
+					funcName := ""
+					if f.initFields.funcName != "" {
+						funcName = string(f.initFields.funcName)
+					}
+					srcName := ""
+					if f.initFields.src != nil {
+						srcName = f.initFields.src.Name()
+					}
+					entryLine := 0
+					if f.initFields.src != nil && len(f.initFields.code) > 0 {
+						entryLine = f.initFields.src.Position(f.initFields.sourceOffset(0)).Line
+					}
+					fmt.Printf("[CLASS-INITFIELDS] Suppressing step flags during _initFields: func=%q, file=%s, entryLine=%d, codeLen=%d, stepIn=%v, next=%v, lastBPLine=%d\n",
+						funcName, srcName, entryLine, len(f.initFields.code), savedStepIn, savedNext, vm.debugger.lastBreakpoint.line)
+				}
+				vm.debugger.stepIn = false
+				vm.debugger.next = false
+				vm.debugger.suppressStepInheritance = true
+			}
+		}
+
 		vm.pushCtx()
 		vm.prg = f.initFields
 		vm.stash = f.stash
@@ -336,6 +369,9 @@ func (f *classFuncObject) _initFields(instance *Object) {
 
 		vm.sb = vm.sp
 		vm.push(instance)
+		if vm.debugMode {
+			prepareInitFieldsDebug(vm)
+		}
 		vm.pc = 0
 		ex := vm.runTry()
 		vm.popCtx()
@@ -343,12 +379,85 @@ func (f *classFuncObject) _initFields(instance *Object) {
 			panic(ex)
 		}
 		vm.sp -= 2
+		// After the inner vm.runTry() exits, the debugger step flags may have
+		// been set by the user (e.g., step-over at a breakpoint inside the
+		// class field initializer). The VM-EXIT nested path clears them.
+		// We must NOT let vmExited=true / vmDoneCh closed survive — this VM
+		// is still alive (the constructor caller continues). Restore those
+		// two fields so the outer vm.debug() loop keeps running.
+		if vm.debugMode && vm.debugger != nil {
+			vm.debugger.vmExited = false
+			select {
+			case <-vm.debugger.vmDoneCh:
+				vm.debugger.vmDoneCh = make(chan struct{})
+			default:
+			}
+
+			// Restore step flags that were suppressed before _initFields.
+			vm.debugger.suppressStepInheritance = false
+			if !vm.debugger.stepIn && !vm.debugger.next {
+				// No new step operation was started inside — restore saved flags
+				vm.debugger.stepIn = savedStepIn
+				vm.debugger.next = savedNext
+				if debugVM && (savedStepIn || savedNext) {
+					fmt.Printf("[CLASS-INITFIELDS] Restored step flags after _initFields: stepIn=%v, next=%v\n", savedStepIn, savedNext)
+				}
+			} else if debugVM {
+				fmt.Printf("[CLASS-INITFIELDS] Keeping user-initiated step flags after _initFields: stepIn=%v, next=%v\n",
+					vm.debugger.stepIn, vm.debugger.next)
+			}
+
+			// If step-over/step-in was active in the inner loop, we must be careful
+			// NOT to corrupt stepOverTargetDepth when the step was initiated OUTSIDE
+			// the initializer (at a shallower depth). The original target depth is
+			// preserved in stepOverOriginalTargetDepth. Only update if the user
+			// started a NEW step operation INSIDE the initializer (which would have
+			// set stepOverOriginalTargetDepth deeper than where we are now).
+			if vm.debugger.next || vm.debugger.stepIn {
+				currentDepth := vm.debugger.callStackDepth()
+				origTarget := vm.debugger.stepOverOriginalTargetDepth
+				// Only update if the step was initiated inside the initializer
+				// (origTarget >= currentDepth means it was set at this depth or deeper).
+				// If origTarget < currentDepth (step was at shallower depth), preserve it.
+				if origTarget == 0 || origTarget >= currentDepth {
+					vm.debugger.stepOverTargetDepth = currentDepth
+					if debugVM {
+						fmt.Printf("[INITFIELDS] Updated stepOverTargetDepth=%d after nested exit (next=%v, stepIn=%v, startLine=%d, origTarget=%d)\n",
+							currentDepth, vm.debugger.next, vm.debugger.stepIn, vm.debugger.stepOverStartLine, origTarget)
+					}
+				} else {
+					// Step was initiated outside — restore the original target depth.
+					vm.debugger.stepOverTargetDepth = origTarget
+					if debugVM {
+						fmt.Printf("[INITFIELDS] Preserved stepOverTargetDepth=%d after nested exit (next=%v, stepIn=%v, startLine=%d, currentDepth=%d)\n",
+							origTarget, vm.debugger.next, vm.debugger.stepIn, vm.debugger.stepOverStartLine, currentDepth)
+					}
+				}
+			}
+		}
 	}
 }
 
 func (f *classFuncObject) construct(args []Value, newTarget *Object) *Object {
 	if newTarget == nil {
 		newTarget = f.val
+	}
+	vm := f.val.runtime.vm
+	if vm.debugMode && vm.debugger != nil && debugVM {
+		prgName := "<nil>"
+		prgFile := ""
+		prgEntryLine := 0
+		if f.prg != nil {
+			prgName = string(f.prg.funcName)
+			if f.prg.src != nil {
+				prgFile = f.prg.src.Name()
+				if len(f.prg.code) > 0 {
+					prgEntryLine = f.prg.src.Position(f.prg.sourceOffset(0)).Line
+				}
+			}
+		}
+		fmt.Printf("[CLASS-CONSTRUCT] Entering construct: prg=%q, file=%s, entryLine=%d, derived=%v, stepIn=%v, next=%v, lastBPLine=%d\n",
+			prgName, prgFile, prgEntryLine, f.derived, vm.debugger.stepIn, vm.debugger.next, vm.debugger.lastBreakpoint.line)
 	}
 	if f.prg == nil {
 		instance := f.createInstance(args, newTarget)
@@ -430,6 +539,22 @@ func (f *baseJsFuncObject) __call(args []Value, newTarget, this Value) (Value, *
 	vm.privEnv = f.privEnv
 	vm.newTarget = newTarget
 	vm.pc = 0
+
+	// ARROW-DEBUG: Log when a JS function is called from Go while step flags are active.
+	// This traces arrow function callbacks (e.g., gherkin calling step definitions).
+	if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
+		srcName := ""
+		if f.prg != nil && f.prg.src != nil {
+			srcName = f.prg.src.Name()
+		}
+		funcName := ""
+		if f.prg != nil {
+			funcName = string(f.prg.funcName)
+		}
+		fmt.Printf("[ARROW-DEBUG] __call entering JS func from Go: func=%q, file=%s, stepIn=%v, next=%v, depth=%d, debugMode=%v, steppingFile=%s\n",
+			funcName, srcName, vm.debugger.stepIn, vm.debugger.next, len(vm.callStack), vm.debugMode, vm.debugger.steppingFilename)
+	}
+
 	for {
 		ex := vm.runTryInner()
 		if ex != nil {
@@ -438,6 +563,13 @@ func (f *baseJsFuncObject) __call(args []Value, newTarget, this Value) (Value, *
 		if vm.halted() {
 			break
 		}
+	}
+
+	// ARROW-DEBUG: Log after the JS function returns — only when step flags are active
+	// to avoid flooding the log with millions of entries during normal execution.
+	if vm.debugger != nil && debugVM && (vm.debugger.stepIn || vm.debugger.next) {
+		fmt.Printf("[ARROW-DEBUG] __call returned from JS func: stepIn=%v, next=%v, depth=%d\n",
+			vm.debugger.stepIn, vm.debugger.next, len(vm.callStack))
 	}
 	if needPop {
 		vm.popCtx()
@@ -683,6 +815,12 @@ type asyncRunner struct {
 	promiseCap *promiseCapability
 	f          *Object
 	vmCall     func(*vm, int)
+
+	// savedDebugState holds step state saved when an await suspends the
+	// generator while the debugger is stepping. Restored by onAsyncResume
+	// when the promise resolves. See async_dbg.go for details.
+	// Only used when vm.debugMode is true.
+	savedDebugState *asyncDebugState
 }
 
 func (ar *asyncRunner) onFulfilled(call FunctionCall) Value {
@@ -691,7 +829,23 @@ func (ar *asyncRunner) onFulfilled(call FunctionCall) Value {
 		ar.gen.vm.curAsyncRunner = nil
 	}()
 	arg := call.Argument(0)
-	res, resType, ex := ar.gen.next(arg)
+	// Inline gen.next() so we can call onAsyncResume AFTER enterNext()
+	// restores the generator's VM context (vm.prg, vm.stash, vm.pc).
+	// If we restore step state before enterNext(), the debug loop sees the
+	// wrong vm.prg (from the promise reaction job context), the file-change
+	// check detects a mismatch, and clears stepIn — causing the debugger
+	// to skip the next line in the async function.
+	ar.gen.enterNext()
+	if arg != nil {
+		ar.gen.vm.push(arg)
+	}
+	// NOW restore step state — vm.prg is the generator's program
+	if ar.gen.vm.debugMode {
+		onAsyncResume(ar)
+	}
+	res, resType, ex := ar.gen.step()
+	ar.gen.vm.popTryFrame()
+	ar.gen.vm.popCtx()
 	ar.step(res, resType == resultNormal, ex)
 	return _undefined
 }
@@ -702,7 +856,21 @@ func (ar *asyncRunner) onRejected(call FunctionCall) Value {
 		ar.gen.vm.curAsyncRunner = nil
 	}()
 	reason := call.Argument(0)
-	res, resType, ex := ar.gen.nextThrow(reason)
+	// Same fix as onFulfilled: restore step state AFTER enterNext()
+	ar.gen.enterNext()
+	if ar.gen.vm.debugMode {
+		onAsyncResume(ar)
+	}
+	ex := ar.gen.vm.handleThrow(reason)
+	if ex != nil {
+		ar.gen.vm.popTryFrame()
+		ar.gen.vm.popCtx()
+		ar.step(nil, false, ex)
+		return _undefined
+	}
+	res, resType, ex := ar.gen.step()
+	ar.gen.vm.popTryFrame()
+	ar.gen.vm.popCtx()
 	ar.step(res, resType == resultNormal, ex)
 	return _undefined
 }

@@ -1,6 +1,8 @@
 package sobek
 
 import (
+	"fmt"
+
 	"github.com/grafana/sobek/ast"
 	"github.com/grafana/sobek/file"
 	"github.com/grafana/sobek/token"
@@ -8,6 +10,9 @@ import (
 )
 
 func (c *compiler) compileStatement(v ast.Statement, needResult bool) {
+	if c.debug {
+		c.p.addStmtPC()
+	}
 	switch v := v.(type) {
 	case *ast.BlockStatement:
 		c.compileBlockStatement(v, needResult)
@@ -90,17 +95,27 @@ func (c *compiler) compileLabeledStatement(v *ast.LabelledStatement, needResult 
 func (c *compiler) updateEnterBlock(enter *enterBlock) {
 	scope := c.scope
 	stashSize, stackSize := 0, 0
+
 	if scope.dynLookup {
 		stashSize = len(scope.bindings)
 		enter.names = scope.makeNamesMap()
 	} else {
+		allInStash := scope.isDynamic() || c.debug
+
 		for _, b := range scope.bindings {
-			if b.inStash {
+			if allInStash || b.inStash {
 				stashSize++
 			} else {
 				stackSize++
 			}
 		}
+		if c.debug {
+			enter.names = scope.makeNamesMap()
+		}
+	}
+	if debugCompiler {
+		fmt.Printf("[UPDATE-ENTER-BLOCK] totalBindings=%d, stashSize=%d, stackSize=%d, isDynamic=%v, debug=%v, funcType=%d\n",
+			len(scope.bindings), stashSize, stackSize, scope.isDynamic(), c.debug, scope.funcType)
 	}
 	enter.stashSize, enter.stackSize = uint32(stashSize), uint32(stackSize)
 }
@@ -171,7 +186,7 @@ func (c *compiler) compileTryStatement(v *ast.TryStatement, needResult bool) {
 			c.compileFunctions(funcs)
 			c.compileStatements(list, bodyNeedResult)
 			c.leaveScopeBlock(enter)
-			if c.scope.dynLookup || c.scope.bindings[0].inStash {
+			if c.scope.dynLookup || c.scope.bindings[0].inStash || c.debug {
 				c.p.code[lbl+catchOffset] = &enterCatchBlock{
 					names:     enter.names,
 					stashSize: enter.stashSize,
@@ -650,12 +665,14 @@ L:
 }
 
 func (c *compiler) compileBreak(label *ast.Identifier, idx file.Idx) {
+	c.p.addSrcMap(int(idx) - 1)
 	block := c.emitBlockExitCode(label, idx, true)
 	block.breaks = append(block.breaks, len(c.p.code))
 	c.emit(nil)
 }
 
 func (c *compiler) compileContinue(label *ast.Identifier, idx file.Idx) {
+	c.p.addSrcMap(int(idx) - 1)
 	block := c.emitBlockExitCode(label, idx, false)
 	block.conts = append(block.conts, len(c.p.code))
 	c.emit(nil)
@@ -734,6 +751,7 @@ func (c *compiler) compileReturnStatement(v *ast.ReturnStatement) {
 	if s := c.scope.nearestFunction(); s != nil && s.funcType == funcClsInit {
 		c.throwSyntaxError(int(v.Return)-1, "Illegal return statement")
 	}
+	c.p.addSrcMap(int(v.Return) - 1)
 	if v.Argument != nil {
 		c.emitExpr(c.compileExpression(v.Argument), true)
 	} else {
@@ -751,6 +769,9 @@ func (c *compiler) compileReturnStatement(v *ast.ReturnStatement) {
 		b := s.boundNames[thisBindingName]
 		c.assert(b != nil, int(v.Return)-1, "Derived constructor, but no 'this' binding")
 		b.markAccessPoint()
+	}
+	if c.debug && c.funcClosingBracePos > 0 {
+		c.p.addSrcMap(int(c.funcClosingBracePos) - 1)
 	}
 	c.emit(ret)
 }

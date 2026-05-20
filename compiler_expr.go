@@ -127,6 +127,11 @@ type compiledFunctionLiteral struct {
 	isExpr          bool
 
 	isAsync, isGenerator bool
+
+	// closingBracePos is the file position of the function body's closing '}'.
+	// Used by the debugger to emit a source-map entry for the implicit return
+	// so that step-over/step-in stops at the '}' (like Node.js/V8 debuggers).
+	closingBracePos file.Idx
 }
 
 type compiledBracketExpr struct {
@@ -1520,6 +1525,12 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				}
 			}
 		}
+		// NOTE: Do NOT pop varScope here.  compileStatements (below) still
+		// needs it alive so that lexical declarations (const/let inside
+		// the function body) can be looked up in boundNames.
+		// The enterFuncBody instruction is filled in later (around
+		// enterFunc2Mark) after finaliseVarAlloc, where varScope info
+		// is captured correctly for both debug and non-debug paths.
 	} else {
 		// To avoid triggering variable conflict when binding from non-strict direct eval().
 		// Parameters are supposed to be in a parent scope, hence no conflict.
@@ -1545,6 +1556,10 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 	if e.isGenerator {
 		e.c.emit(yieldEmpty)
 	}
+	// Save and set the closing brace position for this function so that
+	// compileReturnStatement can emit a source-map entry at '}' for explicit returns.
+	savedClosingBrace := e.c.funcClosingBracePos
+	e.c.funcClosingBracePos = e.closingBracePos
 	e.c.compileStatements(body, false)
 
 	var last ast.Statement
@@ -1552,6 +1567,15 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 		last = body[l-1]
 	}
 	if _, ok := last.(*ast.ReturnStatement); !ok {
+		// DEBUGGER FIX: Emit a source map entry for the closing '}' of the
+		// function body before the implicit return (loadUndef + ret). This makes
+		// the debugger pause at the closing brace after the last statement
+		// executes, matching Node.js/V8 debugger behaviour. Without this, the
+		// implicit return inherits the source position of the last compiled
+		// statement and the debugger skips past it.
+		if e.c.debug && e.closingBracePos > 0 {
+			e.c.p.addSrcMap(int(e.closingBracePos) - 1)
+		}
 		if e.typ == funcDerivedCtor {
 			e.c.emit(loadUndef)
 			thisBinding.markAccessPoint()
@@ -1560,6 +1584,9 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 			e.c.emit(loadUndef, ret)
 		}
 	}
+
+	// Restore the outer function's closing brace position.
+	e.c.funcClosingBracePos = savedClosingBrace
 
 	delta := 0
 	code := e.c.p.code
@@ -1608,11 +1635,11 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 
 	needInitThis := false
 	if thisBinding != nil {
-		if !s.isDynamic() && thisBinding.useCount() == 0 {
+		if !s.isDynamic() && !s.c.debug && thisBinding.useCount() == 0 {
 			s.deleteBinding(thisBinding)
 			thisBinding = nil
 		} else {
-			if thisBinding.inStash || s.isDynamic() {
+			if thisBinding.inStash || s.isDynamic() || s.c.debug {
 				delta++
 				thisBinding.emitInitAtScope(s, preambleLen-delta)
 				needInitThis = true
@@ -1636,6 +1663,32 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 	delta = preambleLen - delta
 	var enter instruction
 	if stashSize > 0 || s.argsInStash {
+		// CAPTURE varScope info BEFORE popping (for the second path)
+		var varScopeNames2 map[unistring.String]uint32
+		var varScopeStashSize2, varScopeStackSize2 int
+		var varScopeDynamic2 bool
+		if enterFunc2Mark != -1 {
+			// Find the varScope by looking at the current scope's outer scope
+			// (since we're still in the parameter scope)
+			varScope2 := e.c.scope
+			// Actually, we need to find the scope that was created by newBlockScope()
+			// Let's capture it differently - iterate from current scope
+			for varScope2 != nil && !varScope2.variable {
+				varScope2 = varScope2.outer
+			}
+			if varScope2 != nil && varScope2.variable {
+				varScopeNames2 = varScope2.makeNamesMap()
+				varScopeDynamic2 = varScope2.dynamic
+				for _, b := range varScope2.bindings {
+					if b.inStash {
+						varScopeStashSize2++
+					} else {
+						varScopeStackSize2++
+					}
+				}
+			}
+		}
+
 		if firstForwardRef == -1 {
 			enter1 := enterFunc{
 				numArgs:     uint32(paramsCount),
@@ -1645,14 +1698,32 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				extensible:  s.dynamic,
 				funcType:    e.typ,
 			}
-			if s.isDynamic() {
+			if e.c.debug {
+				// Always populate names for debugging, not just for dynamic scopes
 				enter1.names = s.makeNamesMap()
+			} else {
+				if s.isDynamic() {
+					enter1.names = s.makeNamesMap()
+				}
 			}
 			enter = &enter1
 			if enterFunc2Mark != -1 {
-				ef2 := &enterFuncBody{
-					extensible: e.c.scope.dynamic,
-					funcType:   e.typ,
+				var ef2 *enterFuncBody
+				if e.c.debug {
+					ef2 = &enterFuncBody{
+						enterBlock: enterBlock{
+							names:     varScopeNames2,
+							stashSize: uint32(varScopeStashSize2),
+							stackSize: uint32(varScopeStackSize2),
+						},
+						extensible: varScopeDynamic2,
+						funcType:   e.typ,
+					}
+				} else {
+					ef2 = &enterFuncBody{
+						extensible: e.c.scope.dynamic,
+						funcType:   e.typ,
+					}
 				}
 				e.c.updateEnterBlock(&ef2.enterBlock)
 				e.c.p.code[enterFunc2Mark] = ef2
@@ -1665,17 +1736,33 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				extensible: s.dynamic,
 				funcType:   e.typ,
 			}
-			if s.isDynamic() {
+			if e.c.debug {
+				// Always populate names for debugging, not just for dynamic scopes
 				enter1.names = s.makeNamesMap()
+			} else {
+				if s.isDynamic() {
+					enter1.names = s.makeNamesMap()
+				}
 			}
 			enter = &enter1
 			if enterFunc2Mark != -1 {
+				var extensible bool
+				if e.c.debug {
+					extensible = varScopeDynamic2
+				} else {
+					extensible = e.c.scope.dynamic
+				}
+
 				ef2 := &enterFuncBody{
+					enterBlock: enterBlock{
+						names:     varScopeNames2,
+						stashSize: uint32(varScopeStashSize2),
+						stackSize: uint32(varScopeStackSize2),
+					},
 					adjustStack: true,
-					extensible:  e.c.scope.dynamic,
+					extensible:  extensible,
 					funcType:    e.typ,
 				}
-				e.c.updateEnterBlock(&ef2.enterBlock)
 				e.c.p.code[enterFunc2Mark] = ef2
 			}
 		}
@@ -1687,6 +1774,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 			stackSize: uint32(stackSize),
 			args:      uint32(paramsCount),
 		}
+
 		if enterFunc2Mark != -1 {
 			ef2 := &enterFuncBody{
 				extensible: e.c.scope.dynamic,
@@ -1769,6 +1857,7 @@ func (c *compiler) compileFunctionLiteral(v *ast.FunctionLiteral, isExpr bool) *
 		strict:          strictBody,
 		isAsync:         v.Async,
 		isGenerator:     v.Generator,
+		closingBracePos: v.Body.RightBrace,
 	}
 	r.init(c, v.Idx0())
 	return r
@@ -1813,6 +1902,7 @@ type clsElement struct {
 	initializer compiledExpr
 	body        *compiledFunctionLiteral
 	computed    bool
+	srcOffset   int // source position of this field/element for source maps
 }
 
 func (e *compiledClassLiteral) emitGetter(putOnStack bool) {
@@ -1955,6 +2045,9 @@ func (e *compiledClassLiteral) emitGetter(putOnStack bool) {
 		case *ast.FieldDefinition:
 			privateName, key, computed := e.processClassKey(elt.Key)
 			var el clsElement
+			if e.c.debug {
+				el.srcOffset = int(elt.Idx) - 1 // source position for stepping through fields
+			}
 			if elt.Initializer != nil {
 				el.initializer = e.c.compileExpression(elt.Initializer)
 			}
@@ -2174,6 +2267,11 @@ func (e *compiledClassLiteral) compileFieldsAndStaticBlocks(elements []clsElemen
 
 	valIdx := 0
 	for _, elt := range elements {
+		// In debug mode, emit a source map entry for each field so the
+		// debugger can step through field declarations line by line.
+		if e.c.debug && elt.srcOffset > 0 {
+			e.c.p.addSrcMap(elt.srcOffset)
+		}
 		if elt.body != nil {
 			e.c.emit(dup) // this
 			elt.body.emitGetter(true)
@@ -2204,8 +2302,8 @@ func (e *compiledClassLiteral) compileFieldsAndStaticBlocks(elements []clsElemen
 			}
 		}
 	}
-	if s.isDynamic() || thisBinding.useCount() > 0 {
-		if s.isDynamic() || thisBinding.inStash {
+	if s.isDynamic() || s.c.debug || thisBinding.useCount() > 0 {
+		if s.isDynamic() || s.c.debug || thisBinding.inStash {
 			thisBinding.emitInitAt(1)
 		}
 	} else {
@@ -2219,8 +2317,13 @@ func (e *compiledClassLiteral) compileFieldsAndStaticBlocks(elements []clsElemen
 			stashSize: 1,
 			funcType:  funcClsInit,
 		}
-		if s.dynLookup {
+		if e.c.debug {
+			// Always populate names for debugging, not just for dynamic lookup
 			enter.names = s.makeNamesMap()
+		} else {
+			if s.dynLookup {
+				enter.names = s.makeNamesMap()
+			}
 		}
 		e.c.p.code[0] = enter
 		s.trimCode(0)
@@ -2261,10 +2364,12 @@ func (c *compiler) compileCtor(ctor *ast.FunctionLiteral, derived bool) (p *Prog
 func (c *compiler) compileArrowFunctionLiteral(v *ast.ArrowFunctionLiteral) *compiledFunctionLiteral {
 	var strictBody *ast.StringLiteral
 	var body []ast.Statement
+	var closingBrace file.Idx
 	switch b := v.Body.(type) {
 	case *ast.BlockStatement:
 		strictBody = c.isStrictStatement(b)
 		body = b.List
+		closingBrace = b.RightBrace
 	case *ast.ExpressionBody:
 		body = []ast.Statement{
 			&ast.ReturnStatement{
@@ -2283,6 +2388,7 @@ func (c *compiler) compileArrowFunctionLiteral(v *ast.ArrowFunctionLiteral) *com
 		typ:             funcArrow,
 		strict:          strictBody,
 		isAsync:         v.Async,
+		closingBracePos: closingBrace,
 	}
 	r.init(c, v.Idx0())
 	return r
@@ -2865,6 +2971,10 @@ func (e *compiledObjectLiteral) emitGetter(putOnStack bool) {
 	for _, prop := range e.expr.Value {
 		switch prop := prop.(type) {
 		case *ast.PropertyKeyed:
+			// Emit a source map entry for each property so the debugger
+			// can step through object literal properties line by line
+			// (matching Node.js / TypeScript debugger behaviour).
+			e.c.p.addSrcMap(int(prop.Idx0()) - 1)
 			key, computed := e.c.processKey(prop.Key)
 			valueExpr := e.c.compileExpression(prop.Value)
 			var ne namedEmitter
@@ -2937,6 +3047,7 @@ func (e *compiledObjectLiteral) emitGetter(putOnStack bool) {
 				}
 			}
 		case *ast.PropertyShort:
+			e.c.p.addSrcMap(int(prop.Idx0()) - 1)
 			key := prop.Name.Name
 			if prop.Initializer != nil {
 				e.c.throwSyntaxError(int(prop.Initializer.Idx0())-1, "Invalid shorthand property initializer")
@@ -2947,6 +3058,7 @@ func (e *compiledObjectLiteral) emitGetter(putOnStack bool) {
 			e.c.compileIdentifierExpression(&prop.Name).emitGetter(true)
 			e.c.emit(putProp(key))
 		case *ast.SpreadElement:
+			e.c.p.addSrcMap(int(prop.Idx0()) - 1)
 			e.c.compileExpression(prop.Expression).emitGetter(true)
 			e.c.emit(copySpread)
 		default:
