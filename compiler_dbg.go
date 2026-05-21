@@ -6,6 +6,7 @@ package sobek
 import (
 	"fmt"
 	"sort"
+	"sync"
 )
 
 // debugScopeEndPCs tracks the ending PC for each scope during compilation.
@@ -35,11 +36,11 @@ func (s *scope) getScopeEndPC() int {
 
 type DebugSymbols struct {
 	// Range-based variable scope storage. Each entry covers a [StartPC, EndPC]
-	// range with its visible variables. Sorted by StartPC for binary search.
+	// range with its visible variables. Sorted by StartPC for early exit during scan.
 	// This replaces the per-PC map which had O(N*M) memory (one entry per
 	// instruction per variable) causing OOM with 20+ bundled files.
-	ranges []PCRange
-	sorted bool // true after ranges have been sorted
+	ranges   []PCRange
+	sortOnce sync.Once // ensures ranges are sorted exactly once, thread-safely
 
 	// Map line number to PCs
 	lineToPCs map[int][]int
@@ -56,13 +57,12 @@ func (ds *DebugSymbols) LookupVarsAtPC(pc int) []VarLocation {
 	if ds == nil || len(ds.ranges) == 0 {
 		return nil
 	}
-	// Sort on first access
-	if !ds.sorted {
+	// Sort once, thread-safely, on first access
+	ds.sortOnce.Do(func() {
 		sort.Slice(ds.ranges, func(i, j int) bool {
 			return ds.ranges[i].StartPC < ds.ranges[j].StartPC
 		})
-		ds.sorted = true
-	}
+	})
 	// Collect all ranges that contain this PC.
 	// Ranges can overlap (nested scopes), so we scan all matches.
 	var result []VarLocation
@@ -83,7 +83,6 @@ type VarLocation struct {
 	InStash    bool
 	StashIdx   uint32 // if InStash=true, the stash index within that stash level
 	StackIdx   int    // if InStash=false, the stack index
-	StashLevel int    // 0 = innermost (current) stash, 1 = parent stash, etc.
 	IsParam    bool
 	IsConst    bool
 	StartPC    int // PC where variable becomes available
@@ -332,30 +331,10 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 	stashIdx := 0
 	stackIdx := 0
 
-	// Compute the stash nesting level of THIS scope relative to the enclosing
-	// function. The function scope itself is level 0. Each stash-creating block
-	// scope inside the function increments the level by 1.
-	// At runtime, vm.stash is the innermost; getValueFromLocation uses this to
-	// compute how many .outer hops are needed.
-	stashLevel := 0
-	if !s.isFunction() {
-		// Count all stash-creating scopes from our parent up to (not including)
-		// the function scope, then add 1 for ourselves.
-		for p := s.outer; p != nil && !p.isFunction(); p = p.outer {
-			if p.needStash || p.isDynamic() || (p.c != nil && p.c.debug && len(p.bindings) > 0) {
-				stashLevel++
-			}
-		}
-		// The current scope itself is one level deeper than whatever we counted.
-		if s.needStash || s.isDynamic() || (s.c != nil && s.c.debug && len(s.bindings) > 0) {
-			stashLevel++
-		}
-	}
-	// stashLevel=0 for the function scope, 1 for try/catch/block directly in function, etc.
 
 	// First, let's see ALL bindings to understand the mismatch
 	if debugCompiler {
-		fmt.Printf("[COMPILER-DEBUG] collectAllDebugSymbols: Processing %d bindings (stashLevel=%d)\n", len(s.bindings), stashLevel)
+		fmt.Printf("[COMPILER-DEBUG] collectAllDebugSymbols: Processing %d bindings\n", len(s.bindings))
 		for i, b := range s.bindings {
 			fmt.Printf("[COMPILER-DEBUG]   Binding[%d]: name=%s, inStash=%v, isArg=%v\n", i, b.name, b.inStash, b.isArg)
 		}
@@ -380,11 +359,10 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 				displayName = "this"
 			}
 			varLoc := VarLocation{
-				Name:       displayName,
-				InStash:    bindingInStash,
-				IsParam:    b.isArg,
-				IsConst:    b.isConst,
-				StashLevel: stashLevel,
+				Name:    displayName,
+				InStash: bindingInStash,
+				IsParam: b.isArg,
+				IsConst: b.isConst,
 			}
 
 			if bindingInStash {
@@ -472,8 +450,8 @@ func (s *scope) collectAllDebugSymbols(stackOffset, finalStashIdx, finalStackIdx
 			})
 
 			if debugCompiler {
-				fmt.Printf("[COMPILER-DEBUG]   Debug symbol: %s, inStash=%v, stashIdx=%d, stackIdx=%d, stashLevel=%d, PC range=[%d-%d]\n",
-					varLoc.Name, varLoc.InStash, varLoc.StashIdx, varLoc.StackIdx, varLoc.StashLevel, minPC, maxPC)
+				fmt.Printf("[COMPILER-DEBUG]   Debug symbol: %s, inStash=%v, stashIdx=%d, stackIdx=%d, PC range=[%d-%d]\n",
+					varLoc.Name, varLoc.InStash, varLoc.StashIdx, varLoc.StackIdx, minPC, maxPC)
 			}
 		}
 

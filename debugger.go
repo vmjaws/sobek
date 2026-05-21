@@ -1079,6 +1079,12 @@ type Debugger struct {
 	vm   *vm
 	vuID uint64 // VU identifier — maps to DAP thread ID in multi-VU debug
 
+	// debugLoopDepth tracks nested vm.debug() invocations. Incremented on entry,
+	// decremented on exit. Only when it reaches 0 is the VM truly finished
+	// (not just a nested runTry/initFields completion). Used by the VM exit
+	// handler to avoid prematurely setting vmExited=true during nested calls.
+	debugLoopDepth int
+
 	currentLine     int
 	lastLine        int
 	lastDebugLine   int
@@ -1243,6 +1249,12 @@ type Debugger struct {
 
 	varValueCache     map[string]Value
 	varValueCacheLine int
+
+	// PERF: Cache for GetAllStashVariables — avoids rescanning 25 modules + stash
+	// chain on every call during the same pause. Invalidated when VM resumes.
+	allStashVarsCache    map[string]Value
+	allStashVarsCachePC  int // PC at time of capture — if unchanged, cache is valid
+	allStashVarsCachePrg *Program
 
 	functionCallStack   []FunctionCall
 	pendingReturnValues map[int]Value
@@ -1574,6 +1586,13 @@ func (dbg *Debugger) refreshFilenameCache() {
 // a file is user code vs. internal k6 code — previously duplicated in multiple
 // places within vm.debug().
 func IsUserSourceFilePath(normalizedFilename string) bool {
+	// External jslib URLs (tempo, httpx, etc.) loaded from https:// are
+	// never user source — they must never trigger breakpoints or stepping.
+	if strings.HasPrefix(normalizedFilename, "https://") ||
+		strings.HasPrefix(normalizedFilename, "http://") {
+		return false
+	}
+
 	return (strings.HasSuffix(normalizedFilename, ".ts") ||
 		strings.HasSuffix(normalizedFilename, ".js") ||
 		strings.HasSuffix(normalizedFilename, ".mjs") ||
@@ -2197,11 +2216,9 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 			dbg.vuID, dbg.stepIn, dbg.next, dbg.lifecycleTransition)
 	}
 
-	// PERF: read global step state once at Continue() entry rather than re-reading
-	// on every loop iteration. Re-read only after a timeout/transition.
-	globalNext, globalStepIn, _, _ := globalDebugCoordinator.GetGlobalStepState()
-	hasGlobalStepState := globalNext || globalStepIn
+	isMultiVU := globalDebugCoordinator.IsMultiVUDebug()
 
+	// Determine if the local VM is already dead.
 	localDead := dbg.vmExited
 	if !localDead {
 		select {
@@ -2211,516 +2228,256 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 		}
 	}
 	if !localDead {
-		activeDbg := globalDebugCoordinator.GetActiveDebugger()
-		if activeDbg != nil {
-			if activeDbg.vmExited {
-				localDead = true
-			} else if activeDbg != dbg {
+		if activeDbg := globalDebugCoordinator.GetActiveDebugger(); activeDbg != nil {
+			if activeDbg.vmExited || activeDbg != dbg {
 				localDead = true
 			}
 		}
 	}
 
 	if debugContinue {
-		fmt.Printf("[DEBUGGER-CONTINUE] Waiting for next activation: hasGlobalStepState=%v (globalNext=%v, globalStepIn=%v), localDead=%v\n",
-			hasGlobalStepState, globalNext, globalStepIn, localDead)
+		fmt.Printf("[DEBUGGER-CONTINUE] localDead=%v, isMultiVU=%v, vuID=%d\n",
+			localDead, isMultiVU, dbg.vuID)
 	}
 
-	// PERF: allocate timers once and Reset() on retry rather than creating a new
-	// timer (and goroutine) on every loop iteration via time.After().
-	// Use adaptive backoff: start at 200ms, increase to 1s after 5 retries,
-	// then to 5s after 15 retries. This keeps the debugger responsive for fast
-	// operations while reducing CPU/log overhead during long native Go calls
-	// (e.g., HTTP requests that can take 10-30s).
-	//
-	// PERF: When the VM has just exited (lifecycle transition), start with a
-	// shorter 50ms interval. The new VM starts within a few ms so 200ms adds
-	// unnecessary perceived latency to the step-over from setup→default.
-	retryInterval := 200 * time.Millisecond
-	if localDead {
-		retryInterval = 50 * time.Millisecond
-	}
-	retryCount := 0
-	retryTimer := time.NewTimer(retryInterval)
-	outerTimer := time.NewTimer(2 * time.Second)
-	defer retryTimer.Stop()
-	defer outerTimer.Stop()
+	// ─── Phase 1: Local VM is alive ────────────────────────────────────
+	// Send currentCh to activationCh, then block on currentCh + vmDoneCh.
+	// No timeouts — activate() will eventually receive from activationCh
+	// when the VM hits a breakpoint/step. vmDoneCh fires if the VM exits.
+	if !localDead {
+		// Try to send currentCh to both local and coordinator channels.
+		// The first one that activate() reads from will get our channel.
+		vuActivationCh := globalDebugCoordinator.GetVUActivationChannel(dbg.vuID)
 
-	// stopTimer drains and resets a timer safely.
-	stopTimer := func(t *time.Timer) {
-		if !t.Stop() {
+		// Non-blocking attempt to send to coordinator first (for step state),
+		// then blocking send to local activationCh + vmDoneCh.
+		sent := false
+		select {
+		case vuActivationCh <- dbg.currentCh:
+			sent = true
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] Sent to coordinator channel (vuID=%d)\n", dbg.vuID)
+			}
+		default:
+		}
+		if !sent {
+			// Block: send to either local activationCh or detect VM exit.
 			select {
-			case <-t.C:
-			default:
+			case dbg.activationCh <- dbg.currentCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Sent to local activationCh\n")
+				}
+			case <-dbg.vmDoneCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] VM exited while trying to send to activationCh\n")
+				}
+				localDead = true
 			}
 		}
-	}
 
-	// waitForActivation returns (activation, ok, vmExited)
-	// ok=true means we got an activation
-	// vmExited=true means the VM exited (vmDoneCh closed) during the wait
-	waitForActivation := func(source string, skipVMDone bool) (DebuggerActivation, bool, bool) {
-		var waitStart time.Time
-		if debugContinue {
-			waitStart = time.Now()
-		}
-
-		stopTimer(retryTimer)
-		retryTimer.Reset(retryInterval)
-
-		if skipVMDone {
+		// If we successfully sent, block on currentCh + vmDoneCh for the response.
+		if !localDead {
 			select {
 			case activation := <-dbg.currentCh:
 				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Received activation from %s: %s:%d (activationVU=%d, myVU=%d, wait=%dms, total=%dms)\n",
-						source, activation.Filename, activation.Line, activation.VUID, dbg.vuID,
-						time.Since(waitStart).Milliseconds(), time.Since(continueStart).Milliseconds())
+					fmt.Printf("[DEBUGGER-CONTINUE] ✅ Received activation: %s:%d (vuID=%d, wait=%dms)\n",
+						activation.Filename, activation.Line, activation.VUID,
+						time.Since(continueStart).Milliseconds())
 				}
-				retryCount = 0
-				retryInterval = 200 * time.Millisecond
-				return activation, true, false
-			case <-retryTimer.C:
-				retryCount++
-				// Adaptive backoff: increase interval for long-running native calls
-				if retryCount > 15 && retryInterval < 5*time.Second {
-					retryInterval = 5 * time.Second
-				} else if retryCount > 5 && retryInterval < 1*time.Second {
-					retryInterval = 1 * time.Second
-				}
-				// Log first 3 retries, then every 10th to avoid flooding
-				if debugContinue && (retryCount <= 3 || retryCount%10 == 0) {
-					fmt.Printf("[DEBUGGER-CONTINUE] Retry timeout waiting for activation from %s (%dms, total=%dms, retries=%d)\n",
-						source, retryInterval.Milliseconds(), time.Since(continueStart).Milliseconds(), retryCount)
-				}
-				return DebuggerActivation{}, false, false
-			}
-		}
-		select {
-		case activation := <-dbg.currentCh:
-			if debugContinue {
-				fmt.Printf("[DEBUGGER-CONTINUE] Received activation from %s: %s:%d (activationVU=%d, myVU=%d, wait=%dms, total=%dms)\n",
-					source, activation.Filename, activation.Line, activation.VUID, dbg.vuID,
-					time.Since(waitStart).Milliseconds(), time.Since(continueStart).Milliseconds())
-			}
-			retryCount = 0
-			retryInterval = 200 * time.Millisecond
-			return activation, true, false
-		case <-dbg.vmDoneCh:
-			if debugContinue {
-				fmt.Printf("[DEBUGGER-CONTINUE] VM exited (vmDoneCh closed) while waiting on %s (%dms, total=%dms) - switching to global\n",
-					source, time.Since(waitStart).Milliseconds(), time.Since(continueStart).Milliseconds())
-			}
-			select {
-			case <-dbg.activationCh:
+				return activation
+			case <-dbg.vmDoneCh:
 				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Drained stale currentCh from local activation channel\n")
+					fmt.Printf("[DEBUGGER-CONTINUE] VM exited while waiting for activation response\n")
 				}
-			default:
+				// Drain stale entry from activationCh if we sent one.
+				select {
+				case <-dbg.activationCh:
+				default:
+				}
+				localDead = true
 			}
-			return DebuggerActivation{}, false, true
-		case <-retryTimer.C:
-			retryCount++
-			// Adaptive backoff: increase interval for long-running native calls
-			if retryCount > 15 && retryInterval < 5*time.Second {
-				retryInterval = 5 * time.Second
-			} else if retryCount > 5 && retryInterval < 1*time.Second {
-				retryInterval = 1 * time.Second
-			}
-			// Log first 3 retries, then every 10th to avoid flooding
-			if debugContinue && (retryCount <= 3 || retryCount%10 == 0) {
-				fmt.Printf("[DEBUGGER-CONTINUE] Retry timeout waiting for activation from %s (%dms, total=%dms, retries=%d)\n",
-					source, retryInterval.Milliseconds(), time.Since(continueStart).Milliseconds(), retryCount)
-			}
-			// NOTE: Do NOT drain dbg.activationCh here — a fresh activation
-			// from activate() may have just arrived between the timer firing
-			// and this code running. The outer Continue() loop drains stale
-			// entries before each send, so stale entries are handled there.
-			return DebuggerActivation{}, false, false
 		}
 	}
 
-	localTimedOut := localDead
-	isMultiVU := globalDebugCoordinator.IsMultiVUDebug()
-	// In multi-VU mode, use per-VU activation channel instead of the global one.
-	vuActivationCh := globalDebugCoordinator.GetVUActivationChannel(dbg.vuID)
-	// crossVUSent tracks whether we've already sent currentCh to the cross-VU
-	// channels. Prevents the localTimedOut loop from re-sending on every retry
-	// iteration, which causes thousands of "cross-VU fallback" log messages
-	// and wastes CPU draining/sending on channels that already have our entry.
+	// ─── Phase 2: Local VM is dead (lifecycle transition or test end) ──
+	// The VM exited. We need to wait for a NEW VM to start and call
+	// activate(), or detect that all VMs are done (test finished).
+	// No timeouts — we block on currentCh and use a notification channel
+	// from the coordinator for "all done" detection.
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-CONTINUE] Entering dead-VM phase (vuID=%d)\n", dbg.vuID)
+	}
+
 	crossVUSent := false
 
-	if debugContinue {
-		fmt.Printf("[DEBUGGER-CONTINUE] Loop init: localTimedOut=%v, isMultiVU=%v, vuID=%d, currentCh=%p, vuCh=%p, vmExited=%v\n",
-			localTimedOut, isMultiVU, dbg.vuID, dbg.currentCh, vuActivationCh, dbg.vmExited)
-	}
-
 	for {
-		// CRITICAL: If a phase transition (ResetForPhaseTransition) ran on
-		// another goroutine while this Continue() is in-flight, it will have
-		// set dbg.currentCh = nil.  We MUST recreate it before any branch
-		// tries to send it into a channel — otherwise activate() receives
-		// a nil channel and deadlocks.
+		// Recreate currentCh if it was nil'd by ResetForPhaseTransition.
 		if dbg.currentCh == nil {
 			dbg.currentCh = make(chan DebuggerActivation)
-			// Reset the sent flag so the new channel gets sent to cross-VU channels.
 			crossVUSent = false
 			if debugContinue {
-				fmt.Printf("[DEBUGGER-CONTINUE] currentCh was nil (phase transition?), recreated %p\n", dbg.currentCh)
+				fmt.Printf("[DEBUGGER-CONTINUE] Recreated currentCh after phase transition\n")
 			}
 		}
 
-		// Re-read vuActivationCh each iteration: ResetForPhaseTransition may
-		// have drained it, and in localTimedOut mode we drain-before-send anyway.
-		vuActivationCh = globalDebugCoordinator.GetVUActivationChannel(dbg.vuID)
-
-		// FIX #5: Re-read global step state at the top of each iteration.
-		// Without this, hasGlobalStepState stays stale if Next()/StepIn()
-		// is called by the DAP handler on another goroutine mid-loop,
-		// causing the routing logic (global vs local channel) to be wrong.
-		if isMultiVU {
-			// In multi-VU mode, check per-VU step state instead of global.
-			globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
-		} else {
-			globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
+		// Check: all VMs exited → test is finished.
+		allVMsExited := true
+		allDbgs := globalDebugCoordinator.GetAllDebuggers()
+		for _, d := range allDbgs {
+			if !d.vmExited {
+				select {
+				case <-d.vmDoneCh:
+				default:
+					allVMsExited = false
+				}
+			}
 		}
-		hasGlobalStepState = globalNext || globalStepIn
-
-		if localTimedOut {
-			// ── FIX: Detect test completion — all VMs exited, no receiver ──
-			// When the test finishes (all iterations done, summary printed),
-			// no VM is running to consume step state. Without this check,
-			// Continue() loops forever on "Timeout waiting for receiver".
-			// Check if ALL registered debuggers have their VMs exited.
-			allVMsExited := true
-			allDbgs := globalDebugCoordinator.GetAllDebuggers()
-			for _, d := range allDbgs {
-				if !d.vmExited {
-					select {
-					case <-d.vmDoneCh:
-						// vmDoneCh closed = VM exited
-					default:
-						allVMsExited = false
-					}
-				}
+		if allVMsExited && len(allDbgs) == 0 {
+			allVMsExited = true
+		}
+		if allVMsExited && globalDebugCoordinator.HasWaitForFunctionEntry() {
+			allVMsExited = false
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] All VMs exited but waitForFunctionEntry set — waiting\n")
 			}
-			// Also treat as all-exited when no debuggers are registered at all
-			if allVMsExited && len(allDbgs) == 0 {
-				allVMsExited = true
+		}
+		if allVMsExited {
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] All VMs exited — returning terminated\n")
 			}
-			// CRITICAL: Do NOT terminate if waitForFunctionEntry is set — a new
-			// lifecycle phase (setup/default/teardown) is about to start. The new
-			// VU hasn't been created yet so all current VMs appear exited, but the
-			// debugger must stay alive to catch the new VU's first breakpoint/step.
-			if allVMsExited && globalDebugCoordinator.HasWaitForFunctionEntry() {
-				allVMsExited = false
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] All VMs exited but waitForFunctionEntry is set — waiting for next lifecycle phase\n")
-				}
-			}
-			if allVMsExited {
-				// Clear stale global step state that no one will consume
-				if hasGlobalStepState {
-					if isMultiVU {
-						globalDebugCoordinator.ClearVUStepState(dbg.vuID)
-					} else {
-						globalDebugCoordinator.ClearGlobalStepState()
-					}
-				}
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] All VMs exited — returning terminated activation (vuID=%d, hadStepState=%v)\n", dbg.vuID, hasGlobalStepState)
-				}
-				return DebuggerActivation{
-					Reason:   TerminatedActivation,
-					Filename: dbg.Filename(),
-					Line:     dbg.Line(),
-					VUID:     dbg.vuID,
-				}
-			}
-
-			// ── FIX: Return pending uncaught exception immediately ─────────
-			// When the VM exited due to an uncaught exception while stepping,
-			// BreakOnException stored the activation info instead of calling
-			// activate() (which races with channel cleanup).  Return it now
-			// so the IDE shows "Paused on exception" instead of looping back
-			// to the same breakpoint in the next iteration.
-			if dbg.pendingUncaughtException != nil {
-				activation := *dbg.pendingUncaughtException
-				dbg.pendingUncaughtException = nil
-
-				// CRITICAL: Mark the debugger as active so that:
-				// 1. getActiveDebugger() returns THIS debugger (not a fallback)
-				// 2. stackTrace/scopes/variables/exceptionInfo requests work correctly
-				// Without this, the IDE receives the stopped event but gets empty
-				// stack traces, causing the stop to appear invisible.
-				dbg.active = true
-				dbg.exceptionBreakActive = true
-				if globalDebugCoordinator.IsInitialized() {
-					globalDebugCoordinator.SetActiveDebugger(dbg)
-				}
-
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] ✅ Returning pending uncaught exception activation: %s:%d (reason=%s, active=true)\n",
-						activation.Filename, activation.Line, activation.Reason)
-				}
-				return activation
-			}
-
-			// ── FIX: cross-VU channel resolution for multi-VU mode ───────────
-			// When the local VM has exited (phase transition), the per-VU channel
-			// that was captured at Continue() entry may belong to a DIFFERENT VU
-			// than the one now in activate(). For example, Continue() was started
-			// on VU 0's debugger during setup, but now VU 1 entered default() and
-			// its debugger is in activate() on VU 1's per-VU channel.
-			//
-			// To break the deadlock, we try THREE targets in order:
-			//   1. The active debugger's local activationCh (direct, fastest)
-			//   2. The active debugger's per-VU channel (coordinator path)
-			//   3. Our own per-VU channel (fallback, original behavior)
-			// This ensures Continue() finds the debugger that is actually waiting,
-			// regardless of which VU it belongs to.
-			sent := false
-			// FIX: Re-attempt cross-VU sends when a NEW active debugger appears.
-			// Previously, crossVUSent=true after the first iteration prevented
-			// re-sending, even if the target debugger didn't exist yet (e.g.,
-			// VU1 hasn't hit its breakpoint when we first try). Now we track
-			// the last targeted debugger and re-send when a different one appears.
+			// Clear stale step state.
 			if isMultiVU {
-				activeDbg := globalDebugCoordinator.GetActiveDebugger()
-				// Re-send if: first time, OR a new active debugger appeared since last attempt
-				needSend := !crossVUSent
-				if !needSend && activeDbg != nil && activeDbg != dbg && activeDbg.IsActive() {
-					// A new debugger became active — re-attempt cross-VU routing
-					needSend = true
-					// Recreate currentCh so the new target gets a fresh channel
-					dbg.currentCh = make(chan DebuggerActivation)
-					if debugContinue {
-						fmt.Printf("[DEBUGGER-CONTINUE] New active debugger detected (vuID=%d), re-attempting cross-VU routing (ch=%p)\n",
-							activeDbg.GetVUID(), dbg.currentCh)
-					}
-				}
-				if needSend {
-				if activeDbg != nil && activeDbg != dbg && activeDbg.IsActive() {
-					targetVUID := activeDbg.GetVUID()
-					targetActivationCh := activeDbg.ActivationCh()
-					targetVUCh := globalDebugCoordinator.GetVUActivationChannel(targetVUID)
-					if debugContinue {
-						fmt.Printf("[DEBUGGER-CONTINUE] Cross-VU resolution: our vuID=%d, active vuID=%d, trying active debugger's channels (localCh=%p, vuCh=%p)\n",
-							dbg.vuID, targetVUID, targetActivationCh, targetVUCh)
-					}
-					// Try 1: send directly to active debugger's local activationCh
-					select {
-					case targetActivationCh <- dbg.currentCh:
-						if debugContinue {
-							fmt.Printf("[DEBUGGER-CONTINUE] ✅ Sent to active debugger's local channel (vuID=%d→%d, ch=%p)\n",
-								dbg.vuID, targetVUID, dbg.currentCh)
-						}
-						sent = true
-					default:
-					}
-					// Try 2: send to active debugger's per-VU coordinator channel
-					if !sent {
-						select {
-						case <-targetVUCh:
-						default:
-						}
-						select {
-						case targetVUCh <- dbg.currentCh:
-							if debugContinue {
-								fmt.Printf("[DEBUGGER-CONTINUE] ✅ Sent to active debugger's per-VU channel (vuID=%d→%d, ch=%p, vuCh=%p)\n",
-									dbg.vuID, targetVUID, dbg.currentCh, targetVUCh)
-							}
-							sent = true
-						default:
-						}
-					}
-				}
-			// Try 3: global activation channel (cross-VU lifecycle fallback)
-			// After a lifecycle transition (init→default), no active debugger
-			// may exist yet (no VU has hit a breakpoint). The global channel
-			// is listened on by ALL VUs' activate(), so the first one to hit
-			// a breakpoint will pick this up.
-			if !sent {
-				globalCh := globalDebugCoordinator.ActivationChannel()
-				// Drain any stale entry first (buffered 1 channel)
-				select {
-				case <-globalCh:
-				default:
-				}
-				select {
-				case globalCh <- dbg.currentCh:
-					if debugContinue {
-						fmt.Printf("[DEBUGGER-CONTINUE] Sent to global activation channel (cross-VU fallback, vuID=%d, ch=%p)\n", dbg.vuID, dbg.currentCh)
-					}
-					sent = true
-				default:
-				}
+				globalDebugCoordinator.ClearVUStepState(dbg.vuID)
+			} else {
+				globalDebugCoordinator.ClearGlobalStepState()
 			}
-			// Try 4: original behavior — send to our own per-VU channel (last resort)
-			if !sent {
-				select {
-				case <-vuActivationCh:
-				default:
-				}
-				select {
-				case vuActivationCh <- dbg.currentCh:
-					if debugContinue {
-						fmt.Printf("[DEBUGGER-CONTINUE] Sent to own coordinator channel (local VM exited, multiVU=%v, vuID=%d, ch=%p, vuCh=%p)\n", isMultiVU, dbg.vuID, dbg.currentCh, vuActivationCh)
-					}
-				default:
-					if debugContinue {
-						fmt.Printf("[DEBUGGER-CONTINUE] Coordinator channel full after drain (multiVU=%v, vuID=%d)\n", isMultiVU, dbg.vuID)
-					}
-				}
+			return DebuggerActivation{
+				Reason:   TerminatedActivation,
+				Filename: dbg.Filename(),
+				Line:     dbg.Line(),
+				VUID:     dbg.vuID,
 			}
+		}
+
+		// Check: pending uncaught exception.
+		if dbg.pendingUncaughtException != nil {
+			activation := *dbg.pendingUncaughtException
+			dbg.pendingUncaughtException = nil
+			dbg.active = true
+			dbg.exceptionBreakActive = true
+			if globalDebugCoordinator.IsInitialized() {
+				globalDebugCoordinator.SetActiveDebugger(dbg)
+			}
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] ✅ Returning pending uncaught exception: %s:%d\n",
+					activation.Filename, activation.Line)
+			}
+			return activation
+		}
+
+		// Send currentCh to all reachable channels (cross-VU routing).
+		if !crossVUSent {
+			dbg.sendToAllActivationChannels(isMultiVU)
 			crossVUSent = true
-				} // end if needSend
-			} // end if isMultiVU
-			if activation, ok, _ := waitForActivation("global", true); ok {
-				return activation
+		} else if activeDbg := globalDebugCoordinator.GetActiveDebugger(); activeDbg != nil && activeDbg != dbg && activeDbg.IsActive() {
+			// A new active debugger appeared — re-route.
+			dbg.currentCh = make(chan DebuggerActivation)
+			dbg.sendToAllActivationChannels(isMultiVU)
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] Re-routed to new active debugger (vuID=%d)\n", activeDbg.GetVUID())
 			}
-			// DON'T create a new currentCh — reuse the same one so activate() can still send on it
-		} else if hasGlobalStepState {
-			stopTimer(outerTimer)
-			outerTimer.Reset(2 * time.Second)
+		}
+
+		// Block: wait for activation on currentCh. Use a poll interval ONLY
+		// to re-check allVMsExited / new active debugger — not for the
+		// activation itself. 500ms is generous; this only matters for
+		// detecting test-end or cross-VU debugger changes.
+		pollTimer := time.NewTimer(500 * time.Millisecond)
+		select {
+		case activation := <-dbg.currentCh:
+			pollTimer.Stop()
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] ✅ Received activation (dead-VM phase): %s:%d (vuID=%d, wait=%dms)\n",
+					activation.Filename, activation.Line, activation.VUID,
+					time.Since(continueStart).Milliseconds())
+			}
+			return activation
+		case <-pollTimer.C:
+			// Re-check allVMsExited, pending exceptions, new active debuggers.
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] Dead-VM poll: re-checking state\n")
+			}
+		}
+	}
+}
+
+// sendToAllActivationChannels attempts to send dbg.currentCh to all reachable
+// activation channels for cross-VU routing when the local VM has exited.
+func (dbg *Debugger) sendToAllActivationChannels(isMultiVU bool) {
+	if debugContinue {
+		fmt.Printf("[DEBUGGER-CONTINUE] sendToAllActivationChannels (vuID=%d, isMultiVU=%v)\n", dbg.vuID, isMultiVU)
+	}
+
+	if isMultiVU {
+		// Try active debugger's local channel first.
+		if activeDbg := globalDebugCoordinator.GetActiveDebugger(); activeDbg != nil && activeDbg != dbg {
+			targetCh := activeDbg.ActivationCh()
 			select {
-			case vuActivationCh <- dbg.currentCh:
+			case targetCh <- dbg.currentCh:
 				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Sent to coordinator (preferred due to step state, multiVU=%v, vuID=%d), waiting for activation\n", isMultiVU, dbg.vuID)
+					fmt.Printf("[DEBUGGER-CONTINUE] ✅ Sent to active debugger's local channel (vuID=%d→%d)\n",
+						dbg.vuID, activeDbg.GetVUID())
 				}
-				if activation, ok, vmExited := waitForActivation("global", false); ok {
-					return activation
-				} else if vmExited {
-					localTimedOut = true
-				}
-				// re-read step state only after a transition
-				if isMultiVU {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
-				} else {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
-				}
-				hasGlobalStepState = globalNext || globalStepIn
-			case dbg.activationCh <- dbg.currentCh:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Sent to local channel (fallback), waiting for activation\n")
-				}
-				if activation, ok, vmExited := waitForActivation("local", false); ok {
-					return activation
-				} else if vmExited {
-					localTimedOut = true
-				}
-				if isMultiVU {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
-				} else {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
-				}
-				hasGlobalStepState = globalNext || globalStepIn
-			case <-dbg.vmDoneCh:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] VM exited (vmDoneCh) while waiting for receiver, switching to global-only\n")
-				}
-				localTimedOut = true
-				if isMultiVU {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
-				} else {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
-				}
-				hasGlobalStepState = globalNext || globalStepIn
-			case <-outerTimer.C:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] ⚠️ Timeout waiting for receiver (hasGlobalStepState=%v), retrying...\n", hasGlobalStepState)
-				}
-				select {
-				case <-dbg.vmDoneCh:
-					localTimedOut = true
-				default:
-				}
-				if isMultiVU {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
-				} else {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
-				}
-				hasGlobalStepState = globalNext || globalStepIn
+				return
+			default:
 			}
-		} else {
-			stopTimer(outerTimer)
-			outerTimer.Reset(2 * time.Second)
+			// Try active debugger's per-VU coordinator channel.
+			targetVUCh := globalDebugCoordinator.GetVUActivationChannel(activeDbg.GetVUID())
 			select {
-			case dbg.activationCh <- dbg.currentCh:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Sent to local channel, waiting for activation\n")
-				}
-				if activation, ok, vmExited := waitForActivation("local", false); ok {
-					return activation
-				} else if vmExited {
-					localTimedOut = true
-					if debugContinue {
-						fmt.Printf("[DEBUGGER-CONTINUE] Local VM exited, switching to global-only mode (hasGlobalStepState=%v, uncaughtException=%v)\n",
-							hasGlobalStepState, dbg.uncaughtExceptionExit)
-					}
-				}
-				if isMultiVU {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
-				} else {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
-				}
-				hasGlobalStepState = globalNext || globalStepIn
-			case vuActivationCh <- dbg.currentCh:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Sent to coordinator (multiVU=%v, vuID=%d), waiting for activation\n", isMultiVU, dbg.vuID)
-				}
-				if activation, ok, vmExited := waitForActivation("global", false); ok {
-					return activation
-				} else if vmExited {
-					localTimedOut = true
-					if debugContinue {
-						fmt.Printf("[DEBUGGER-CONTINUE] VM exited after coordinator send, switching to global-only mode (hasGlobalStepState=%v, uncaughtException=%v)\n",
-							hasGlobalStepState, dbg.uncaughtExceptionExit)
-					}
-				}
-				if isMultiVU {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
-				} else {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
-				}
-				hasGlobalStepState = globalNext || globalStepIn
-			case globalDebugCoordinator.ActivationChannel() <- dbg.currentCh:
-				// LIFECYCLE FIX: When the local VM exited (init ended) and
-				// waitForFunctionEntry is set, VU 0's activate() listens on
-				// the global activation channel. Send currentCh there so it
-				// can respond with the activation from the new lifecycle phase.
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Sent to global activation channel (lifecycle transition, vuID=%d)\n", dbg.vuID)
-				}
-				if activation, ok, _ := waitForActivation("global-lifecycle", true); ok {
-					return activation
-				}
-			case <-dbg.vmDoneCh:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] VM exited (vmDoneCh) while waiting for receiver, switching to global-only\n")
-				}
-				localTimedOut = true
-				if isMultiVU {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
-				} else {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
-				}
-				hasGlobalStepState = globalNext || globalStepIn
-			case <-outerTimer.C:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] ⚠️ Timeout waiting for receiver (hasGlobalStepState=%v), checking state...\n", hasGlobalStepState)
-				}
-				select {
-				case <-dbg.vmDoneCh:
-					localTimedOut = true
-				default:
-				}
-				if isMultiVU {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetVUStepState(dbg.vuID)
-				} else {
-					globalNext, globalStepIn, _, _ = globalDebugCoordinator.GetGlobalStepState()
-				}
-				hasGlobalStepState = globalNext || globalStepIn
+			case <-targetVUCh:
+			default:
 			}
+			select {
+			case targetVUCh <- dbg.currentCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] ✅ Sent to active debugger's per-VU channel (vuID=%d→%d)\n",
+						dbg.vuID, activeDbg.GetVUID())
+				}
+				return
+			default:
+			}
+		}
+	}
+
+	// Global activation channel — any VU's activate() can pick this up.
+	globalCh := globalDebugCoordinator.ActivationChannel()
+	select {
+	case <-globalCh:
+	default:
+	}
+	select {
+	case globalCh <- dbg.currentCh:
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-CONTINUE] Sent to global activation channel (vuID=%d)\n", dbg.vuID)
+		}
+		return
+	default:
+	}
+
+	// Own per-VU channel as last resort.
+	vuActivationCh := globalDebugCoordinator.GetVUActivationChannel(dbg.vuID)
+	select {
+	case <-vuActivationCh:
+	default:
+	}
+	select {
+	case vuActivationCh <- dbg.currentCh:
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-CONTINUE] Sent to own per-VU channel (vuID=%d)\n", dbg.vuID)
+		}
+	default:
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-CONTINUE] All channels full (vuID=%d)\n", dbg.vuID)
 		}
 	}
 }
@@ -3499,6 +3256,18 @@ func (dbg *Debugger) ClearStepFlags() {
 	globalDebugCoordinator.ClearGlobalStepState()
 }
 
+// ClearLastBreakpoint resets the lastBreakpoint position tracking so that
+// same-line-skip logic doesn't prevent breakpoints from firing after a phase
+// transition. This is needed when the init phase stopped at a line that also
+// has a breakpoint in setup/default/teardown — without clearing, the debugger
+// thinks it's still on the same line and skips the breakpoint.
+func (dbg *Debugger) ClearLastBreakpoint() {
+	dbg.lastBreakpoint.filename = ""
+	dbg.lastBreakpoint.line = 0
+	dbg.lastBreakpoint.pc = -1
+	dbg.lastBreakpoint.stackDepth = 0
+}
+
 // ResetForPhaseTransition clears stale step/pause state from a cached Debugger
 // when reusing it for a new lifecycle phase (setup → default → teardown →
 // handleSummary) within the SAME k6 run.  Unlike ResetForNewRun it preserves
@@ -3896,6 +3665,16 @@ func (dbg *Debugger) breakpoint() bool {
 	// PERF: skip all debugger work during getter evaluation (resolveIndirectValue/safeCallGetter).
 	// Without this, variable inspection can trigger breakpoints and corrupt step state.
 	if dbg.suppressDebugger {
+		return false
+	}
+
+	// PERF: Never break inside external jslib bundles loaded from https://
+	// These are instrumentation libraries (tempo, httpx, etc.) that must
+	// execute transparently, exactly as Node.js skips node_modules.
+	// This eliminates ALL breakpoint overhead for tempo code — no line lookup,
+	// no breakpoint map scan, no source-map resolution.
+	if strings.HasPrefix(dbg.cachedNormFile, "https://") ||
+		strings.HasPrefix(dbg.cachedNormFile, "http://") {
 		return false
 	}
 
@@ -5570,7 +5349,7 @@ func (dbg *Debugger) buildPausedVarSnapshot() map[string]Value {
 					val := s.values[actualIdx]
 					if val != nil && !isNullValue(val) {
 						if isIndirect && !lifecycleFunctionKeys[nameStr] {
-							val = dbg.resolveIndirectValue(val)
+							val = dbg.safeResolveIndirectValue(nameStr, val)
 						}
 						if isSimpleIdentifier(nameStr) {
 							snap[nameStr] = val
@@ -6465,8 +6244,18 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 		// and an exception consumed them, or if extra frames were left behind,
 		// truncate back to the saved length. This prevents the outer
 		// runWrapped.try.popTryFrame from operating on a corrupted stack.
-		if len(dbg.vm.tryStack) > savedTryStackLen {
-			dbg.vm.tryStack = dbg.vm.tryStack[:savedTryStackLen]
+		//
+		// IMPORTANT: Clamp to the SHORTER of saved vs current length.
+		// When an external wrapper's handleThrow unwinds tryStack BEFORE
+		// the recover fires, len(vm.tryStack) may already be less than
+		// savedTryStackLen. Truncating to savedLen would panic with
+		// "slice bounds out of range" (seen with tempo instrumentation).
+		restoreTryLen := savedTryStackLen
+		if restoreTryLen > len(dbg.vm.tryStack) {
+			restoreTryLen = len(dbg.vm.tryStack)
+		}
+		if len(dbg.vm.tryStack) > restoreTryLen {
+			dbg.vm.tryStack = dbg.vm.tryStack[:restoreTryLen]
 		}
 		if len(dbg.vm.stack) > savedStackLen {
 			dbg.vm.stack = dbg.vm.stack[:savedStackLen]
@@ -6497,6 +6286,36 @@ func (dbg *Debugger) withSuppressedDebugger(fn func() Value) (result Value) {
 
 	result = fn()
 	return result
+}
+
+// safeResolveIndirectValue resolves an indirect stash binding only when it is
+// safe to do so. Go-backed functions (e.g. monkey-patched HTTP wrappers from
+// tempo/tracing libraries) must NOT be called during variable snapshot because:
+//   1. They may make real HTTP calls or access k6 internals invalid outside a
+//      real VU iteration context → panic.
+//   2. They push extra call frames / try frames that corrupt the saved VM state
+//      in withSuppressedDebugger, causing slice-bounds panics on restore.
+//   3. Their source position falls inside the jslib bundle, breaking line mapping.
+//
+// The heuristic: if the raw indirect value IS already a callable Go function
+// (nativeFuncObject, boundFuncObject, Go reflect wrappers), skip resolution
+// and return the raw value so the IDE shows "ƒ name()" rather than crashing.
+// JS functions (arrow, regular, async) are safe — they are sobek-internal.
+func (dbg *Debugger) safeResolveIndirectValue(name string, rawVal Value) Value {
+	if rawVal == nil || dbg.vm == nil {
+		return rawVal
+	}
+
+	// Fast path: check if the raw value wraps a Go-backed callable.
+	if obj, ok := rawVal.(*Object); ok && obj.self != nil {
+		switch obj.self.(type) {
+		case *nativeFuncObject, *boundFuncObject:
+			// Go-backed callable — do NOT invoke it.
+			return rawVal
+		}
+	}
+
+	return dbg.resolveIndirectValue(rawVal)
 }
 
 func (dbg *Debugger) resolveIndirectValue(rawVal Value) Value {
@@ -7205,6 +7024,21 @@ func (dbg *Debugger) GetAllStashVariablesQuiet() map[string]Value {
 }
 
 func (dbg *Debugger) GetAllStashVariables() map[string]Value {
+	// PERF: Return cached result if VM state hasn't changed (same PC + program = same pause point).
+	// During a single debugger pause, the IDE's MultiScopeEval calls this 20+ times
+	// (once per variable hover/expansion). Each uncached call scans 25 module instances
+	// and iterates 400+ variables — caching reduces this to a single scan per pause.
+	//
+	// CRITICAL: The cache is naturally invalidated when the VM resumes because vm.pc
+	// changes on the next instruction. No explicit invalidation needed.
+	//
+	// NOTE: This was a major source of IDE slowness — "loading variables" would take
+	// 5-10 seconds because GetAllStashVariables was called 20+ times × 400 vars each.
+	if dbg.vm != nil && dbg.allStashVarsCache != nil &&
+		dbg.allStashVarsCachePC == dbg.vm.pc && dbg.allStashVarsCachePrg == dbg.vm.prg {
+		return dbg.allStashVarsCache
+	}
+
 	vars := make(map[string]Value)
 	if dbg.vm == nil {
 		if dbg.enableDebugLogging {
@@ -7285,6 +7119,14 @@ func (dbg *Debugger) GetAllStashVariables() map[string]Value {
 		fmt.Printf("[DEBUGGER] GetAllStashVariables: found %d variables across %d stash sources\n",
 			len(vars), stashLevel)
 	}
+
+	// Cache the result for subsequent calls at the same pause point
+	if dbg.vm != nil {
+		dbg.allStashVarsCache = vars
+		dbg.allStashVarsCachePC = dbg.vm.pc
+		dbg.allStashVarsCachePrg = dbg.vm.prg
+	}
+
 	return vars
 }
 

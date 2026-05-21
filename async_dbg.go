@@ -45,7 +45,6 @@ type asyncDebugState struct {
 	stepIn           bool
 	next             bool
 	steppingFilename string
-	targetDepth      int
 	startLine        int
 	vuID             uint64
 }
@@ -70,7 +69,6 @@ func onAsyncYield(v *vm) {
 		stepIn:           dbg.stepIn,
 		next:             dbg.next,
 		steppingFilename: dbg.steppingFilename,
-		targetDepth:      dbg.stepOverTargetDepth,
 		startLine:        dbg.stepOverStartLine,
 		vuID:             dbg.vuID,
 	}
@@ -79,9 +77,9 @@ func onAsyncYield(v *vm) {
 	dbg.stepIn = false
 	dbg.next = false
 	if debugVM || dbg.enableDebugLogging {
-		fmt.Printf("[ASYNC-DBG] onAsyncYield: saved step state on asyncRunner — stepIn=%v, next=%v, file=%s, depth=%d, line=%d, vuID=%d\n",
+		fmt.Printf("[ASYNC-DBG] onAsyncYield: saved step state on asyncRunner — stepIn=%v, next=%v, file=%s, line=%d, vuID=%d\n",
 			ar.savedDebugState.stepIn, ar.savedDebugState.next,
-			ar.savedDebugState.steppingFilename, ar.savedDebugState.targetDepth,
+			ar.savedDebugState.steppingFilename,
 			ar.savedDebugState.startLine, ar.savedDebugState.vuID)
 	}
 }
@@ -145,7 +143,7 @@ func onAsyncResume(ar *asyncRunner) {
 	dbg.asyncResumeActive = true
 	if debugVM || dbg.enableDebugLogging {
 		fmt.Printf("[ASYNC-DBG] onAsyncResume: restored step state — stepIn=%v, next=%v, file=%s, depth=%d, line=%d\n",
-			saved.stepIn, saved.next, saved.steppingFilename, saved.targetDepth, saved.startLine)
+				saved.stepIn, saved.next, saved.steppingFilename, dbg.stepOverTargetDepth, saved.startLine)
 	}
 }
 

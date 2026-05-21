@@ -125,6 +125,11 @@ type binding struct {
 	isArg        bool
 	isVar        bool
 	inStash      bool
+	// inStashBeforeDebug is true if this binding was already stash-allocated
+	// before debug mode's allInStash forced it. Used to distinguish genuine
+	// TDZ-requiring closures from variables forced to stash only for debugger
+	// visibility. When false in debug mode, loadStackLex → loadStash (no TDZ).
+	inStashBeforeDebug bool
 }
 
 func (b *binding) getAccessPointsForScope(s *scope) *[]int {
@@ -692,6 +697,11 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 		}
 		if allInStash || b.inStash {
 			if s.c.debug {
+				// Track whether this binding was naturally stash-allocated (closure
+				// capture, dynamic scope) vs forced by debug mode's allInStash.
+				// Variables forced to stash only for debugger visibility don't have
+				// genuine TDZ at runtime — their initializer always runs before read.
+				b.inStashBeforeDebug = b.inStash
 				b.inStash = true
 				s.needStash = true
 			}
@@ -768,7 +778,18 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 						case storeStackP:
 							*ap = storeStashP(idx)
 						case loadStackLex:
-							*ap = loadStashLex(idx)
+							// DEBUG FIX: In debug mode (allInStash due to s.c.debug), variables
+							// that were originally on the stack don't have genuine TDZ issues —
+							// their initializer always runs before any read in normal control flow.
+							// Using loadStashLex would introduce false TDZ errors (stash slots
+							// start as nil) for variables that work fine on stack (where nil is
+							// never observed because loadStackLex is only reached after initStack).
+							// Use loadStash (no TDZ check) to match non-debug stack behavior.
+							if s.c.debug && !b.inStashBeforeDebug {
+								*ap = loadStash(idx)
+							} else {
+								*ap = loadStashLex(idx)
+							}
 						case storeStackLex:
 							*ap = storeStashLex(idx)
 						case storeStackLexP:

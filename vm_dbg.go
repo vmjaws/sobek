@@ -9,6 +9,121 @@ package sobek
 //   - The `debugger *Debugger` and `debugMode bool` fields on the `vm` struct
 //   - The dispatch in runTryInner(): `if vm.debugMode { vm.debug() } else { vm.run() }`
 //   - Minor safety checks (nil prg, stash bounds) guarded by `vm.debugMode`
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+// CRITICAL DEBUGGING NOTES (for future reference):
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// 1. TEMPO JSLIB SLOWNESS (https://jslib.k6.io/http-instrumentation-tempo/...)
+//    ─────────────────────────────────────────────────────────────────────────
+//    Problem: When tempo is imported, EVERY HTTP call goes through tempo's
+//    instrumentation code. In debug mode, every instruction in the tempo jslib
+//    was being checked for breakpoints (breakpoint() call), adding ~18s overhead
+//    per HTTP request (11 requests = 3+ minutes).
+//
+//    Root cause: The debug loop ran full breakpoint checks on EVERY instruction
+//    even for library files that have NO breakpoints set.
+//
+//    Fix: Fast-path at lines ~324-333 — when not stepping (next/stepIn both false)
+//    AND the file has no breakpoints (local or global), skip directly to
+//    executeInstruction. The method fileHasBreakpoints() checks both local and
+//    global registries with a single RLock each.
+//
+//    Key indicator in logs: Many [BP-TRACE] entries for normFile="https://jslib.k6.io/..."
+//    with hasLocal=true, hasGlobal=true but NO actual breakpoints on that file.
+//    The "hasLocal=true" means the debugger struct has breakpoints, not that the
+//    specific file has them — fileHasBreakpoints() does the per-file check.
+//
+// 2. GETTER CONSUMING STEP FLAGS (setup→default transition death)
+//    ─────────────────────────────────────────────────────────────────────────
+//    Problem: StepOver at last line of setup() → VM exits → lifecycle transition
+//    sets stepIn=true for default() entry → BUT before default() runs, a module
+//    namespace getter (func="get", prg=nil, src=nil) is called to resolve the
+//    "default" export. This getter entered debug(), the exit handler saw
+//    callStackDepth≤1 + stepIn=true → treated it as a lifecycle transition →
+//    cleared step flags + set vmExited=true. The actual default() then runs
+//    with NO step flags → debugger never pauses.
+//
+//    Key indicator in logs:
+//      [ARROW-DEBUG] __call entering JS func from Go: func="get", file=, stepIn=true
+//      [VM-EXIT] 🔄 Step active at outermost exit → lifecycle transition
+//      (then default() runs without any PAUSING events)
+//
+//    Fix: Early return at top of debug() — when prg==nil || prg.src==nil, fall
+//    back to vm.run() which doesn't touch step flags at all.
+//
+// 3. GetAllStashVariables PERFORMANCE (IDE slow loading vars)
+//    ─────────────────────────────────────────────────────────────────────────
+//    Problem: During a pause, the IDE requests variables which triggers
+//    GetAllStashVariables() 20+ times (MultiScopeEval for each var). Each call
+//    scans 25 module instances and finds 400+ variables, taking significant time.
+//
+//    Fix: Added epoch-based cache (keyed by vm.pc + vm.prg). During a pause the
+//    PC doesn't change, so subsequent calls return cached results instantly.
+//    Cache is naturally invalidated when VM resumes (PC changes).
+//
+// 4. IMPORTANT: The "phase=default" in log messages during setup() is MISLEADING.
+//    ─────────────────────────────────────────────────────────────────────────
+//    The debugger's initPhase flag is set by k6's bundle.go, but the "phase"
+//    shown in [VM-WILL-BREAK] comes from whether initPhase is true/false.
+//    Once init completes, ALL subsequent pauses show "phase=default" even during
+//    setup(). This is NOT a bug — it just means "not init phase".
+//
+// 5. VU MISMATCH: setup runs on VU0, default runs on VU1
+//    ─────────────────────────────────────────────────────────────────────────
+//    k6 creates VU0 for init, then VU1 for setup (reusing VU0's debugger), then
+//    VU1 for default. The global step state coordinator handles cross-VU step
+//    propagation. The log shows vuID=0 for setup and vuID=1 for default.
+//    Continue() routes via global channel when step state exists.
+//
+// 6. ACTIVATE TIMEOUT: "⚠️ Timeout waiting for fresh channel"
+//    ─────────────────────────────────────────────────────────────────────────
+//    This happens when activate() blocks waiting for Continue() but the DAP
+//    server hasn't sent the continue signal yet (user is still looking at vars
+//    in the IDE). It's a 200ms timeout with retries. Usually harmless — the VM
+//    resumes after the timeout. But if it happens unexpectedly during stepping,
+//    it means the channel handshake failed (stale epoch, closed channel, etc.)
+//
+// 7. CONTINUE() TIMEOUT → FALSE PAUSE IN TEMPO (the CRITICAL tempo debug death)
+//    ─────────────────────────────────────────────────────────────────────────
+//    Problem: User does step-over on a line that makes an HTTP call (through
+//    tempo instrumentation). The VM enters tempo's `post` function at depth 7.
+//    The DAP Continue() is waiting for the next activation (200ms timeout).
+//    Continue() sends currentCh to dbg.activationCh (buffered size=1, succeeds
+//    immediately into the buffer). Then waits 200ms on currentCh for a response.
+//    Nobody responds (VM is running tempo code via fileChanged→goto executeInstr).
+//    On the NEXT iteration, activationCh buffer is FULL (stale entry). The select
+//    tries activationCh (blocks, full), so ActivationChannel() case WINS instead
+//    → goes down "lifecycle transition" path → sends to global channel → blocks
+//    on currentCh → IDE shows tempo stack trace as if paused.
+//
+//    Key indicator in logs:
+//      [DEBUGGER-CONTINUE] Retry timeout waiting for activation from local (200ms)
+//      [DEBUGGER-CONTINUE] Sent to global activation channel (lifecycle transition)
+//      [DAP-STACKTRACE] top: https://jslib.k6.io/.../index.js:97
+//
+//    Fix: In Continue() (debugger.go), after a local timeout, DRAIN the stale
+//    activationCh entry. This prevents the buffer-full condition that causes the
+//    select to fall through to the lifecycle path. See the "Drained stale local
+//    activationCh entry" log message.
+//
+//    IMPORTANT: Do NOT use vm.run() as a fallback for non-user files! Async
+//    functions (default() is async) use promises internally. The promise
+//    resolution code expects debug-mode VM state. Switching to vm.run() causes
+//    nil pointer panics in builtin_promise.go:94 (createResolvingFunctions).
+//    The crash stack: asyncRunner.start → asyncRunner.step → promiseCapability.resolve
+//
+// 8. FAST-PATH FOR NON-USER FILES (tempo performance)
+//    ─────────────────────────────────────────────────────────────────────────
+//    The fast-path at the top of the debug loop (fileHasBreakpoints check)
+//    skips the expensive breakpoint() call for files with no breakpoints.
+//    Combined with the fileChanged→goto executeInstruction check, this means
+//    tempo instructions only pay the cost of: refreshFilenameCache() +
+//    fileHasBreakpoints() (2 RLock acquisitions) per instruction, instead of
+//    the full breakpoint scan. This is still non-zero overhead but much less
+//    than before (~50x reduction).
+//
+// ═══════════════════════════════════════════════════════════════════════════════
 
 import (
 	"fmt"
@@ -22,6 +137,14 @@ var vmDebugEnabled = os.Getenv("SOBEK_DEBUG_VM") == "1" || os.Getenv("SOBEK_DEBU
 
 
 func (vm *vm) debug() {
+
+	// Track nested vm.debug() depth so the exit handler knows whether this
+	// is the outermost invocation (debugLoopDepth==1 → will become 0 on exit).
+	if vm.debugger != nil {
+		vm.debugger.debugLoopDepth++
+		defer func() { vm.debugger.debugLoopDepth-- }()
+	}
+
 	// Log every debug() entry when step flags are active — unconditionally
 	if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
 		funcName := ""
@@ -90,6 +213,15 @@ func (vm *vm) debug() {
 				goto executeInstruction
 			}
 
+			// PERF/FIX: Skip all debugger processing for functions without a program
+			// or source (e.g., module namespace getters like "get default").
+			// These are internal VM operations that should never consume step flags.
+			// Without this guard, a getter called between lifecycle phases consumes
+			// stepIn=true meant for the next user function, causing the debugger to
+			// never break at the first line of default().
+			if vm.prg == nil || vm.prg.src == nil {
+				goto executeInstruction
+			}
 
 			// CHANGED: Allow breakpoints during init phase for user scripts
 			// Only skip breakpoints during init if the current file is NOT a user file
@@ -100,6 +232,26 @@ func (vm *vm) debug() {
 			// All code below uses cachedFilename / cachedNormFile instead of
 			// calling Filename() + strings.HasPrefix/TrimPrefix repeatedly.
 			vm.debugger.refreshFilenameCache()
+
+			// ── PERF: Fast-path skip for external jslib URLs ──────────────
+			// Files loaded from https:// (tempo, httpx, etc.) are NEVER user
+			// files. Skip ALL debug processing for them — even when step flags
+			// are active (next/stepIn). The step-over will correctly resume
+			// when execution returns to a user file via the fileChanged check
+			// in the outer debug loop (the caller's vm.debug()).
+			// Without this, every instruction inside the tempo wrapper goes
+			// through init-BP dedup, step inheritance, breakpoint checks, etc.
+			// adding ~18s overhead per HTTP call.
+			{
+				normFile := vm.debugger.cachedNormFile
+				if strings.HasPrefix(normFile, "https://") || strings.HasPrefix(normFile, "http://") {
+					if debugVM && vm.pc == 0 && (vm.debugger.next || vm.debugger.stepIn) {
+						fmt.Printf("[HTTPS-SKIP] ⚡ Skipping ALL debug processing for external URL: %s (next=%v, stepIn=%v, depth=%d)\n",
+							normFile, vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth())
+					}
+					goto executeInstruction
+				}
+			}
 
 			// CRITICAL: First check if init was already completed for ANY user file
 			// This check happens REGARDLESS of whether initPhase is set
@@ -307,6 +459,25 @@ func (vm *vm) debug() {
 				}
 			}
 
+
+				// ── PERF: Fast-path skip for non-user library files ──────────────
+				// When NOT stepping (next/stepIn both false) and the current file has
+				// NO breakpoints, skip the expensive breakpoint() call entirely.
+				// This eliminates the debug loop overhead for library code (e.g., tempo
+				// jslib at https://jslib.k6.io/...) which adds ~18s per HTTP call when
+				// every instruction is checked. Without this, the CIAS token fetch
+				// (11 HTTP requests through tempo) takes 3+ minutes instead of seconds.
+				if !skipBreakpoints && !vm.debugger.next && !vm.debugger.stepIn {
+					normFile := vm.debugger.cachedNormFile
+					if normFile != "" && !vm.debugger.fileHasBreakpoints(normFile) {
+						// Also check source-mapped file (for bundled code)
+						srcMap := vm.debugger.cachedSrcMapFile
+						if srcMap == "" || !vm.debugger.fileHasBreakpoints(srcMap) {
+							goto executeInstruction
+						}
+					}
+				}
+
 				// Check breakpoint FIRST before logging
 				// When skipBreakpoints is true, we treat hasBreakpoint as false to skip breakpoint activation
 				// but we STILL process step-over and step-in
@@ -466,6 +637,10 @@ func (vm *vm) debug() {
 							// - For stepIn: clear the flag (we don't want to step through internal code)
 							// - For next (step-over): preserve the flag so stepping continues when we return to user code
 							//   This is the key fix: step-over should step OVER function calls into non-user code
+							if debugVM {
+								fmt.Printf("[FILE-CHANGE] Entering NON-USER file: %s (next=%v, stepIn=%v, depth=%d, targetDepth=%d) → skipping\n",
+									normalizedCurrentFilename, vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth(), vm.debugger.stepOverTargetDepth)
+							}
 							vm.debugger.stepIn = false
 							// DON'T clear next here - let step-over continue when we return
 							// Skip further breakpoint processing for this instruction
@@ -473,7 +648,14 @@ func (vm *vm) debug() {
 						} else if vm.debugger.stepIn {
 							// Entering a user source file during step-in: update the stepping filename
 							// This allows stepping to continue in the new file
-							vm.debugger.steppingFilename = currentFilename
+							// GUARD: never update steppingFilename to an external URL.
+							// Without this, step-over through tempo.instrumentHTTP() could
+							// set steppingFilename = "https://jslib.k6.io/..." causing all
+							// subsequent file-change checks to compare against that URL.
+							if !strings.HasPrefix(normalizedCurrentFilename, "https://") &&
+								!strings.HasPrefix(normalizedCurrentFilename, "http://") {
+								vm.debugger.steppingFilename = currentFilename
+							}
 						}
 					}
 
@@ -1045,6 +1227,12 @@ func (vm *vm) debug() {
 						shouldBreak = pcAdvanced && lineChanged && atValidDepth && vmInValidState && isUserFile && !isControlFlowOnly && !suppressedByInheritedLine
 						breakReason = "next"
 
+						// DIAGNOSTIC: Log step-over state when in user file to trace why break doesn't fire
+						if debugVM && isUserFile && !shouldBreak {
+							fmt.Printf("[STEPOVER-MISS] line=%d, file=%s, depth=%d, targetDepth=%d, startLine=%d, pcAdv=%v, lineChg=%v, atDepth=%v, vmValid=%v, cfOnly=%v, suppressed=%v\n",
+								currentLine, normalizedCurrentFilename, currentStackDepth, vm.debugger.stepOverTargetDepth, startLine, pcAdvanced, lineChanged, atValidDepth, vmInValidState, isControlFlowOnly, suppressedByInheritedLine)
+						}
+
 						// FIX: Also check inherited position for step-over.
 						// The isControlFlowOnly scan above catches the FIRST instruction
 						// after a conditional jump, but subsequent instructions at the
@@ -1470,53 +1658,58 @@ func (vm *vm) debug() {
 	// and only enables stepping when the call depth increases (entering the function body).
 	//
 	// SAFETY: Check vm.debugger != nil first — Detach() could have been called during execution.
+	// ── VM EXIT: Lifecycle transition handling ──────────────────────────
+	//
+	// When vm.debug() exits, we check whether the user was mid-step (next/stepIn).
+	// If so, we propagate the step intent to the next lifecycle phase via
+	// waitForFunctionEntry, and mark vmExited so Continue() can detect the
+	// transition and route to the new VM.
+	//
+	// When NO step flags are active (user pressed Continue, or code ran to
+	// completion), we do NOT set vmExited. The working branch proved this is
+	// correct: setting vmExited prematurely (e.g., during setup/handleSummary
+	// RunProgram calls that happen after init) causes Continue() to see
+	// "All VMs exited" and terminate the debug session before breakpoints fire.
+	//
+	// Continue() handles the "VM doing a long operation" case via its retry
+	// loop with adaptive backoff — it polls vmDoneCh and retries until the
+	// VM either hits a breakpoint (activate() fires) or truly finishes
+	// (lifecycle transition sets vmExited via the step-active path).
+	//
 	if vm.debugger != nil && (vm.debugger.next || vm.debugger.stepIn) {
-		// Only handle this at top-level (callStackDepth <= 1 means we're exiting the main function)
+		// Step operation active at exit. Use callStackDepth to distinguish:
+		//   depth <= 1: outermost function exited → lifecycle transition
+		//   depth > 1:  nested runTry (class init, try/catch) → preserve flags
 		if vm.debugger.callStackDepth() <= 1 {
 			if debugVM {
-				fmt.Printf("[VM-EXIT] 🔄 Step operation active when VM exited (next=%v, stepIn=%v, depth=%d, lastLine=%d), setting waitForFunctionEntry for next lifecycle phase\n",
-					vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth(), vm.debugger.Line())
+				fmt.Printf("[VM-EXIT] 🔄 Step active at outermost exit (next=%v, stepIn=%v, callDepth=%d, loopDepth=%d, lastLine=%d) → lifecycle transition\n",
+					vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth(), vm.debugger.debugLoopDepth, vm.debugger.Line())
 			}
-			// Mark this debugger's VM as exited so Continue() won't send to its dead local channel
 			vm.debugger.vmExited = true
-			// Close vmDoneCh to instantly notify any waiting Continue() that this VM is done
 			if vm.debugger.vmDoneCh != nil {
 				select {
 				case <-vm.debugger.vmDoneCh:
-					// Already closed
 				default:
 					close(vm.debugger.vmDoneCh)
 				}
 			}
-			// Clear the local step flags since this VM is done
 			vm.debugger.next = false
 			vm.debugger.stepIn = false
-			// Clear any stale global step state
 			GetGlobalCoordinator().ClearGlobalStepState()
-			// Set waitForFunctionEntry so the next lifecycle phase (setup/default/teardown)
-			// breaks at its first line, but does NOT re-step through module init code
 			GetGlobalCoordinator().SetWaitForFunctionEntry(true)
 		} else {
-			// VM exited at depth > 1 with step flags still active. This is a
-			// nested vm.runTry() (e.g., class field initializer). Do NOT clear
-			// the step flags — they were set by the user (step-over at a
-			// breakpoint inside the nested program) and must survive to the
-			// outer vm.debug() loop. The caller (_initFields) only resets
-			// vmExited/vmDoneCh.
+			// Nested runTry exit (class field init, try/catch, module eval).
+			// Preserve step flags for the outer vm.debug() loop.
 			if debugVM {
-				fmt.Printf("[VM-EXIT] 🔄 Step operation active at nested exit (next=%v, stepIn=%v, depth=%d) — preserving step flags for outer loop\n",
-					vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth())
+				fmt.Printf("[VM-EXIT] 🔄 Step active at nested exit (next=%v, stepIn=%v, callDepth=%d, loopDepth=%d) → preserving flags\n",
+					vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth(), vm.debugger.debugLoopDepth)
 			}
 		}
 	} else if vm.debugger != nil && debugVM {
-		// Only log normal VM exits at shallow depths to avoid massive spam
-		// during handleSummary text rendering (hundreds of function calls at depth 5-16)
-		depth := vm.debugger.callStackDepth()
-		if depth <= 2 {
-			if debugVM {
-				fmt.Printf("[VM-EXIT] VM exited normally (no step active, next=%v, stepIn=%v, depth=%d)\n",
-				vm.debugger.next, vm.debugger.stepIn, depth)
-			}
+		// No step flags active — do NOT set vmExited. See comment block above.
+		if vm.debugger.callStackDepth() <= 2 {
+			fmt.Printf("[VM-EXIT] Normal exit (next=%v, stepIn=%v, callDepth=%d, loopDepth=%d)\n",
+				vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth(), vm.debugger.debugLoopDepth)
 		}
 	}
 
@@ -1563,3 +1756,28 @@ func execDebugSafe(vm *vm, instr instruction) {
 	}()
 	instr.exec(vm)
 }
+
+// fileHasBreakpoints returns true if the given normalized filename has any
+// breakpoints registered either locally (on this debugger) or globally.
+//
+// CRITICAL for TEMPO/JSLIB performance: This is the gate that allows the
+// fast-path (goto executeInstruction) to skip the expensive breakpoint() call.
+// Without this, every instruction in https://jslib.k6.io/http-instrumentation-tempo/...
+// triggers a full breakpoint scan (RLock + sorted search + source map lookup),
+// adding ~1.5s per 1000 instructions. The tempo lib has ~12000 instructions per
+// HTTP call → 18s overhead per request in debug mode.
+//
+// NOTE: dbg.breakpoints map is keyed by NORMALIZED filename. The caller must
+// pass a normalized filename (from cachedNormFile or cachedSrcMapFile).
+func (dbg *Debugger) fileHasBreakpoints(normalizedFile string) bool {
+	// Check local breakpoints
+	dbg.breakpointMutex.RLock()
+	_, hasLocal := dbg.breakpoints[normalizedFile]
+	dbg.breakpointMutex.RUnlock()
+	if hasLocal {
+		return true
+	}
+	// Check global registry
+	return globalBreakpoints.FileHasBreakpoints(normalizedFile)
+}
+

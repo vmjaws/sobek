@@ -50,6 +50,10 @@ func (h *vmDebugHooksImpl) stashRefLexRelaxed() Value {
 	return _undefined
 }
 
+func (h *vmDebugHooksImpl) loadStashLexRelaxed() Value {
+	return _undefined
+}
+
 // --- Names map copy ---
 
 func (h *vmDebugHooksImpl) copyNamesMap(names map[unistring.String]uint32) map[unistring.String]uint32 {

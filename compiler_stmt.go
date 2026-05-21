@@ -446,10 +446,21 @@ func (c *compiler) compileLabeledForInOfStatement(into ast.ForInto, source ast.E
 		s := c.scope
 		used := len(c.block.breaks) > 0 || s.isDynamic()
 		if !used {
-			for _, b := range s.bindings {
-				if b.useCount() > 0 {
-					used = true
-					break
+			if c.debug {
+				// In debug mode, all bindings go to stash and finaliseVarAlloc
+				// counts every scope with bindings as a stash level. If we
+				// discard this scope (the !used path) without pushing a stash
+				// at runtime, the stash level is off by one and variable
+				// lookups that traverse through this scope access the wrong
+				// stash slot. Force used=true so the enterBlock is always
+				// emitted to keep the stash chain consistent.
+				used = true
+			} else {
+				for _, b := range s.bindings {
+					if b.useCount() > 0 {
+						used = true
+						break
+					}
 				}
 			}
 		}

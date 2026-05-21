@@ -41,6 +41,16 @@ type debugHooks interface {
 	// uninitialized lexical bindings accessed via ref.
 	stashRefLexRelaxed() Value
 
+	// loadStashLexRelaxed returns _undefined instead of throwing TDZ error
+	// for uninitialized stash bindings in debug mode. In debug mode,
+	// allInStash=true forces all variables to stash. Their slots start as nil,
+	// which loadStashLex/loadMixedLex interprets as TDZ. But these variables
+	// work fine in non-debug mode (stack slots are always initialized).
+	// The compiler fix (loadStackLex → loadStash) handles most cases, but
+	// class field initializers (#privateFields) and module-level bindings
+	// are compiled in separate programs where the compiler fix doesn't apply.
+	loadStashLexRelaxed() Value
+
 	// --- Names map copy (prevents shared mutation) ---
 
 	// copyNamesMap returns a copy of the names map instead of sharing it.

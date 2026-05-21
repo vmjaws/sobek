@@ -3228,6 +3228,11 @@ func (g loadStashLex) exec(vm *vm) {
 
 	v := stash.getByIdx(idx)
 	if v == nil {
+		if vm.dbgHooks != nil {
+			vm.push(vm.dbgHooks.loadStashLexRelaxed())
+			vm.pc++
+			return
+		}
 		vm.throw(errAccessBeforeInit)
 		return
 	}
@@ -3301,6 +3306,10 @@ func (g *loadMixedLex) exec(vm *vm) {
 	if stash != nil {
 		v := stash.getByIdx(idx)
 		if v == nil {
+			if vm.dbgHooks != nil {
+				vm.push(vm.dbgHooks.loadStashLexRelaxed())
+				goto end
+			}
 			vm.throw(errAccessBeforeInit)
 			return
 		}
