@@ -1,5 +1,7 @@
 package sobek
 
+import "strings"
+
 // func_dbg.go — Debug-mode fixes for class function operations.
 // Separated from func.go to keep debugger changes isolated.
 
@@ -15,6 +17,49 @@ package sobek
 // thisBinding is unused and allInStash is false), so vm.args doesn't matter.
 func prepareInitFieldsDebug(vm *vm) {
 	vm.args = 0
+}
+
+// shouldSuppressInitFields returns true when the field-initializer program
+// should run with suppressDebugger=true, i.e. the debug loop must NOT
+// pause inside it.  This mirrors Node.js "skip node_modules" behaviour:
+// any class whose source comes from an external URL (https://) or has no
+// source at all (native Go-backed classes like k6 http.Client) is treated
+// as library internals and skipped transparently.
+//
+// Without this guard, tempo's instrumentHTTP class construction causes the
+// debug loop to run thousands of instructions through full breakpoint checks
+// for every HTTP call, adding ~14s overhead per request in debug mode and
+// potentially triggering the "false pause" deadlock described in vm_dbg.go #7.
+func shouldSuppressInitFields(initFields *Program) bool {
+	if initFields == nil {
+		return false
+	}
+	if initFields.src == nil {
+		// No source info — native/generated code, always suppress.
+		return true
+	}
+	name := initFields.src.Name()
+	if name == "" {
+		return true
+	}
+	return strings.HasPrefix(name, "https://") || strings.HasPrefix(name, "http://")
+}
+
+// shouldSuppressClassConstructDebug returns true when class constructor
+// execution should run with suppressDebugger=true in debug mode.
+//
+// This targets constructors with no user-source body (prg==nil or src=nil)
+// and external URL constructors (tempo/httpx jslib). Node.js debuggers
+// treat these as library/native internals and do not step through them.
+func shouldSuppressClassConstructDebug(prg *Program) bool {
+	if prg == nil || prg.src == nil {
+		return true
+	}
+	name := prg.src.Name()
+	if name == "" {
+		return true
+	}
+	return strings.HasPrefix(name, "https://") || strings.HasPrefix(name, "http://")
 }
 
 // asyncRunnerDebugMixin adds the savedDebugState field to asyncRunner.

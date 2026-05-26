@@ -130,10 +130,49 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // Debug logging control via environment variables (same as debugger.go)
 var vmDebugEnabled = os.Getenv("SOBEK_DEBUG_VM") == "1" || os.Getenv("SOBEK_DEBUG_ALL") == "1"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⚠️  COMMON MISTAKES THAT CAUSE INFINITE LOOPS / EXTREME SLOWNESS:
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// 1. CALLING Line() INSIDE THE HOT LOOP WITHOUT CACHING:
+//    Line() does a mutex lock + binary search in the source map. Calling it on
+//    every instruction (even for non-user files) adds ~500ns * 12000 instrs =
+//    6ms per HTTP call through tempo. The fast-paths MUST skip Line() when
+//    possible (use cachedNormFile/cachedSrcMapFile from refreshFilenameCache).
+//
+// 2. NOT CHECKING SOURCE-MAPPED FILE FOR EXTERNAL URLs:
+//    When code is BUNDLED (esbuild/webpack), cachedIsExternal is FALSE because
+//    the program name is the bundle. But the source-mapped file may point to
+//    https://jslib.k6.io/... (tempo). ALWAYS check cachedSrcMapFile for
+//    external URLs when stepping, not just cachedNormFile/cachedIsExternal.
+//
+// 3. CONVERTING next→stepIn IN onAsyncResume WITHOUT AN EXTERNAL-FILE GUARD:
+//    After async resume, stepIn=true means EVERY instruction is checked for
+//    shouldBreak (pcAdvanced && lineChanged && isUserFile). If the VM resumes
+//    inside bundled tempo code, this loops through thousands of instructions
+//    before returning to user code. The bundled-external fast-path (above the
+//    STEP-TRACE section) converts stepIn→next and skips to executeInstruction.
+//
+// 4. fileHasBreakpoints RETURNING TRUE FOR BUNDLED FILES:
+//    In bundled TS, ALL code shares one normFile (the bundle). If the user has
+//    a BP in that bundle, fileHasBreakpoints returns true for EVERY instruction.
+//    Use cachedSrcMapFile as the PRIMARY check when a source map is available.
+//
+// 5. FORGETTING TO REBUILD + COPY TO VS CODE EXTENSION BIN:
+//    The project uses the binary at:
+//      ~/.vscode/extensions/k6.k6-utils-0.1.0/bin/k6
+//    NOT /Users/jorgevit/XK6/k6/k6. Always run:
+//      bash build_with_extensions.sh --debug
+//    This builds, bundles extensions, and installs the VS Code extension.
+//    Then reload VS Code (Cmd+Shift+P → "Reload Window").
+//
+// ═══════════════════════════════════════════════════════════════════════════════
 
 
 func (vm *vm) debug() {
@@ -210,6 +249,19 @@ func (vm *vm) debug() {
 			// Init, setup, teardown, and handleSummary never set suppressDebugger,
 			// so breakpoints work normally in those phases.
 			if vm.debugger.suppressDebugger {
+				if debugVM && vm.pc == 0 {
+					// Log at function-entry (pc==0) to show when we enter a new suppressed function
+					srcName := ""
+					if vm.prg != nil && vm.prg.src != nil {
+						srcName = vm.prg.src.Name()
+					}
+					funcName := ""
+					if vm.prg != nil {
+						funcName = string(vm.prg.funcName)
+					}
+					fmt.Printf("[SUPPRESS-SKIP] suppressDebugger=true at PC=0: func=%q, file=%s, depth=%d, suppressDepth=%d\n",
+						funcName, srcName, vm.debugger.callStackDepth(), vm.debugger.suppressDebugDepth)
+				}
 				goto executeInstruction
 			}
 
@@ -233,27 +285,124 @@ func (vm *vm) debug() {
 			// calling Filename() + strings.HasPrefix/TrimPrefix repeatedly.
 			vm.debugger.refreshFilenameCache()
 
+			// ── PERF: Fast-path skip for code with no source location ──────
+			// When normFile is empty (native constructors, class field initializers
+			// for Go-backed classes like k6's http.Client, built-in methods, etc.),
+			// there is no meaningful source position. Skip ALL debug processing.
+			// This prevents breakpoint() calls that hit EARLY EXIT for every
+			// instruction inside tempo's class construction / _initFields paths.
+			// Node.js never debugs "native" code frames — we match that behaviour.
+			if vm.debugger.cachedNormFile == "" && !vm.debugger.next && !vm.debugger.stepIn {
+				goto executeInstruction
+			}
+
 			// ── PERF: Fast-path skip for external jslib URLs ──────────────
 			// Files loaded from https:// (tempo, httpx, etc.) are NEVER user
 			// files. Skip ALL debug processing for them — even when step flags
 			// are active (next/stepIn). The step-over will correctly resume
 			// when execution returns to a user file via the fileChanged check
 			// in the outer debug loop (the caller's vm.debug()).
-			// Without this, every instruction inside the tempo wrapper goes
-			// through init-BP dedup, step inheritance, breakpoint checks, etc.
-			// adding ~18s overhead per HTTP call.
-			{
-				normFile := vm.debugger.cachedNormFile
-				if strings.HasPrefix(normFile, "https://") || strings.HasPrefix(normFile, "http://") {
-					if debugVM && vm.pc == 0 && (vm.debugger.next || vm.debugger.stepIn) {
-						fmt.Printf("[HTTPS-SKIP] ⚡ Skipping ALL debug processing for external URL: %s (next=%v, stepIn=%v, depth=%d)\n",
-							normFile, vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth())
+			if vm.debugger.cachedIsExternal {
+				if vm.pc == 0 {
+					if debugVM && (vm.debugger.next || vm.debugger.stepIn) {
+						fmt.Printf("[HTTPS-SKIP] ⚡ Skipping ALL debug for external URL: %s (next=%v, stepIn=%v, depth=%d)\n",
+							vm.debugger.cachedNormFile, vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth())
+					}
+					// FIX: When step-in enters an external URL, convert it to step-over
+					// so the debugger resumes at the NEXT user-code line after the call
+					// returns — exactly like Node.js stepping over node_modules.
+					// IMPORTANT: stepIn->next must preserve the user's step intent.
+					if vm.debugger.stepIn {
+						vm.debugger.stepIn = false
+						vm.debugger.next = true
+						if vm.debugger.stepOverStartLine <= 0 {
+							vm.debugger.stepOverStartLine = vm.debugger.Line()
+						}
+						if vm.debugger.stepOverTargetDepth <= 0 {
+							vm.debugger.stepOverTargetDepth = vm.debugger.callStackDepth()
+							vm.debugger.stepOverOriginalTargetDepth = vm.debugger.stepOverTargetDepth
+						}
+					}
+					// STEP-TRACE: record when we first enter external code during a step
+					if (vm.debugger.next || vm.debugger.stepIn) && !vm.debugger.stepWasInExternal {
+						vm.debugger.stepWasInExternal = true
+						vm.debugger.stepExternalEntryTime = time.Now()
+						if vm.debugger.enableDebugLogging {
+							fmt.Printf("[STEP-TRACE] ⏱️ ENTERING external code: %s depth=%d next=%v stepIn=%v targetDepth=%d startLine=%d at=%s\n",
+								vm.debugger.cachedNormFile, vm.debugger.callStackDepth(),
+								vm.debugger.next, vm.debugger.stepIn,
+								vm.debugger.stepOverTargetDepth, vm.debugger.stepOverStartLine,
+								time.Now().Format("15:04:05.000"))
+						}
+					}
+				}
+				goto executeInstruction
+			}
+			// ── PERF: Fast-path for BUNDLED external code during stepping ──────
+			// When tempo/httpx is bundled (via esbuild/webpack) into the user's
+			// entry point, cachedIsExternal is false (program name is the bundle).
+			// But the SOURCE-MAPPED filename still points to https://jslib.k6.io/...
+			// Without this check, every instruction in bundled tempo code goes
+			// through the full debug loop during step-over/step-in (~12000 instrs
+			// per HTTP call), causing 18s+ overhead per request.
+			//
+			// FIX: When stepping, do a cheap Line() call to refresh cachedSrcMapFile,
+			// then check if the source-mapped file is an external URL. If so, skip
+			// debug processing — same as the cachedIsExternal fast-path above.
+			if !vm.debugger.cachedIsExternal && (vm.debugger.next || vm.debugger.stepIn) {
+				_ = vm.debugger.Line() // refresh cachedSrcMapFile
+				srcMap := vm.debugger.cachedSrcMapFile
+				if srcMap != "" && (strings.HasPrefix(srcMap, "https://") || strings.HasPrefix(srcMap, "http://")) {
+					// Source-mapped file is external (bundled tempo/httpx/etc.)
+					// Convert stepIn → next so we resume at the next user-code line.
+					if vm.debugger.stepIn {
+						vm.debugger.stepIn = false
+						vm.debugger.next = true
+						if vm.debugger.stepOverStartLine <= 0 {
+							vm.debugger.stepOverStartLine = vm.debugger.Line()
+						}
+						if vm.debugger.stepOverTargetDepth <= 0 {
+							vm.debugger.stepOverTargetDepth = vm.debugger.callStackDepth()
+							vm.debugger.stepOverOriginalTargetDepth = vm.debugger.stepOverTargetDepth
+						}
+					}
+					if !vm.debugger.stepWasInExternal {
+						vm.debugger.stepWasInExternal = true
+						vm.debugger.stepExternalEntryTime = time.Now()
+						if vm.debugger.enableDebugLogging {
+							fmt.Printf("[STEP-TRACE] ⏱️ ENTERING bundled external code: srcMap=%s depth=%d next=%v stepIn=%v at=%s\n",
+								srcMap, vm.debugger.callStackDepth(),
+								vm.debugger.next, vm.debugger.stepIn,
+								time.Now().Format("15:04:05.000"))
+						}
 					}
 					goto executeInstruction
 				}
 			}
 
-			// CRITICAL: First check if init was already completed for ANY user file
+			// STEP-TRACE: detect transition OUT of external code back to user code
+			if vm.debugger.stepWasInExternal && (vm.debugger.next || vm.debugger.stepIn) {
+				vm.debugger.stepWasInExternal = false
+				if vm.debugger.enableDebugLogging {
+					elapsed := time.Since(vm.debugger.stepExternalEntryTime)
+					fmt.Printf("[STEP-TRACE] ✅ RETURNED from external code after %v → now in %s line=%d depth=%d next=%v stepIn=%v targetDepth=%d at=%s\n",
+						elapsed, vm.debugger.cachedNormFile, vm.debugger.Line(),
+						vm.debugger.callStackDepth(), vm.debugger.next, vm.debugger.stepIn,
+						vm.debugger.stepOverTargetDepth, time.Now().Format("15:04:05.000"))
+				}
+			}
+			// ── ULTRA-FAST path: skip before dbg.Line() for files with no BPs ──
+			// dbg.Line() acquires a mutex and does a source-map binary search on
+			// every instruction. For files like getCiasToken.ts, BaseApi.ts, etc.
+			// that have NO breakpoints, calling it is pure overhead.
+			// Guard: only outside init phase (during init we need the initPhase
+			// block below to detect the user file and set initFilename).
+			if !vm.debugger.initPhase && !vm.debugger.next && !vm.debugger.stepIn {
+				normFile := vm.debugger.cachedNormFile
+				if normFile != "" && !vm.debugger.fileHasBreakpoints(normFile) {
+					goto executeInstruction
+				}
+			}
 			// This check happens REGARDLESS of whether initPhase is set
 			// It prevents re-hitting init breakpoints on subsequent VUs (VU 0 for teardown/handleSummary)
 			//
@@ -467,12 +616,67 @@ func (vm *vm) debug() {
 				// jslib at https://jslib.k6.io/...) which adds ~18s per HTTP call when
 				// every instruction is checked. Without this, the CIAS token fetch
 				// (11 HTTP requests through tempo) takes 3+ minutes instead of seconds.
+				//
+				// CRITICAL FIX for bundled TypeScript + tempo:
+				// In bundled TypeScript (esbuild), all .ts files compile into a single
+				// bundle named after the entry point (e.g., Checkout_Perf_Tests.ts).
+				// If the user has a breakpoint in that bundle (e.g., line 213), then
+				// fileHasBreakpoints("Checkout_Perf_Tests.ts") == true for EVERY
+				// instruction in EVERY bundled file (getCiasToken.ts, BaseApi.ts,
+				// CcsApi.ts, etc.) — even though those files have no breakpoints at all.
+				// The old logic never skipped bundled code, forcing the full debug loop
+				// on every instruction and turning a 2s auth flow into a 25-min ordeal.
+				//
+				// FIX: When a source map is available (cachedSrcMapFile != ""), use the
+				// source-mapped filename as the primary check — it identifies the specific
+				// original file for this instruction, not the bundle. Only fall back to
+				// normFile when no source map is present.
 				if !skipBreakpoints && !vm.debugger.next && !vm.debugger.stepIn {
 					normFile := vm.debugger.cachedNormFile
-					if normFile != "" && !vm.debugger.fileHasBreakpoints(normFile) {
-						// Also check source-mapped file (for bundled code)
+					srcMap := vm.debugger.cachedSrcMapFile
+					if srcMap != "" {
+						// Source map available: use the mapped file as the primary check.
+						// The bundle file (normFile) may have BPs for other bundled files,
+						// but if THIS source-mapped file has no BPs, we can safely skip.
+						if !vm.debugger.fileHasBreakpoints(srcMap) {
+							goto executeInstruction
+						}
+					} else if normFile != "" && !vm.debugger.fileHasBreakpoints(normFile) {
+						// No source map: fall back to checking the program file name.
+						goto executeInstruction
+					}
+				}
+
+				// ── PERF: Fast-path skip for step-over when too deep with no BPs ──
+				// During step-over (next=true), when the call depth exceeds the target
+				// AND the current source-mapped file has no explicit breakpoints, there
+				// is nothing to do here — we can't break (wrong depth) and no explicit
+				// BP can fire. Skip all expensive processing and just execute.
+				//
+				// This is the KEY fix for tempo+debugger slowness: without this,
+				// every instruction in BaseApi.ts/CdsApi.ts (thousands per HTTP call)
+				// goes through the full debug loop during step-over, causing 20s gaps.
+				//
+				// We call Line() to get a FRESH source-mapped filename (avoids stale
+				// cachedSrcMapFile from the previous instruction). Line() is O(log N)
+				// which is cheap (~50ns) compared to the full debug loop (~500ns+).
+				if !skipBreakpoints && !vm.debugger.active && vm.debugger.next && !vm.debugger.stepIn {
+					if vm.debugger.callStackDepth() > vm.debugger.stepOverTargetDepth {
+						// Refresh the source-mapped file for the current PC.
+						_ = vm.debugger.Line()
 						srcMap := vm.debugger.cachedSrcMapFile
-						if srcMap == "" || !vm.debugger.fileHasBreakpoints(srcMap) {
+						normFile := vm.debugger.cachedNormFile
+						// Skip if NEITHER the bundle file NOR the source-mapped file has BPs.
+						// For non-bundled TS: normFile = "BaseApi.ts", no BPs → skip.
+						// For bundled TS:     normFile = bundle (has BPs), srcMap = "BaseApi.ts" (no BPs) → skip.
+						// For user file:      srcMap = "Checkout_Perf_Tests.ts" (has BPs) → full processing.
+						noNormBPs := normFile == "" || !vm.debugger.fileHasBreakpoints(normFile)
+						noSrcBPs := srcMap == "" || !vm.debugger.fileHasBreakpoints(srcMap)
+						if noNormBPs && noSrcBPs {
+							goto executeInstruction
+						}
+						if !noNormBPs && noSrcBPs && srcMap != "" {
+							// Bundle file has BPs but source-mapped file does not → safe to skip.
 							goto executeInstruction
 						}
 					}
@@ -633,10 +837,6 @@ func (vm *vm) debug() {
 						}
 
 						if !isUserSourceFile {
-							// Entering non-user file:
-							// - For stepIn: clear the flag (we don't want to step through internal code)
-							// - For next (step-over): preserve the flag so stepping continues when we return to user code
-							//   This is the key fix: step-over should step OVER function calls into non-user code
 							if debugVM {
 								fmt.Printf("[FILE-CHANGE] Entering NON-USER file: %s (next=%v, stepIn=%v, depth=%d, targetDepth=%d) → skipping\n",
 									normalizedCurrentFilename, vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth(), vm.debugger.stepOverTargetDepth)
@@ -1228,7 +1428,7 @@ func (vm *vm) debug() {
 						breakReason = "next"
 
 						// DIAGNOSTIC: Log step-over state when in user file to trace why break doesn't fire
-						if debugVM && isUserFile && !shouldBreak {
+						if debugVM && isUserFile && !shouldBreak && !atValidDepth {
 							fmt.Printf("[STEPOVER-MISS] line=%d, file=%s, depth=%d, targetDepth=%d, startLine=%d, pcAdv=%v, lineChg=%v, atDepth=%v, vmValid=%v, cfOnly=%v, suppressed=%v\n",
 								currentLine, normalizedCurrentFilename, currentStackDepth, vm.debugger.stepOverTargetDepth, startLine, pcAdvanced, lineChanged, atValidDepth, vmInValidState, isControlFlowOnly, suppressedByInheritedLine)
 						}
@@ -1286,7 +1486,7 @@ func (vm *vm) debug() {
 						// in the caller to be skipped (the "loop back" / "runs through"
 						// bug when stepping over a function call).
 						sameProgram := vm.debugger.stepOverLastPCPrg == nil || vm.debugger.stepOverLastPCPrg == vm.prg
-						if shouldBreak && vm.debugger.stepOverLastPC >= 0 && sameProgram && currentPC <= vm.debugger.stepOverLastPC && currentPC > lastExecPC {
+						if shouldBreak && vm.debugger.stepOverLastPC >= 0 && sameProgram && currentLine == startLine && currentPC <= vm.debugger.stepOverLastPC && currentPC > lastExecPC {
 							shouldBreak = false
 							breakReason = "next-skip-subexpr"
 							if debugVM {
@@ -1451,6 +1651,13 @@ func (vm *vm) debug() {
 										}
 
 						if shouldBreak {
+						// STEP-TRACE: log when step-over/step-in actually fires
+						if (breakReason == "next" || breakReason == "stepIn") && vm.debugger.enableDebugLogging {
+							fmt.Printf("[STEP-TRACE] 🛑 STEP BREAK at %s:%d depth=%d targetDepth=%d reason=%s at=%s\n",
+								normalizedCurrentFilename, currentLine, currentStackDepth,
+								vm.debugger.stepOverTargetDepth, breakReason,
+								time.Now().Format("15:04:05.000"))
+						}
 						// DIAGNOSTIC: Log ALL breaks with forward-jump info
 						if vm.debugger.enableDebugLogging {
 							lastExecInstrType := "N/A"
@@ -1473,7 +1680,7 @@ func (vm *vm) debug() {
 						// function-signature line (PC=0).  Record the position so that
 						// the very next source line triggers the break instead.
 						// This saves the user one unnecessary step-over.
-						if vm.debugger.skipPhaseEntryBreak && currentPC == 0 && prevPC == -1 {
+						if vm.debugger.skipPhaseEntryBreak && currentPC == 0 && prevPC == -1 && isUserFile {
 							if debugVM {
 								fmt.Printf("[VM-LIFECYCLE-ENTRY] Skipping phase-entry break at line %d (PC=0) — will break at first statement\n", currentLine)
 							}
@@ -1627,17 +1834,31 @@ func (vm *vm) debug() {
 			// (where N is the old stepInLastPC) and land on the catch block
 			// instead of the first line.
 			//
-			// NOTE: stepOverLastPC is intentionally NOT cleared here. During
-			// step-over, function calls don't trigger breaks (the depth check
-			// prevents it). When the function returns, vm.prg reverts to the
-			// original caller's program — so stepOverLastPC (computed for the
-			// caller's PC space) is still valid and needed to skip sub-expressions
-			// on the same line. Clearing it would remove the guard that prevents
-			// false breaks at try-catch exit points whose source maps map to the
-			// catch block's line.
+			// CRITICAL FIX: Also invalidate stepOverLastPC on program change.
+			//
+			// Previously this was "intentionally NOT cleared" because "when the
+			// function returns, vm.prg reverts to the caller's program, so
+			// stepOverLastPC is still valid". That reasoning is WRONG when a JS
+			// wrapper (like tempo's instrumentHTTP) intercepts the call:
+			//
+			//   1. User at line 213 (PC=42), stepOverLastPC=79
+			//   2. CDSapi.createCart → tempo.request() → native HTTP → return
+			//   3. Back in same vm.prg, PC=77 (line 213 call instruction)
+			//   4. currentPC=77 <= stepOverLastPC=79 → "skip sub-expression"
+			//   5. Lines 214-222 ALL skipped as "sub-expressions" → stuck forever
+			//
+			// The sub-expression range [breakpointPC..stepOverLastPC] is only
+			// valid for the INITIAL evaluation of arguments BEFORE the call.
+			// Once a function call has happened and returned, we've completed
+			// that expression — the remaining bytecodes at the same PC range
+			// are RETURN VALUE handling, which is a new statement.
+			// Clearing stepOverLastPC lets step-over correctly break at the
+			// next source line after the call returns.
 			if vm.debugger != nil {
 				vm.debugger.stepInLastPC = -1
 				vm.debugger.stepInLastPCPrg = nil
+				vm.debugger.stepOverLastPC = -1
+				vm.debugger.stepOverLastPCPrg = nil
 			}
 		}
 		// if vm.debugger != nil && debugVM && (vm.debugger.next || vm.debugger.stepIn) {
@@ -1676,7 +1897,13 @@ func (vm *vm) debug() {
 	// VM either hits a breakpoint (activate() fires) or truly finishes
 	// (lifecycle transition sets vmExited via the step-active path).
 	//
-	if vm.debugger != nil && (vm.debugger.next || vm.debugger.stepIn) {
+	// FIX (issue 6): Only treat a vm.debug() exit as a lifecycle transition when
+	// the PC is valid (>= 0).  A negative PC means the loop exited because of a
+	// yieldMarker (async/await suspension).  onAsyncYield() normally clears step
+	// flags before we reach here, but if curAsyncRunner is nil it cannot, leaving
+	// stale flags that would cause vmExited to be set for a yield — making
+	// Continue() think the VM is dead and routing to Phase 2 prematurely.
+	if vm.debugger != nil && (vm.debugger.next || vm.debugger.stepIn) && vm.pc >= 0 {
 		// Step operation active at exit. Use callStackDepth to distinguish:
 		//   depth <= 1: outermost function exited → lifecycle transition
 		//   depth > 1:  nested runTry (class init, try/catch) → preserve flags

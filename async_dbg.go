@@ -131,6 +131,14 @@ func onAsyncResume(ar *asyncRunner) {
 	// Also reset lastBreakpoint.line to the await line so that lineChanged
 	// correctly detects the first new line after the await.
 	dbg.lastBreakpoint.line = saved.startLine
+	// FIX (issue 7): Invalidate the Line() cache so the first breakpoint()
+	// call after the resume does a fresh source-map lookup. The cache is keyed
+	// by (cachedPC, cachedLinePrg); after an async suspend/resume the PC
+	// restarts at a negative yieldMarker value and quickly advances. Without
+	// this reset, Line() can return a stale line number from before the yield,
+	// causing breakpoints to be missed at the first line after the await.
+	dbg.cachedPC = -1
+	dbg.cachedLinePrg = nil
 	// Clear any inherited-position suppression from before the yield.
 	// After async resume, try-catch exit bytecodes around the await can
 	// trigger the inherited-position heuristic and suppress the break on

@@ -3,6 +3,8 @@ package sobek
 import (
 	"fmt"
 	"reflect"
+	"strings"
+	"time"
 
 	"github.com/grafana/sobek/unistring"
 )
@@ -332,10 +334,36 @@ func (f *classFuncObject) _initFields(instance *Object) {
 		// restore after. Also set suppressStepInheritance to prevent the
 		// global coordinator from re-enabling step flags mid-execution.
 		var savedStepIn, savedNext bool
+		// FIX: Suppress the debugger entirely for class field initializers from
+		// external URLs (https://) or native/no-source classes (e.g. k6's http.Client,
+		// tempo's InstrumentedHTTP).  This mirrors Node.js "skip node_modules"
+		// behaviour and prevents the debug loop from running thousands of
+		// instructions through full breakpoint checks for every instrumented
+		// HTTP call, which was adding ~14s overhead per request in debug mode.
+		suppressForExternal := vm.debugMode && vm.debugger != nil && shouldSuppressInitFields(f.initFields)
+		restoreExternalSuppression := false
 		if vm.debugMode && vm.debugger != nil {
 			savedStepIn = vm.debugger.stepIn
 			savedNext = vm.debugger.next
-			if savedStepIn || savedNext {
+			if suppressForExternal {
+				// Fully suppress the debug loop for this initFields execution.
+				prevDepth := vm.debugger.suppressDebugDepth
+				vm.debugger.suppressDebugDepth++
+				vm.debugger.suppressDebugger = true
+				restoreExternalSuppression = true
+				vm.debugger.stepIn = false
+				vm.debugger.next = false
+				vm.debugger.suppressStepInheritance = true
+				if debugVM {
+					srcName := ""
+					if f.initFields.src != nil {
+						srcName = f.initFields.src.Name()
+					}
+					fmt.Printf("[CLASS-INITFIELDS] ⚡ Suppressing debug for external/native initFields: file=%q\n", srcName)
+					fmt.Printf("[SUPPRESS-INITFIELDS] ➕ suppressDebugDepth: %d→%d (file=%q)\n",
+						prevDepth, vm.debugger.suppressDebugDepth, srcName)
+				}
+			} else if savedStepIn || savedNext {
 				if debugVM {
 					funcName := ""
 					if f.initFields.funcName != "" {
@@ -356,6 +384,30 @@ func (f *classFuncObject) _initFields(instance *Object) {
 				vm.debugger.next = false
 				vm.debugger.suppressStepInheritance = true
 			}
+		}
+
+		if restoreExternalSuppression {
+			// Always restore suppression state even if runTry panics.
+			defer func() {
+				if vm.debugger == nil {
+					return
+				}
+				prevDepth := vm.debugger.suppressDebugDepth
+				vm.debugger.suppressDebugDepth--
+				if vm.debugger.suppressDebugDepth <= 0 {
+					vm.debugger.suppressDebugDepth = 0
+					vm.debugger.suppressDebugger = false
+				}
+				if debugVM {
+					fmt.Printf("[SUPPRESS-INITFIELDS] ➖ suppressDebugDepth: %d→%d (suppressDebugger=%v)\n",
+						prevDepth, vm.debugger.suppressDebugDepth, vm.debugger.suppressDebugger)
+				}
+				vm.debugger.suppressStepInheritance = false
+				if !vm.debugger.stepIn && !vm.debugger.next {
+					vm.debugger.stepIn = savedStepIn
+					vm.debugger.next = savedNext
+				}
+			}()
 		}
 
 		vm.pushCtx()
@@ -386,6 +438,9 @@ func (f *classFuncObject) _initFields(instance *Object) {
 		// is still alive (the constructor caller continues). Restore those
 		// two fields so the outer vm.debug() loop keeps running.
 		if vm.debugMode && vm.debugger != nil {
+			// If we suppressed the debugger for an external/native initFields, undo it now.
+			// NOTE: external suppression is restored via defer above.
+
 			vm.debugger.vmExited = false
 			select {
 			case <-vm.debugger.vmDoneCh:
@@ -393,18 +448,20 @@ func (f *classFuncObject) _initFields(instance *Object) {
 			default:
 			}
 
-			// Restore step flags that were suppressed before _initFields.
-			vm.debugger.suppressStepInheritance = false
-			if !vm.debugger.stepIn && !vm.debugger.next {
-				// No new step operation was started inside — restore saved flags
-				vm.debugger.stepIn = savedStepIn
-				vm.debugger.next = savedNext
-				if debugVM && (savedStepIn || savedNext) {
-					fmt.Printf("[CLASS-INITFIELDS] Restored step flags after _initFields: stepIn=%v, next=%v\n", savedStepIn, savedNext)
+			if !suppressForExternal {
+				// Restore step flags that were suppressed before _initFields.
+				vm.debugger.suppressStepInheritance = false
+				if !vm.debugger.stepIn && !vm.debugger.next {
+					// No new step operation was started inside — restore saved flags
+					vm.debugger.stepIn = savedStepIn
+					vm.debugger.next = savedNext
+					if debugVM && (savedStepIn || savedNext) {
+						fmt.Printf("[CLASS-INITFIELDS] Restored step flags after _initFields: stepIn=%v, next=%v\n", savedStepIn, savedNext)
+					}
+				} else if debugVM {
+					fmt.Printf("[CLASS-INITFIELDS] Keeping user-initiated step flags after _initFields: stepIn=%v, next=%v\n",
+						vm.debugger.stepIn, vm.debugger.next)
 				}
-			} else if debugVM {
-				fmt.Printf("[CLASS-INITFIELDS] Keeping user-initiated step flags after _initFields: stepIn=%v, next=%v\n",
-					vm.debugger.stepIn, vm.debugger.next)
 			}
 
 			// If step-over/step-in was active in the inner loop, we must be careful
@@ -443,6 +500,41 @@ func (f *classFuncObject) construct(args []Value, newTarget *Object) *Object {
 		newTarget = f.val
 	}
 	vm := f.val.runtime.vm
+	constructSuppressed := false
+	if vm.debugMode && vm.debugger != nil && !vm.debugger.next && !vm.debugger.stepIn && shouldSuppressClassConstructDebug(f.prg) {
+		// Skip debugger internals for native/external constructors (tempo wrappers,
+		// Go-backed classes). This matches Node.js behavior and avoids constructor-
+		// path interference before the first HTTP call in default().
+		prevDepth := vm.debugger.suppressDebugDepth
+		vm.debugger.suppressDebugDepth++
+		vm.debugger.suppressDebugger = true
+		constructSuppressed = true
+		if debugVM {
+			prgFile := ""
+			if f.prg != nil && f.prg.src != nil {
+				prgFile = f.prg.src.Name()
+			}
+			fmt.Printf("[SUPPRESS-CONSTRUCT] ➕ suppressDebugDepth: %d→%d (file=%q, callDepth=%d, next=%v, stepIn=%v)\n",
+				prevDepth, vm.debugger.suppressDebugDepth, prgFile, vm.debugger.callStackDepth(), vm.debugger.next, vm.debugger.stepIn)
+		}
+	}
+	if constructSuppressed {
+		defer func() {
+			if vm.debugger == nil {
+				return
+			}
+			prevDepth := vm.debugger.suppressDebugDepth
+			vm.debugger.suppressDebugDepth--
+			if vm.debugger.suppressDebugDepth <= 0 {
+				vm.debugger.suppressDebugDepth = 0
+				vm.debugger.suppressDebugger = false
+			}
+			if debugVM {
+				fmt.Printf("[SUPPRESS-CONSTRUCT] ➖ suppressDebugDepth: %d→%d (suppressDebugger=%v, callDepth=%d)\n",
+					prevDepth, vm.debugger.suppressDebugDepth, vm.debugger.suppressDebugger, vm.debugger.callStackDepth())
+			}
+		}()
+	}
 	if vm.debugMode && vm.debugger != nil && debugVM {
 		prgName := "<nil>"
 		prgFile := ""
@@ -460,8 +552,24 @@ func (f *classFuncObject) construct(args []Value, newTarget *Object) *Object {
 			prgName, prgFile, prgEntryLine, f.derived, vm.debugger.stepIn, vm.debugger.next, vm.debugger.lastBreakpoint.line)
 	}
 	if f.prg == nil {
+		if vm.debugMode && vm.debugger != nil && debugVM {
+			fmt.Printf("[CLASS-CONSTRUCT-TRACE] native branch START: derived=%v, initFields=%v, suppress=%v, depth=%d\n",
+				f.derived, f.initFields != nil, vm.debugger.suppressDebugger, vm.debugger.callStackDepth())
+		}
+		if vm.debugMode && vm.debugger != nil && debugVM {
+			fmt.Printf("[CLASS-CONSTRUCT-TRACE] native createInstance START\n")
+		}
 		instance := f.createInstance(args, newTarget)
+		if vm.debugMode && vm.debugger != nil && debugVM {
+			fmt.Printf("[CLASS-CONSTRUCT-TRACE] native createInstance DONE\n")
+		}
+		if vm.debugMode && vm.debugger != nil && debugVM {
+			fmt.Printf("[CLASS-CONSTRUCT-TRACE] native _initFields START\n")
+		}
 		f._initFields(instance)
+		if vm.debugMode && vm.debugger != nil && debugVM {
+			fmt.Printf("[CLASS-CONSTRUCT-TRACE] native _initFields DONE\n")
+		}
 		return instance
 	} else {
 		var instance *Object
@@ -567,9 +675,22 @@ func (f *baseJsFuncObject) __call(args []Value, newTarget, this Value) (Value, *
 
 	// ARROW-DEBUG: Log after the JS function returns — only when step flags are active
 	// to avoid flooding the log with millions of entries during normal execution.
-	if vm.debugger != nil && debugVM && (vm.debugger.stepIn || vm.debugger.next) {
-		fmt.Printf("[ARROW-DEBUG] __call returned from JS func: stepIn=%v, next=%v, depth=%d\n",
-			vm.debugger.stepIn, vm.debugger.next, len(vm.callStack))
+	if vm.debugger != nil && (vm.debugger.stepIn || vm.debugger.next) {
+		srcName := ""
+		isExt := false
+		if f.prg != nil && f.prg.src != nil {
+			srcName = f.prg.src.Name()
+			isExt = strings.HasPrefix(srcName, "https://") || strings.HasPrefix(srcName, "http://")
+		}
+		if isExt && vm.debugger.enableDebugLogging {
+			fmt.Printf("[STEP-TRACE] ⬅️  RETURNED from external func %q (%s) depth=%d next=%v stepIn=%v at=%s\n",
+				string(f.prg.funcName), srcName, len(vm.callStack),
+				vm.debugger.next, vm.debugger.stepIn,
+				time.Now().Format("15:04:05.000"))
+		} else if !isExt && debugVM {
+			fmt.Printf("[ARROW-DEBUG] __call returned from JS func: stepIn=%v, next=%v, depth=%d\n",
+				vm.debugger.stepIn, vm.debugger.next, len(vm.callStack))
+		}
 	}
 	if needPop {
 		vm.popCtx()

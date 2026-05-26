@@ -1160,9 +1160,10 @@ type Debugger struct {
 	// cachedPrg is the last vm.prg pointer we computed filename/normFilename for.
 	// When vm.prg == cachedPrg we skip all string work in breakpoint().
 	// NOTE: This is ONLY for the filename cache. The Line() cache uses cachedLinePrg.
-	cachedPrg      *Program
-	cachedFilename string // raw src.Name()
-	cachedNormFile string // normalizeFilename(cachedFilename), slice of cachedFilename or equal
+	cachedPrg        *Program
+	cachedFilename   string // raw src.Name()
+	cachedNormFile   string // normalizeFilename(cachedFilename), slice of cachedFilename or equal
+	cachedIsExternal bool   // true when cachedNormFile starts with https:// or http://
 
 	// PERF: Line() cache — avoids expensive src.Position(sourceOffset(pc)) on every instruction.
 	// Uses separate cachedLinePrg (not cachedPrg) to prevent Line() and refreshFilenameCache()
@@ -1205,6 +1206,12 @@ type Debugger struct {
 	// When both are false, breakpoint() returns immediately with no lock acquisitions.
 	hasLocalBPs  bool
 	hasGlobalBPs bool
+
+	// stepTracing: precise diagnostics for step-over across external code (tempo/jslib).
+	// stepExternalEntryTime records when we first entered external code during a step.
+	// Used to log exactly how long execution spends inside external code vs user code.
+	stepExternalEntryTime time.Time
+	stepWasInExternal     bool // true while we're executing inside external URL code
 
 	// pausedVarSnapshot is built lazily on the first eval call per pause and reused
 	// for all subsequent evals during the same pause (e.g. multiple variable hovers).
@@ -1574,10 +1581,22 @@ func (dbg *Debugger) refreshFilenameCache() {
 	if dbg.vm.prg == nil || dbg.vm.prg.src == nil {
 		dbg.cachedFilename = ""
 		dbg.cachedNormFile = ""
+		dbg.cachedIsExternal = false
+		dbg.cachedSrcMapFile = "" // Clear stale source-map filename
 		return
 	}
 	dbg.cachedFilename = dbg.vm.prg.src.Name()
 	dbg.cachedNormFile = normalizeFilename(dbg.cachedFilename)
+	dbg.cachedIsExternal = strings.HasPrefix(dbg.cachedNormFile, "https://") || strings.HasPrefix(dbg.cachedNormFile, "http://")
+	// CRITICAL FIX: Clear cachedSrcMapFile when program changes.
+	// Without this, the old fast-path check (fileHasBreakpoints(srcMap))
+	// uses a stale source-map filename from a PREVIOUS file (e.g.,
+	// Checkout_Perf_Tests.ts) when execution enters a new program (e.g.,
+	// tempo jslib). If the stale file has breakpoints, the fast-path
+	// never fires, and every instruction in tempo goes through the full
+	// debug loop — adding ~6.5s per Continue through tempo code.
+	// cachedSrcMapFile will be properly refreshed by the next Line() call.
+	dbg.cachedSrcMapFile = ""
 }
 
 // IsUserSourceFilePath returns true if the given normalized filename looks like
@@ -1988,6 +2007,13 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 		dbg.onResume()
 	}
 
+	// FIX (issue 1): Clear asyncResumeActive here, at resume time, not only
+	// inside the vm_dbg.go shouldBreak block. If the user pressed Continue
+	// (not Step) while paused after an async resume, shouldBreak is false and
+	// the flag was never cleared. A stale asyncResumeActive on the next pause
+	// would disable forward-jump heuristics and potentially skip breakpoints.
+	dbg.asyncResumeActive = false
+
 	dbg.pendingCh = nil
 
 	// PERF: read global step state once after Continue signal, reuse for all checks below.
@@ -2241,61 +2267,82 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 	}
 
 	// ─── Phase 1: Local VM is alive ────────────────────────────────────
-	// Send currentCh to activationCh, then block on currentCh + vmDoneCh.
-	// No timeouts — activate() will eventually receive from activationCh
-	// when the VM hits a breakpoint/step. vmDoneCh fires if the VM exits.
+	// ─── Phase 1: Local VM is alive ────────────────────────────────────
+	// Send currentCh to BOTH local and coordinator activation channels.
+	// activate() listens on multiple channels — by sending to all of them,
+	// we guarantee it finds currentCh regardless of which channel it reads
+	// from first. No timeouts, no draining — just send and block.
 	if !localDead {
-		// Try to send currentCh to both local and coordinator channels.
-		// The first one that activate() reads from will get our channel.
 		vuActivationCh := globalDebugCoordinator.GetVUActivationChannel(dbg.vuID)
 
-		// Non-blocking attempt to send to coordinator first (for step state),
-		// then blocking send to local activationCh + vmDoneCh.
-		sent := false
+		// Send to coordinator channel (non-blocking, buffered size 1).
 		select {
 		case vuActivationCh <- dbg.currentCh:
-			sent = true
 			if debugContinue {
 				fmt.Printf("[DEBUGGER-CONTINUE] Sent to coordinator channel (vuID=%d)\n", dbg.vuID)
 			}
 		default:
-		}
-		if !sent {
-			// Block: send to either local activationCh or detect VM exit.
+			// Buffer full — drain stale entry and retry.
 			select {
-			case dbg.activationCh <- dbg.currentCh:
+			case <-vuActivationCh:
+			default:
+			}
+			select {
+			case vuActivationCh <- dbg.currentCh:
 				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] Sent to local activationCh\n")
+					fmt.Printf("[DEBUGGER-CONTINUE] Sent to coordinator channel after drain (vuID=%d)\n", dbg.vuID)
 				}
-			case <-dbg.vmDoneCh:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] VM exited while trying to send to activationCh\n")
-				}
-				localDead = true
+			default:
 			}
 		}
 
-		// If we successfully sent, block on currentCh + vmDoneCh for the response.
-		if !localDead {
-			select {
-			case activation := <-dbg.currentCh:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] ✅ Received activation: %s:%d (vuID=%d, wait=%dms)\n",
-						activation.Filename, activation.Line, activation.VUID,
-						time.Since(continueStart).Milliseconds())
-				}
-				return activation
-			case <-dbg.vmDoneCh:
-				if debugContinue {
-					fmt.Printf("[DEBUGGER-CONTINUE] VM exited while waiting for activation response\n")
-				}
-				// Drain stale entry from activationCh if we sent one.
-				select {
-				case <-dbg.activationCh:
-				default:
-				}
-				localDead = true
+		// Also send to local activationCh (non-blocking, buffered size 1).
+		// activate() may read from either channel — cover both.
+		select {
+		case dbg.activationCh <- dbg.currentCh:
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] Sent to local activationCh (vuID=%d)\n", dbg.vuID)
 			}
+		default:
+			// Buffer full — drain stale entry and retry.
+			select {
+			case <-dbg.activationCh:
+			default:
+			}
+			select {
+			case dbg.activationCh <- dbg.currentCh:
+				if debugContinue {
+					fmt.Printf("[DEBUGGER-CONTINUE] Sent to local activationCh after drain (vuID=%d)\n", dbg.vuID)
+				}
+			default:
+			}
+		}
+
+		// Block indefinitely on currentCh. activate() will send the
+		// activation when the VM hits a breakpoint/step. vmDoneCh fires
+		// if the VM exits (lifecycle transition or test end).
+		select {
+		case activation := <-dbg.currentCh:
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] ✅ Received activation: %s:%d (vuID=%d, wait=%dms)\n",
+					activation.Filename, activation.Line, activation.VUID,
+					time.Since(continueStart).Milliseconds())
+			}
+			return activation
+		case <-dbg.vmDoneCh:
+			if debugContinue {
+				fmt.Printf("[DEBUGGER-CONTINUE] VM exited while waiting for activation response\n")
+			}
+			// Drain stale entries from both channels.
+			select {
+			case <-dbg.activationCh:
+			default:
+			}
+			select {
+			case <-vuActivationCh:
+			default:
+			}
+			localDead = true
 		}
 	}
 
@@ -2304,6 +2351,21 @@ func (dbg *Debugger) Continue() DebuggerActivation {
 	// activate(), or detect that all VMs are done (test finished).
 	// No timeouts — we block on currentCh and use a notification channel
 	// from the coordinator for "all done" detection.
+
+	// FIX (issue 3): Drain stale entries from the global activation channel
+	// before attempting cross-VU routing. Tempo's promises may trigger
+	// multiple VM exits/re-entries, leaving old currentCh references in the
+	// global channel. A stale entry causes Continue() to pick up the wrong
+	// activation and show a tempo stack trace instead of user code.
+	globalCh := globalDebugCoordinator.ActivationChannel()
+	select {
+	case <-globalCh:
+		if debugContinue {
+			fmt.Printf("[DEBUGGER-CONTINUE] Drained stale global activation channel entry before dead-VM phase\n")
+		}
+	default:
+	}
+
 	if debugContinue {
 		fmt.Printf("[DEBUGGER-CONTINUE] Entering dead-VM phase (vuID=%d)\n", dbg.vuID)
 	}
@@ -2622,7 +2684,12 @@ func (dbg *Debugger) SetPauseResumeCallbacks(onPause, onResume func()) {
 // Use this to prevent breakpoints firing during Go→JS orchestration calls (e.g.
 // gherkin's Run() internals). Un-suppress before calling actual user step functions.
 func (dbg *Debugger) SetSuppressBreakpoints(v bool) {
+	prev := dbg.suppressDebugger
 	dbg.suppressDebugger = v
+	if debugVM && prev != v {
+		fmt.Printf("[SUPPRESS-DIRECT] SetSuppressBreakpoints: %v→%v (suppressDepth=%d, next=%v, stepIn=%v)\n",
+			prev, v, dbg.suppressDebugDepth, dbg.next, dbg.stepIn)
+	}
 }
 
 // SetInTestExecution marks whether the VM is currently executing a Gherkin step
@@ -3655,6 +3722,7 @@ func (dbg *Debugger) breakpoint() bool {
 	}
 	if dbg.vm.prg == nil || (!dbg.hasLocalBPs && !dbg.hasGlobalBPs) {
 		if dbg.breakpointCheckCount <= 5 {
+			dbg.breakpointCheckCount++ // FIX: must increment or this logs on EVERY call forever
 			if debugBreakpoint {
 				fmt.Printf("[BP-TRACE] EARLY EXIT: prg=%v, hasLocal=%v, hasGlobal=%v\n", dbg.vm.prg != nil, dbg.hasLocalBPs, dbg.hasGlobalBPs)
 			}
@@ -3663,16 +3731,18 @@ func (dbg *Debugger) breakpoint() bool {
 	}
 
 	// PERF: skip all debugger work during getter evaluation (resolveIndirectValue/safeCallGetter).
-	// Without this, variable inspection can trigger breakpoints and corrupt step state.
 	if dbg.suppressDebugger {
 		return false
 	}
 
+	// PERF: Empty normFile = native/no-source code (class field initializers for Go-backed
+	// classes, built-in polyfills, etc.).  No source position means no breakpoint can
+	// ever match — return false immediately, matching Node.js "skip native" behaviour.
+	if dbg.cachedNormFile == "" {
+		return false
+	}
+
 	// PERF: Never break inside external jslib bundles loaded from https://
-	// These are instrumentation libraries (tempo, httpx, etc.) that must
-	// execute transparently, exactly as Node.js skips node_modules.
-	// This eliminates ALL breakpoint overhead for tempo code — no line lookup,
-	// no breakpoint map scan, no source-map resolution.
 	if strings.HasPrefix(dbg.cachedNormFile, "https://") ||
 		strings.HasPrefix(dbg.cachedNormFile, "http://") {
 		return false
