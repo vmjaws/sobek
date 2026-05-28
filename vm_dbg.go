@@ -338,6 +338,24 @@ func (vm *vm) debug() {
 				}
 				goto executeInstruction
 			}
+			// ── PERF: Fast-path for BUNDLED external code (Continue / non-stepping) ──
+			// When tempo/httpx is bundled into the user's script, cachedIsExternal
+			// is false (program name is the bundle file). During Continue (no stepping),
+			// every instruction still went through the full debug loop. This caches
+			// the source-mapped external detection per-program to skip all processing.
+			if !vm.debugger.cachedIsExternal && !vm.debugger.next && !vm.debugger.stepIn {
+				// FIX: For bundles, check source-mapped file per-instruction (not per-program).
+				// A single vm.prg can contain BOTH user code and external code (tempo).
+				// Line() internally caches per (prg, pc) so repeated calls at the same
+				// PC are O(1). When PC advances, it does a source-map binary search
+				// which is the only way to tell if we're in user or external code.
+				_ = vm.debugger.Line() // refresh cachedSrcMapFile for current PC
+				srcMap := vm.debugger.cachedSrcMapFile
+				if srcMap != "" && (strings.HasPrefix(srcMap, "https://") || strings.HasPrefix(srcMap, "http://")) {
+					goto executeInstruction
+				}
+			}
+
 			// ── PERF: Fast-path for BUNDLED external code during stepping ──────
 			// When tempo/httpx is bundled (via esbuild/webpack) into the user's
 			// entry point, cachedIsExternal is false (program name is the bundle).
@@ -346,13 +364,14 @@ func (vm *vm) debug() {
 			// through the full debug loop during step-over/step-in (~12000 instrs
 			// per HTTP call), causing 18s+ overhead per request.
 			//
-			// FIX: When stepping, do a cheap Line() call to refresh cachedSrcMapFile,
-			// then check if the source-mapped file is an external URL. If so, skip
-			// debug processing — same as the cachedIsExternal fast-path above.
+			// FIX: Check source-mapped file per-instruction (not per-program) since
+			// bundles mix user and external code in the same vm.prg. Line() caches
+			// per (prg, pc) so this is O(1) when PC hasn't changed.
 			if !vm.debugger.cachedIsExternal && (vm.debugger.next || vm.debugger.stepIn) {
-				_ = vm.debugger.Line() // refresh cachedSrcMapFile
+				_ = vm.debugger.Line() // refresh cachedSrcMapFile for current PC
 				srcMap := vm.debugger.cachedSrcMapFile
-				if srcMap != "" && (strings.HasPrefix(srcMap, "https://") || strings.HasPrefix(srcMap, "http://")) {
+				isBundledExternal := srcMap != "" && (strings.HasPrefix(srcMap, "https://") || strings.HasPrefix(srcMap, "http://"))
+				if isBundledExternal {
 					// Source-mapped file is external (bundled tempo/httpx/etc.)
 					// Convert stepIn → next so we resume at the next user-code line.
 					if vm.debugger.stepIn {
@@ -370,8 +389,8 @@ func (vm *vm) debug() {
 						vm.debugger.stepWasInExternal = true
 						vm.debugger.stepExternalEntryTime = time.Now()
 						if vm.debugger.enableDebugLogging {
-							fmt.Printf("[STEP-TRACE] ⏱️ ENTERING bundled external code: srcMap=%s depth=%d next=%v stepIn=%v at=%s\n",
-								srcMap, vm.debugger.callStackDepth(),
+						fmt.Printf("[STEP-TRACE] ⏱️ ENTERING bundled external code: srcMap=%s depth=%d next=%v stepIn=%v at=%s\n",
+							vm.debugger.cachedSrcMapFile, vm.debugger.callStackDepth(),
 								vm.debugger.next, vm.debugger.stepIn,
 								time.Now().Format("15:04:05.000"))
 						}
@@ -727,6 +746,15 @@ func (vm *vm) debug() {
 
 					currentFilename := vm.debugger.Filename() // Use source-mapped filename for consistency
 					normalizedCurrentFilename := vm.debugger.cachedNormFile
+					// FIX: For bundled code, use source-mapped filename for file-change
+					// detection. Without this, all code in the bundle shares the same
+					// cachedNormFile (the bundle filename), so stepping into bundled tempo
+					// code is never detected as a "file change". The source-mapped filename
+					// resolves to the ORIGINAL file (e.g., https://jslib.k6.io/... for tempo
+					// or Checkout.ts for user code), enabling correct detection.
+					if vm.debugger.cachedSrcMapFile != "" {
+						normalizedCurrentFilename = vm.debugger.cachedSrcMapFile
+					}
 					currentLine := vm.debugger.Line()
 					currentStackDepth := vm.debugger.callStackDepth()
 					currentPC := vm.pc
@@ -1798,7 +1826,36 @@ func (vm *vm) debug() {
 			// triggering false step pauses, and ensures the step resumes correctly
 			// when the promise resolves. See async_dbg.go for details.
 			if pc < 0 && vm.debugger != nil && (vm.debugger.stepIn || vm.debugger.next) {
-				onAsyncYield(vm)
+				if vm.curAsyncRunner != nil {
+					onAsyncYield(vm)
+				} else if vm.debugger.callStackDepth() <= 1 {
+					// LIFECYCLE TRANSITION FIX: When the debug loop exits with pc < 0
+					// at the top-level depth (callStackDepth <= 1) AND there's no
+					// asyncRunner, this is a real function/module exit — NOT an async
+					// yield. This happens during ESM module init completion which uses
+					// promises internally. We must set waitForFunctionEntry so that
+					// step-over at the end of init → setup → default transitions work.
+					//
+					// MANDATORY BEHAVIOUR: Step-over must transition between lifecycle
+					// phases: init → setup → default → teardown → handleSummary.
+					// Only Continue should jump to the next breakpoint.
+					if debugVM {
+						fmt.Printf("[VM-EXIT] 🔄 Step active at top-level exit with pc<0 (no asyncRunner, next=%v, stepIn=%v, callDepth=%d) → lifecycle transition\n",
+							vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth())
+					}
+					vm.debugger.vmExited = true
+					if vm.debugger.vmDoneCh != nil {
+						select {
+						case <-vm.debugger.vmDoneCh:
+						default:
+							close(vm.debugger.vmDoneCh)
+						}
+					}
+					vm.debugger.next = false
+					vm.debugger.stepIn = false
+					GetGlobalCoordinator().ClearGlobalStepState()
+					GetGlobalCoordinator().SetWaitForFunctionEntry(true)
+				}
 			}
 			break
 		}
@@ -1903,33 +1960,43 @@ func (vm *vm) debug() {
 	// flags before we reach here, but if curAsyncRunner is nil it cannot, leaving
 	// stale flags that would cause vmExited to be set for a yield — making
 	// Continue() think the VM is dead and routing to Phase 2 prematurely.
-	if vm.debugger != nil && (vm.debugger.next || vm.debugger.stepIn) && vm.pc >= 0 {
-		// Step operation active at exit. Use callStackDepth to distinguish:
-		//   depth <= 1: outermost function exited → lifecycle transition
-		//   depth > 1:  nested runTry (class init, try/catch) → preserve flags
-		if vm.debugger.callStackDepth() <= 1 {
-			if debugVM {
-				fmt.Printf("[VM-EXIT] 🔄 Step active at outermost exit (next=%v, stepIn=%v, callDepth=%d, loopDepth=%d, lastLine=%d) → lifecycle transition\n",
-					vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth(), vm.debugger.debugLoopDepth, vm.debugger.Line())
-			}
-			vm.debugger.vmExited = true
-			if vm.debugger.vmDoneCh != nil {
-				select {
-				case <-vm.debugger.vmDoneCh:
-				default:
-					close(vm.debugger.vmDoneCh)
+	//
+	// LIFECYCLE TRANSITION FIX: When callStackDepth <= 1 AND curAsyncRunner is nil,
+	// this is a REAL lifecycle exit (e.g., init module completion via promises),
+	// NOT a temporary async yield. We MUST set waitForFunctionEntry even with pc < 0.
+	// MANDATORY BEHAVIOUR: Step-over must transition between lifecycle phases:
+	// init → setup → default → teardown → handleSummary.
+	// Only Continue should jump to the next breakpoint.
+	if vm.debugger != nil && (vm.debugger.next || vm.debugger.stepIn) {
+		isRealExit := vm.pc >= 0 || (vm.curAsyncRunner == nil && vm.debugger.callStackDepth() <= 1)
+		if isRealExit {
+			// Step operation active at exit. Use callStackDepth to distinguish:
+			//   depth <= 1: outermost function exited → lifecycle transition
+			//   depth > 1:  nested runTry (class init, try/catch) → preserve flags
+			if vm.debugger.callStackDepth() <= 1 {
+				if debugVM {
+					fmt.Printf("[VM-EXIT] 🔄 Step active at outermost exit (next=%v, stepIn=%v, callDepth=%d, loopDepth=%d, lastLine=%d) → lifecycle transition\n",
+						vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth(), vm.debugger.debugLoopDepth, vm.debugger.Line())
 				}
-			}
-			vm.debugger.next = false
-			vm.debugger.stepIn = false
-			GetGlobalCoordinator().ClearGlobalStepState()
-			GetGlobalCoordinator().SetWaitForFunctionEntry(true)
-		} else {
-			// Nested runTry exit (class field init, try/catch, module eval).
-			// Preserve step flags for the outer vm.debug() loop.
-			if debugVM {
-				fmt.Printf("[VM-EXIT] 🔄 Step active at nested exit (next=%v, stepIn=%v, callDepth=%d, loopDepth=%d) → preserving flags\n",
-					vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth(), vm.debugger.debugLoopDepth)
+				vm.debugger.vmExited = true
+				if vm.debugger.vmDoneCh != nil {
+					select {
+					case <-vm.debugger.vmDoneCh:
+					default:
+						close(vm.debugger.vmDoneCh)
+					}
+				}
+				vm.debugger.next = false
+				vm.debugger.stepIn = false
+				GetGlobalCoordinator().ClearGlobalStepState()
+				GetGlobalCoordinator().SetWaitForFunctionEntry(true)
+			} else {
+				// Nested runTry exit (class field init, try/catch, module eval).
+				// Preserve step flags for the outer vm.debug() loop.
+				if debugVM {
+					fmt.Printf("[VM-EXIT] 🔄 Step active at nested exit (next=%v, stepIn=%v, callDepth=%d, loopDepth=%d) → preserving flags\n",
+						vm.debugger.next, vm.debugger.stepIn, vm.debugger.callStackDepth(), vm.debugger.debugLoopDepth)
+				}
 			}
 		}
 	} else if vm.debugger != nil && debugVM {

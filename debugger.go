@@ -1165,6 +1165,7 @@ type Debugger struct {
 	cachedNormFile   string // normalizeFilename(cachedFilename), slice of cachedFilename or equal
 	cachedIsExternal bool   // true when cachedNormFile starts with https:// or http://
 
+
 	// PERF: Line() cache — avoids expensive src.Position(sourceOffset(pc)) on every instruction.
 	// Uses separate cachedLinePrg (not cachedPrg) to prevent Line() and refreshFilenameCache()
 	// from interfering with each other's cache validity checks.

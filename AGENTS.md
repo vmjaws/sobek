@@ -31,3 +31,25 @@ The promise job queue drains synchronously when the top-level script function re
 - **Interrupt vs. cancel**: Runaway scripts are stopped with the runtime's interrupt method, not context cancellation. After interrupting, the interrupt flag must be explicitly cleared before reuse, or the next execution immediately aborts.
 
 - **Object cross-runtime panic**: Passing an Object created in one runtime to another runtime's method silently compiles but panics at runtime. The check is in the Go-to-JS value conversion path.
+
+## MANDATORY Debugger Lifecycle Behaviour (NEVER BREAK THIS)
+
+The k6 debugger follows the lifecycle: **init → setup → default → teardown → handleSummary**.
+
+**Debug mode forces single VU execution:**
+- ALL scenarios are converted to `per-vu-iterations` with 1 VU, 1 iteration (`k6/internal/cmd/run_dbg.go`).
+- Debug mode is for code validation, NOT performance — multi-VU is unnecessary and breaks the debugger.
+
+**Step-Over / Step-Into MUST transition between lifecycle phases:**
+- If the user is stepping (step-over or step-into) at the end of `init`, the debugger MUST pause at the first line of `setup`.
+- If stepping at the end of `setup`, MUST pause at the first line of `default`.
+- If stepping at the end of `default`, MUST pause at the first line of `teardown`.
+- If stepping at the end of `teardown`, MUST pause at the first line of `handleSummary`.
+
+**Continue (F5) jumps to the next breakpoint only** — it does NOT auto-pause at lifecycle boundaries.
+
+**Implementation details (do NOT break these invariants):**
+1. When `vm.debug()` exits with step state active at the top-level depth (`callStackDepth() <= 1`), `SetWaitForFunctionEntry(true)` MUST be called — even when `vm.pc < 0` (ESM module exit via promise). The `vm.pc >= 0` guard only applies to deeper async yields (when `curAsyncRunner != nil`).
+2. When entering a new lifecycle phase (runPart/RunOnce/HandleSummary), `ConsumeWaitForFunctionEntry()` enables `stepIn` so the debugger pauses at the first line.
+3. When entering a new lifecycle phase WITHOUT pending step state, `ClearLocalStepState()` MUST be called to prevent stale `next=true`/`stepIn=true` from the previous phase from causing unwanted pauses.
+4. The debugger instance is reused across lifecycle phases (cached VU 0). Local state (next, stepIn, steppingFilename, stepOverTargetDepth) persists unless explicitly cleared.

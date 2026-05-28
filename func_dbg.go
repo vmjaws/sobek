@@ -42,7 +42,21 @@ func shouldSuppressInitFields(initFields *Program) bool {
 	if name == "" {
 		return true
 	}
-	return strings.HasPrefix(name, "https://") || strings.HasPrefix(name, "http://")
+	// Direct external URL
+	if strings.HasPrefix(name, "https://") || strings.HasPrefix(name, "http://") {
+		return true
+	}
+	// FIX: For bundled code, the program's src.Name() is the bundle filename
+	// (e.g., LoadTests.ts), not the external URL. Check the source-mapped
+	// filename at PC=0 to detect bundled tempo/httpx code.
+	if len(initFields.srcMap) > 0 {
+		pos := initFields.src.Position(initFields.sourceOffset(0))
+		if pos.Filename != "" &&
+			(strings.HasPrefix(pos.Filename, "https://") || strings.HasPrefix(pos.Filename, "http://")) {
+			return true
+		}
+	}
+	return false
 }
 
 // shouldSuppressClassConstructDebug returns true when class constructor
@@ -59,7 +73,19 @@ func shouldSuppressClassConstructDebug(prg *Program) bool {
 	if name == "" {
 		return true
 	}
-	return strings.HasPrefix(name, "https://") || strings.HasPrefix(name, "http://")
+	// Direct external URL
+	if strings.HasPrefix(name, "https://") || strings.HasPrefix(name, "http://") {
+		return true
+	}
+	// FIX: For bundled code, check source-mapped filename at PC=0.
+	if len(prg.srcMap) > 0 {
+		pos := prg.src.Position(prg.sourceOffset(0))
+		if pos.Filename != "" &&
+			(strings.HasPrefix(pos.Filename, "https://") || strings.HasPrefix(pos.Filename, "http://")) {
+			return true
+		}
+	}
+	return false
 }
 
 // asyncRunnerDebugMixin adds the savedDebugState field to asyncRunner.
