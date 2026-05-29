@@ -41,10 +41,12 @@ The k6 debugger follows the lifecycle: **init → setup → default → teardown
 - Debug mode is for code validation, NOT performance — multi-VU is unnecessary and breaks the debugger.
 
 **Step-Over / Step-Into MUST transition between lifecycle phases:**
-- If the user is stepping (step-over or step-into) at the end of `init`, the debugger MUST pause at the first line of `setup`.
+- If the user is stepping at the end of `init`, the debugger MUST pause at the first line of `setup` (or `default` if setup is not defined).
 - If stepping at the end of `setup`, MUST pause at the first line of `default`.
-- If stepping at the end of `default`, MUST pause at the first line of `teardown`.
+- If stepping at the end of `default`, MUST pause at the first line of `teardown` (or `handleSummary` if teardown is not defined).
 - If stepping at the end of `teardown`, MUST pause at the first line of `handleSummary`.
+
+**setup and teardown are OPTIONAL.** When a phase is not defined, step state MUST skip across it to the next defined phase.
 
 **Continue (F5) jumps to the next breakpoint only** — it does NOT auto-pause at lifecycle boundaries.
 

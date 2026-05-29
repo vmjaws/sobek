@@ -1421,6 +1421,9 @@ func newDebugger(vm *vm) *Debugger {
 	// at function entry evaluates 0 != 0 = false and skips the first line.
 	// ResetForPhaseTransition already does this correctly; newDebugger must match.
 	dbg.lastBreakpoint.pc = -1
+	// Default to breaking on uncaught exceptions (matches IDE default and Node.js behavior).
+	// The IDE can override this via SetExceptionBreakpoints if the user changes the setting.
+	dbg.breakOnUncaughtExceptions = true
 	if debugActivate {
 		if inheritConnection {
 			if debugActivate {
