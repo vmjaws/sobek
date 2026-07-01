@@ -1122,8 +1122,6 @@ type Debugger struct {
 	steppingFilename            string
 	enableDebugLogging          bool
 	breakpointCheckCount        int // TEMP: counter for unique line transitions logged
-	bpCallLogCount              int // TEMP: counter for BP-ENTRY logs
-	bpCallLogLastLine           int // TEMP: last line logged for BP-ENTRY dedup
 	lastBPTraceLine             int    // last line logged in BP-TRACE (dedup)
 	lastBPTraceFile             string // last file logged in BP-TRACE (dedup)
 	skipPhaseEntryBreak         bool
@@ -2153,6 +2151,7 @@ func (dbg *Debugger) activateWithStepState(reason ActivationReason, filename str
 
 	// PERF: invalidate the per-pause variable snapshot now that we're resuming.
 	dbg.pausedVarSnapshot = nil
+	dbg.allStashVarsCache = nil
 
 	dbg.active = false
 
@@ -3228,7 +3227,11 @@ func (dbg *Debugger) Next() error {
 		// properties that map to different source lines but are part of the
 		// same expression — the call instruction at the end maps back to startLine).
 		if dbg.vm != nil && dbg.vm.prg != nil && !dbg.vmResuming.Load() {
-			dbg.stepOverLastPC = dbg.vm.prg.lastPCForLine(startLine, dbg.lastBreakpoint.pc, steppingFilename)
+
+		if dbg.stepOverLastPC > 0 && dbg.vm.prg != nil {
+            dbg.stepOverLastPC = dbg.vm.prg.lastPCForLine(startLine, dbg.lastBreakpoint.pc, steppingFilename)
+        }
+			//dbg.stepOverLastPC = dbg.vm.prg.lastPCForLine(startLine, dbg.lastBreakpoint.pc, steppingFilename)
 			dbg.stepOverLastPCPrg = dbg.vm.prg
 			// LOOP GUARD: If the computed range [breakpointPC .. stepOverLastPC]
 			// contains a backward jump instruction, it spans a loop body
@@ -3385,6 +3388,9 @@ func (dbg *Debugger) ResetForPhaseTransition() {
 	dbg.pausedVarSnapshot = nil
 	dbg.pausedVarSnapshotLine = 0
 	dbg.pausedVarSnapshotPC = -1
+	dbg.allStashVarsCache = nil
+	dbg.allStashVarsCachePC = 0
+	dbg.allStashVarsCachePrg = nil
 	dbg.sourceVarCache = nil
 	dbg.globalVarCache = nil
 	dbg.sourceCacheValid = false
@@ -3756,19 +3762,6 @@ func (dbg *Debugger) breakpoint() bool {
 	// called there before breakpoint(), so we skip the redundant call here.
 	normalizedFilename := dbg.cachedNormFile
 	line := dbg.Line()
-
-	// DIAGNOSTIC: Log EVERY call to breakpoint() for the specific file that has breakpoints.
-	// Only log distinct lines to avoid flooding on repeated line=2 import bytecodes.
-	if (debugBreakpoint || debugAll) && strings.HasSuffix(normalizedFilename, "LoadTests.ts") {
-		if dbg.bpCallLogLastLine != line {
-			dbg.bpCallLogLastLine = line
-			if dbg.bpCallLogCount < 50 {
-				dbg.bpCallLogCount++
-				fmt.Printf("[BP-ENTRY] breakpoint() called: file=%q, line=%d, initPhase=%v, initComplete=%v, vuID=%d, hasLocal=%v, hasGlobal=%v, suppress=%v, active=%v\n",
-					normalizedFilename, line, dbg.initPhase, dbg.initComplete, dbg.vuID, dbg.hasLocalBPs, dbg.hasGlobalBPs, dbg.suppressDebugger, dbg.active)
-			}
-		}
-	}
 
 	// DIAGNOSTIC: Always log when breakpoint() is called for a file+line that has a registered BP.
 	// This is NOT gated by bpTraceLimit — it only fires for actual breakpoint lines.
